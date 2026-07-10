@@ -27,11 +27,90 @@ def apply_compat_patches() -> None:
     if _APPLIED:
         return
     _APPLIED = True
+    _patch_huggingface_hub_relative_redirect_query()
     _patch_vllm_gemma4_mtp_config_loading()
     _patch_vllm_bytelevel_tokenizer_loading()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_gemma4_kv_shared_sanitize()
     _patch_transformers_exaone4_config()
+
+
+def _patch_huggingface_hub_relative_redirect_query() -> None:
+    """Preserve query strings when huggingface_hub follows mirror redirects.
+
+    huggingface_hub 1.22 follows relative redirects manually for HEAD metadata
+    requests, but rebuilds the URL with only the redirected path. Mirrors such as
+    hf-mirror.com include cache metadata in the query string; dropping it can
+    lead to a second request without commit/etag/size headers, so the hub client
+    rejects the download before vLLM starts.
+    """
+    try:
+        from urllib.parse import urlparse
+
+        import httpx
+        from huggingface_hub import file_download
+        from huggingface_hub.utils import _http
+    except ImportError as exc:
+        logger.debug("Skipping Hugging Face Hub redirect compatibility patch: %s", exc)
+        return
+
+    original = getattr(_http, "_httpx_follow_relative_redirects_with_backoff", None)
+    if original is None or getattr(original, "_vllm_metal_preserves_query", False):
+        return
+
+    def _patched_follow_relative_redirects(method: str, url: str, **httpx_kwargs: Any):
+        retry_on_errors = httpx_kwargs.pop("retry_on_errors", False)
+        no_retry_kwargs = (
+            {} if retry_on_errors else {"retry_on_exceptions": (), "retry_on_status_codes": ()}
+        )
+        while True:
+            current = urlparse(url)
+            if method == "HEAD" and current.netloc != "huggingface.co":
+                with httpx.Client(trust_env=False) as client:
+                    response = client.request(
+                        method=method,
+                        url=url,
+                        **httpx_kwargs,
+                        follow_redirects=False,
+                    )
+            else:
+                response = _http.http_backoff(
+                    method=method,
+                    url=url,
+                    **httpx_kwargs,
+                    follow_redirects=False,
+                    **no_retry_kwargs,
+                )
+            _http.hf_raise_for_status(response)
+            if 300 <= response.status_code <= 399:
+                parsed_target = urlparse(response.headers["Location"])
+                if parsed_target.netloc == "":
+                    url = current._replace(
+                        path=parsed_target.path,
+                        params=parsed_target.params,
+                        query=parsed_target.query,
+                        fragment=parsed_target.fragment,
+                    ).geturl()
+                    continue
+                if (
+                    current.netloc
+                    and current.netloc != "huggingface.co"
+                    and parsed_target.netloc == "huggingface.co"
+                ):
+                    url = parsed_target._replace(
+                        scheme=current.scheme,
+                        netloc=current.netloc,
+                    ).geturl()
+                    continue
+            break
+        return response
+
+    setattr(_patched_follow_relative_redirects, "_vllm_metal_preserves_query", True)
+    _http._httpx_follow_relative_redirects_with_backoff = _patched_follow_relative_redirects
+    file_download._httpx_follow_relative_redirects_with_backoff = (
+        _patched_follow_relative_redirects
+    )
+    logger.debug("Installed Hugging Face Hub relative redirect compatibility patch")
 
 
 def _patch_transformers_exaone4_config() -> None:
