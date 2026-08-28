@@ -16,7 +16,8 @@
         "vllm.platform.v1",
         "vllm.operator.v1",
         "vllm.model_runner.v1"
-      ]
+      ],
+      "integration_surfaces": ["vllm.model_loader"]
     }
   ],
   "system_boundaries": {
