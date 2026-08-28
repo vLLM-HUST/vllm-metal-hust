@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "canonical_registry": "https://github.com/vLLM-HUST/vllm-hust-docs/tree/codex/ecosystem-architecture-reorganization/registry",
+  "repository": "https://github.com/vLLM-HUST/vllm-metal-hust",
+  "repository_role": "platform_profile",
+  "relation_to_runtime": "implements_core_contracts",
+  "lifecycle": "incubating",
+  "artifacts": [
+    {
+      "id": "vllm-metal-platform-profile",
+      "artifact_type": "platform_profile",
+      "system_role": "platform_backend",
+      "delivery_model": "platform_distribution",
+      "execution_planes": ["worker", "native", "device"],
+      "integration_contracts": [
+        "vllm.platform.v1",
+        "vllm.operator.v1",
+        "vllm.model_runner.v1"
+      ]
+    }
+  ],
+  "system_boundaries": {
+    "is": [
+      "an Apple Silicon platform profile combining Python, MLX, native runtime, and Metal kernels",
+      "a coordinated hardware integration distribution"
+    ],
+    "is_not": [
+      "the vLLM runtime core or owner of generic domain contracts",
+      "a single generic plugin callback",
+      "an external KV state system or control plane"
+    ]
+  },
+  "validation": [
+    "uv run ruff check .",
+    "uv run pytest -m 'not slow'",
+    "run hardware and performance suites on a declared Apple Silicon target"
+  ],
+  "compatibility_document": "docs/supported_models.md"
+}

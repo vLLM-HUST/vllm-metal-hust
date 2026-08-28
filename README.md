@@ -4,6 +4,15 @@
 
 vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX as the primary compute backend. It unifies MLX and PyTorch under a single lowering path.
 
+In the vLLM-HUST ecosystem this repository is a multi-component Apple Silicon
+platform profile. “Plugin” describes its current installation and discovery
+mechanism; the profile itself spans platform selection, model runners, loaders,
+operators, native libraries, Metal kernels, and device capability negotiation.
+It is neither the vLLM runtime core nor a single callback component.
+
+See [`.vllm-hust/repository-profile.json`](./.vllm-hust/repository-profile.json)
+for the machine-readable role and validation boundary.
+
 **Documentation**: https://docs.vllm.ai/projects/vllm-metal/en/latest/
 
 ---
