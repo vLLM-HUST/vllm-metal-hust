@@ -1,0 +1,127 @@
+name: Daily upstream sync
+
+on:
+  schedule:
+    # 02:29 Asia/Shanghai (18:29 UTC on the previous day).
+    - cron: "29 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: daily-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync default branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve fork metadata
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream_repo="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.full_name // empty')"
+          if [[ -z "${upstream_repo}" ]]; then
+            echo "${GITHUB_REPOSITORY} is not a GitHub fork." >&2
+            exit 1
+          fi
+          upstream_branch="$(gh api "repos/${upstream_repo}" --jq '.default_branch')"
+          echo "repository=${upstream_repo}" >> "${GITHUB_OUTPUT}"
+          echo "branch=${upstream_branch}" >> "${GITHUB_OUTPUT}"
+
+      - name: Merge official upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/merge-upstream" \
+            -f branch="${GITHUB_REF_NAME}" \
+            --jq '.message' | tee -a "${GITHUB_STEP_SUMMARY}"
+
+      - name: Create or update failure issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPOSITORY: ${{ steps.upstream.outputs.repository }}
+          UPSTREAM_BRANCH: ${{ steps.upstream.outputs.branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          title="[Automation] Daily upstream sync failed"
+          run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          issue_number="$(
+            gh issue list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --state open \
+              --search "${title} in:title" \
+              --json number \
+              --jq '.[0].number // empty'
+          )"
+          body="Daily synchronization from \`${UPSTREAM_REPOSITORY:-unknown}:${UPSTREAM_BRANCH:-unknown}\` into \`${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}\` failed.
+
+          Run: ${run_url}
+
+          Check for merge conflicts, repository permissions, fork metadata changes, or GitHub API failures. Successful daily runs remain silent."
+          if [[ -n "${issue_number}" ]]; then
+            gh issue comment "${issue_number}" --repo "${GITHUB_REPOSITORY}" --body "${body}"
+          else
+            gh issue create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${title}" \
+              --body "${body}" \
+              --assignee "ShuhaoZhangTony"
+          fi
+
+      - name: Send Slack failure notification
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          UPSTREAM_REPOSITORY: ${{ steps.upstream.outputs.repository }}
+          UPSTREAM_BRANCH: ${{ steps.upstream.outputs.branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${SLACK_WEBHOOK_URL:-}" ]]; then
+            echo "SLACK_WEBHOOK_URL is not configured." >&2
+            exit 1
+          fi
+          run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          jq -n \
+            --arg text "Upstream sync failed: ${UPSTREAM_REPOSITORY:-unknown}:${UPSTREAM_BRANCH:-unknown} -> ${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}. ${run_url}" \
+            '{text: $text}' |
+            curl --fail --silent --show-error \
+              --header "Content-Type: application/json" \
+              --data @- \
+              "${SLACK_WEBHOOK_URL}"
+
+      - name: Close recovered failure issue
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          title="[Automation] Daily upstream sync failed"
+          issue_number="$(
+            gh issue list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --state open \
+              --search "${title} in:title" \
+              --json number \
+              --jq '.[0].number // empty'
+          )"
+          if [[ -n "${issue_number}" ]]; then
+            gh issue close "${issue_number}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --comment "Daily upstream synchronization recovered in run https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+          fi
