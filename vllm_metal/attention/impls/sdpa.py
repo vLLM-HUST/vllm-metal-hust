@@ -296,8 +296,9 @@ def prepare_sdpa_qkv(
           the caller can forward them to the next YOCO layer.
 
     Raises:
-        NotImplementedError: If ``inner`` has neither ``rope`` nor
-            ``rotary_emb`` (only RoPE-based models are supported).
+        NotImplementedError: If no precomputed rotary embeddings are provided,
+            and ``inner`` has neither ``rope`` nor ``rotary_emb`` and does not
+            explicitly disable RoPE.
     """
     B, L, _ = x.shape  # noqa: N806
     norm_placement = attention_contract.qk_norm_placement
@@ -530,17 +531,29 @@ def sdpa_forward(
     #   Qwen3/Llama/Gemma/Gemma4: n_heads, n_kv_heads
     #   Qwen3.5 (Qwen3Next):      num_attention_heads, num_key_value_heads
     #   StableLM:                 num_heads, num_key_value_heads
+    #   DeepseekAttention:        num_attention_heads, num_kv_heads
     n_heads = (
         getattr(inner, "n_heads", None)
         or getattr(inner, "num_attention_heads", None)
         or inner.num_heads
     )
-    n_kv_heads = getattr(inner, "n_kv_heads", None) or inner.num_key_value_heads
+    n_kv_heads = (
+        getattr(inner, "n_kv_heads", None)
+        or getattr(inner, "num_kv_heads", None)
+        or inner.num_key_value_heads
+    )
 
     # Softmax scale — GPT-OSS names it sm_scale rather than scale.
     attn_scale = getattr(inner, "scale", None)
     if attn_scale is None:
         attn_scale = inner.sm_scale
+
+    # Attention logit softcapping (Gemma 2: ``attn_logit_softcapping``).
+    # mlx_lm applies ``tanh(qk / cap) * cap`` to the pre-softmax scores; the
+    # Metal kernel implements the same clamp and treats any value <= 0 as
+    # disabled, so architectures that do not define the attribute keep the
+    # previous uncapped path unchanged.
+    attn_softcap = float(getattr(inner, "attn_logit_softcapping", None) or 0.0)
 
     # Attention sinks: a learned per-head logit that joins the softmax
     # denominator without contributing a value row (GPT-OSS). Models without
@@ -740,7 +753,7 @@ def sdpa_forward(
             kernel_v_cache,
             cache_kv_heads,
             attn_scale,
-            0.0,  # softcap (0 = disabled)
+            attn_softcap,
             block_tables,
             seq_lens,
             cu_seqlens_q,
@@ -768,7 +781,7 @@ def sdpa_forward(
             kernel_v_cache,
             cache_kv_heads,
             attn_scale,
-            0.0,  # softcap (0 = disabled)
+            attn_softcap,
             block_tables,
             seq_lens,
             cu_seqlens_q,

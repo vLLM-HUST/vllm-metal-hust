@@ -53,6 +53,7 @@ from vllm_metal.attention.context import (
     prepare_grouped,
 )
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
+from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 from vllm_metal.config import get_config
 from vllm_metal.distributed import (
@@ -467,6 +468,8 @@ class MetalModelRunner:
         # present: it is consulted on the KV-sizing path, which runs for every
         # model, not only the YOCO ones that install a real mapping.
         self._yoco_cache_mapping: tuple[int, dict[int, int]] | None = None
+        # Resolved by ModelLifecycle at load; None for non-hybrid models.
+        self.hybrid_runtime_plan: HybridRuntimePlan | None = None
 
         # Whether the adapter can run projection-free intermediate forwards
         # for the loaded model; resolved once in load_model().
@@ -844,6 +847,14 @@ class MetalModelRunner:
     def linear_cache_bytes_per_slot(self) -> int:
         """Bytes for one request's linear attention state across all GDN layers."""
         return self._cache_policy.linear_cache_bytes_per_slot()
+
+    def hybrid_align_state_bytes_per_block(self) -> int:
+        """Per-pool-block linear-state bytes under align-mode prefix caching."""
+        return self._cache_policy.hybrid_align_state_bytes_per_block()
+
+    def hybrid_align_growth_bytes_per_block(self) -> int:
+        """One old physical state pool retained during align-cache growth."""
+        return self._cache_policy.hybrid_align_growth_bytes_per_block()
 
     def draft_scratch_reserve_blocks(self) -> int:
         """Blocks reserved for the draft model's speculative lookahead tail."""
