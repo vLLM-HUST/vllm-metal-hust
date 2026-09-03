@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the pipeline-parallel primitives.
 
-Pure-Python: no model load, no GPU, no MLX distributed launcher. We drive
-``PipelineGroup`` with a fake group object and ``apply_pipeline_split`` with a
-tiny stub backbone whose ``.layers`` is a list of sentinels.
+Pure-Python: no checkpoint download, no GPU, no MLX distributed launcher. We
+drive ``PipelineGroup`` with a fake group object and ``apply_pipeline_split``
+with a tiny stub backbone whose ``.layers`` is a list of sentinels; the
+mlx_lm contract tests build a micro ``qwen3.Model`` from args in-process.
 """
 
+import os
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx_lm.models import qwen3
 
 from vllm_metal.distributed.pipeline import (
     PipelinedModel,
@@ -47,6 +52,18 @@ def _make_model(n_layers: int) -> SimpleNamespace:
         norm=sentinel_norm,
     )
     return SimpleNamespace(model=backbone)
+
+
+def _use_ring_temp_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep bootstrap hostfiles inside pytest's managed temporary directory."""
+
+    def mkstemp(*, prefix: str, suffix: str) -> tuple[int, str]:
+        return tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=tmp_path)
+
+    monkeypatch.setattr(
+        "vllm_metal.distributed.pipeline.tempfile",
+        SimpleNamespace(mkstemp=mkstemp),
+    )
 
 
 class TestPipelineGroupRankFlags:
@@ -180,6 +197,58 @@ class TestRingHosts:
             _ring_hosts(["10.0.0.5", "10.0.0.6"])
 
 
+class TestBootstrapRing:
+    def test_restores_bootstrap_state_after_success(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _use_ring_temp_dir(monkeypatch, tmp_path)
+        monkeypatch.setenv("MLX_RANK", "original-rank")
+        monkeypatch.setenv("MLX_HOSTFILE", "original-hostfile")
+        hostfile: Path | None = None
+
+        def fake_init(*, backend: str) -> _FakeGroup:
+            nonlocal hostfile
+            hostfile = Path(os.environ["MLX_HOSTFILE"])
+            assert hostfile.exists()
+            assert os.environ["MLX_RANK"] == "1"
+            return _FakeGroup(rank=1, size=2)
+
+        monkeypatch.setattr(mx.distributed, "init", fake_init)
+
+        PipelineGroup.bootstrap_ring(rank=1, peer_ips=["10.0.0.5", "10.0.0.6"])
+
+        assert hostfile is not None
+        assert not hostfile.exists()
+        assert os.environ["MLX_RANK"] == "original-rank"
+        assert os.environ["MLX_HOSTFILE"] == "original-hostfile"
+
+    def test_cleans_bootstrap_state_and_preserves_init_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _use_ring_temp_dir(monkeypatch, tmp_path)
+        monkeypatch.delenv("MLX_RANK", raising=False)
+        monkeypatch.delenv("MLX_HOSTFILE", raising=False)
+        hostfile: Path | None = None
+        expected_error = RuntimeError("ring initialization failed")
+
+        def failing_init(*, backend: str) -> _FakeGroup:
+            nonlocal hostfile
+            hostfile = Path(os.environ["MLX_HOSTFILE"])
+            assert hostfile.exists()
+            raise expected_error
+
+        monkeypatch.setattr(mx.distributed, "init", failing_init)
+
+        with pytest.raises(RuntimeError) as raised:
+            PipelineGroup.bootstrap_ring(rank=0, peer_ips=["10.0.0.5", "10.0.0.6"])
+
+        assert raised.value is expected_error
+        assert hostfile is not None
+        assert not hostfile.exists()
+        assert "MLX_RANK" not in os.environ
+        assert "MLX_HOSTFILE" not in os.environ
+
+
 class _StubLayer(nn.Module):
     """An owned PP layer with the quantized projection registered BEFORE the norm,
     mirroring real Llama/Qwen blocks (attention precedes norms). The packed weight
@@ -232,3 +301,149 @@ class TestPipelinedModel:
         assert wrapper._wire_hidden == 32
         assert wrapper._wire_dtype == layer.q_proj.scales.dtype
         assert wrapper._wire_dtype != layer.input_layernorm.weight.dtype
+
+
+class _StageStubModel:
+    """Records which forward the wrapper takes: the top-level (head) call vs the
+    backbone-only call. ``embed_tokens`` raises, pinning that a dummy forward on
+    a non-first stage never touches the embedding."""
+
+    _HIDDEN = 32
+
+    def __init__(self) -> None:
+        layer = _StubLayer(self._HIDDEN)
+        self.args = SimpleNamespace(hidden_size=self._HIDDEN)
+        self.calls: dict[str, object] = {}
+        self.model = self._backbone(layer)
+
+    def _backbone(self, layer: _StubLayer) -> object:
+        calls = self.calls
+        hidden = self._HIDDEN
+        wire_dtype = layer.q_proj.scales.dtype
+
+        class _Backbone:
+            def __init__(self) -> None:
+                self.layers = [layer]
+                self.embed_tokens = _RaisingEmbed()
+
+            def __call__(self, input_ids, *, cache=None, input_embeddings=None):
+                calls["backbone"] = input_embeddings
+                if input_embeddings is None:
+                    # mirror mlx_lm: the backbone embeds ONLY when no hidden is
+                    # provided — this makes the raising embed a LIVE pin.
+                    self.embed_tokens(input_ids)
+                return mx.zeros((1, input_ids.shape[1], hidden), dtype=wire_dtype)
+
+        return _Backbone()
+
+    def __call__(self, input_ids, *, cache=None, input_embeddings=None):
+        self.calls["full"] = input_embeddings
+        return "model-output"
+
+
+class _RaisingEmbed:
+    def __call__(self, input_ids: object) -> mx.array:
+        raise AssertionError("embed_tokens must not be called on this stage")
+
+
+class TestPipelinedModelDummyForward:
+    def test_non_first_stage_feeds_zeros_at_wire_descriptor(self) -> None:
+        # A middle stage profiles from a locally built zeros hidden (no ring
+        # recv, no embedding) shaped by the wire descriptor.
+        stub = _StageStubModel()
+        wrapper = PipelinedModel(stub, _pp(1, 3))
+
+        out = wrapper.dummy_forward(mx.zeros((1, 4), dtype=mx.int32))
+
+        h_in = stub.calls["backbone"]
+        assert isinstance(h_in, mx.array)
+        assert h_in.shape == (1, 4, 32)
+        assert h_in.dtype == wrapper._wire_dtype
+        assert mx.all(h_in == 0)  # zeros, per upstream's empty intermediates
+        assert "full" not in stub.calls  # head path never taken
+        assert out.dtype == wrapper._wire_dtype
+
+    def test_inherits_wire_dtype_fail_fast(self) -> None:
+        # The dummy shares the stage body with __call__, so a wire-dtype
+        # mismatch fails at profiling/startup instead of on the first request.
+        stub = _StageStubModel()
+        backbone = stub.model
+
+        class _WrongDtypeBackbone:
+            layers = backbone.layers
+            embed_tokens = backbone.embed_tokens
+
+            def __call__(self, input_ids, *, cache=None, input_embeddings=None):
+                return mx.zeros((1, input_ids.shape[1], 32), dtype=mx.bfloat16)
+
+        wrapper = PipelinedModel(stub, _pp(1, 3))
+        stub.model = _WrongDtypeBackbone()
+
+        with pytest.raises(TypeError) as excinfo:
+            wrapper.dummy_forward(mx.zeros((1, 4), dtype=mx.int32))
+        assert str(excinfo.value) == (
+            "PP stage produced hidden mlx.core.bfloat16, but the wire dtype "
+            "(stage compute dtype) is mlx.core.float32; mismatch deadlocks "
+            "the ring."
+        )
+
+
+def _micro_qwen3(tie_word_embeddings: bool, n_layers: int = 2) -> qwen3.Model:
+    args = qwen3.ModelArgs(
+        model_type="qwen3",
+        hidden_size=32,
+        num_hidden_layers=n_layers,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        rms_norm_eps=1e-5,
+        vocab_size=64,
+        max_position_embeddings=128,
+        rope_theta=1000.0,
+        head_dim=8,
+        tie_word_embeddings=tie_word_embeddings,
+    )
+    return qwen3.Model(args)
+
+
+class TestDummyForwardMlxLmContract:
+    """Pin the upstream keyword contract the dummy relies on — a real (micro)
+    mlx_lm model built from args, both tie states, no checkpoint download."""
+
+    @pytest.mark.parametrize("tied", [True, False])
+    def test_first_stage_outputs_hidden_at_wire_dtype(self, tied: bool) -> None:
+        model = _micro_qwen3(tied)
+        pp = _pp(0, 2)
+        apply_pipeline_split(model, pp)
+        wrapper = PipelinedModel(model, pp)
+
+        out = wrapper.dummy_forward(mx.zeros((1, 4), dtype=mx.int32))
+
+        assert out.shape == (1, 4, 32)
+        assert out.dtype == wrapper._wire_dtype
+
+    @pytest.mark.parametrize("tied", [True, False])
+    def test_last_stage_outputs_vocab_logits(self, tied: bool) -> None:
+        model = _micro_qwen3(tied)
+        pp = _pp(1, 2)
+        apply_pipeline_split(model, pp)
+        wrapper = PipelinedModel(model, pp)
+
+        out = wrapper.dummy_forward(mx.zeros((1, 4), dtype=mx.int32))
+
+        assert out.shape == (1, 4, 64)
+
+    def test_middle_stage_never_touches_the_embedding(self) -> None:
+        # The memory win rests on the upstream keyword contract: a backbone
+        # given input_embeddings never calls embed_tokens. Pin it on a real
+        # (micro) qwen3 middle stage by swapping the embedding for a raiser.
+        model = _micro_qwen3(tie_word_embeddings=False, n_layers=3)
+        pp = _pp(1, 3)  # middle: owns neither the embedding nor the head
+        apply_pipeline_split(model, pp)
+        model.model.embed_tokens = _RaisingEmbed()
+        wrapper = PipelinedModel(model, pp)
+
+        out = wrapper.dummy_forward(mx.zeros((1, 4), dtype=mx.int32))
+
+        assert out.shape == (1, 4, 32)
+        assert out.dtype == wrapper._wire_dtype

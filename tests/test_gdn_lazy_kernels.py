@@ -168,6 +168,27 @@ class TestGDNPagedStateCache:
             np.array(pending_state), np.full((2, 1, 4, 32), 9)
         )
 
+    def test_recurrent_decode_view_drains_mismatched_pending_state(self) -> None:
+        # Arrange
+        cache = _make_state_cache(max_seqs=4)
+        initial_state = mx.arange(4 * 1 * 4 * 32, dtype=mx.float32).reshape(4, 1, 4, 32)
+        cache.recurrent_states[0] = mx.array(initial_state)
+        cache.set_pending_recurrent_state(
+            0, [3, 1], mx.full((2, 1, 4, 32), 7, dtype=mx.float32)
+        )
+
+        # Act
+        view = cache.recurrent_state_for_decode(0, [0, 2])
+
+        # Assert
+        assert not view.uses_compact_state
+        assert not cache.has_pending_recurrent_state(0)
+        mx.eval(view.state, view.state_slot_ids)
+        expected_state = np.array(initial_state)
+        expected_state[[3, 1]] = 7
+        np.testing.assert_array_equal(np.array(view.state), expected_state)
+        np.testing.assert_array_equal(np.array(view.state_slot_ids), [0, 2])
+
     def test_decode_state_view_owns_compact_slot_mapping(self) -> None:
         # Arrange
         cache = _make_state_cache(max_seqs=4, conv_kernel_dim=3, conv_dim=4)
@@ -182,6 +203,46 @@ class TestGDNPagedStateCache:
         assert view.uses_compact_state
         np.testing.assert_array_equal(np.array(view.cache_slot_ids), [3, 1])
         np.testing.assert_array_equal(np.array(view.state_slot_ids), [0, 1])
+
+    def test_copy_slots_gathers_overlapping_sources_before_writing(self) -> None:
+        cache = _make_state_cache(
+            max_seqs=4,
+            conv_kernel_dim=2,
+            conv_dim=1,
+            value_head_dim=1,
+            key_head_dim=1,
+        )
+        cache.conv_states[0] = mx.arange(4, dtype=mx.float32).reshape(4, 1, 1)
+        cache.recurrent_states[0] = mx.arange(4, dtype=mx.float32).reshape(4, 1, 1, 1)
+
+        # Destination 2 is also the second source. Both source rows must be
+        # gathered before the in-place writes begin.
+        cache.copy_slots([1, 2], [2, 3], [0])
+        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
+
+        np.testing.assert_array_equal(
+            np.array(cache.conv_states[0]).reshape(-1), [0.0, 1.0, 1.0, 2.0]
+        )
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0]).reshape(-1), [0.0, 1.0, 1.0, 2.0]
+        )
+
+    def test_identity_layout_still_drains_every_layer(self) -> None:
+        # mamba_cache_mode="none" never calls set_layer_layout: every layer is
+        # its own pool and must still be drained.
+        cache = _make_state_cache(num_layers=3, max_seqs=4)
+        for layer_idx in range(3):
+            cache.set_pending_recurrent_state(
+                layer_idx, [layer_idx], mx.full((1, 1, 4, 32), 2, dtype=mx.float32)
+            )
+
+        cache.apply_pending_recurrent_states()
+
+        for layer_idx in range(3):
+            assert not cache.has_pending_recurrent_state(layer_idx)
+            np.testing.assert_array_equal(
+                np.array(cache.recurrent_states[layer_idx][layer_idx]), 2.0
+            )
 
 
 def _require_metal() -> None:
@@ -208,6 +269,7 @@ def _get_native_ops_or_skip() -> Any:
 
 def _make_state_cache(
     *,
+    num_layers: int = 1,
     max_seqs: int = 3,
     conv_kernel_dim: int = 3,
     conv_dim: int = 4,
@@ -216,7 +278,7 @@ def _make_state_cache(
     key_head_dim: int = 32,
 ) -> GDNPagedStateCache:
     return GDNPagedStateCache(
-        num_layers=1,
+        num_layers=num_layers,
         max_seqs=max_seqs,
         conv_kernel_dim=conv_kernel_dim,
         conv_dim=conv_dim,
@@ -266,7 +328,6 @@ def _recurrent_prefill_request(
     output_dtype: mx.Dtype = mx.float32,
     compute_dtype: mx.Dtype | None = None,
     defer_state_scatter: bool = False,
-    materialize_outputs: bool = False,
 ) -> GDNRecurrentPrefillRequest:
     return GDNRecurrentPrefillRequest(
         q=q,
@@ -281,7 +342,6 @@ def _recurrent_prefill_request(
         cu_seqlens=cu_seqlens,
         compute_dtype=compute_dtype,
         defer_state_scatter=defer_state_scatter,
-        materialize_outputs=materialize_outputs,
     )
 
 
@@ -648,7 +708,10 @@ class TestLazyConvPrefill:
         # Assert
         assert result is not None
         assert cache.pending_conv_state(0, [3, 1]) is None
-        assert decode_kernel.state_input is cache.conv_states[0]
+        # The kernel must read the stable pool, not the compact pending rows.
+        # Object identity no longer distinguishes them: the in-place scatter
+        # mints a fresh handle onto the same buffer, so compare shape.
+        assert decode_kernel.state_input.shape == cache.conv_states[0].shape
         mx.eval(cache.conv_states[0], decode_kernel.slot_mapping)
         np.testing.assert_array_equal(np.array(decode_kernel.slot_mapping), [1, 3])
         expected_state = np.array(initial_state)
@@ -779,9 +842,74 @@ class TestLazyRecurrentDecode:
         assert fake_kernel.grid == (32, 3, 4)
         assert fake_kernel.threadgroup == (32, 4, 1)
         assert fake_kernel.output_shapes == [(2, 2, 3), (2, 2, 3, 32)]
+        # Decode defers its compact update; draining it must land the new state
+        # on the active slots and leave every other slot untouched.
+        assert cache.pending_recurrent_state(0, slot_ids) is not None
+        cache.apply_pending_recurrent_state(0)
         mx.eval(cache.recurrent_states[0])
         expected_state = np.array(initial_state)
         expected_state[slot_ids] = 9
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0]), expected_state
+        )
+
+    def test_consecutive_decodes_never_touch_the_stable_pool(self) -> None:
+        # Arrange
+        decode_kernel = _RecordingStateKernel(
+            mx.ones((2, 2, 3), dtype=mx.float32),
+            mx.full((2, 2, 3, 32), 7, dtype=mx.float32),
+            state_input_index=5,
+            slot_mapping_index=6,
+        )
+        cache = _make_state_cache(
+            max_seqs=4,
+            num_v_heads=2,
+            value_head_dim=3,
+            key_head_dim=32,
+        )
+        initial_state = mx.arange(4 * 2 * 3 * 32, dtype=mx.float32).reshape(4, 2, 3, 32)
+        cache.recurrent_states[0] = mx.array(initial_state)
+        slot_ids = [3, 1]
+        kernels = GDNLazyKernels(
+            enabled=True,
+            conv_kernel=_RaisingKernel(),
+            recurrent_decode_kernel=decode_kernel,
+        )
+        request = _recurrent_request(
+            q=mx.zeros((1, 2, 1, 32), dtype=mx.float32),
+            k=mx.zeros((1, 2, 1, 32), dtype=mx.float32),
+            v=mx.zeros((1, 2, 2, 3), dtype=mx.float32),
+            g=mx.zeros((1, 2, 2), dtype=mx.float32),
+            beta=mx.zeros((1, 2, 2), dtype=mx.float32),
+            cache=cache,
+            slot_ids=slot_ids,
+        )
+
+        # Act
+        for _ in range(2):
+            assert kernels.try_recurrent_decode(request) is not None
+
+        # Assert: each step fed the previous step's compact update straight
+        # back into the kernel, so the pool still holds its pre-decode bytes.
+        assert decode_kernel.state_input is not None
+        assert decode_kernel.state_input.shape == (2, 2, 3, 32)
+        mx.eval(
+            cache.recurrent_states[0],
+            decode_kernel.state_input,
+            decode_kernel.slot_mapping,
+        )
+        np.testing.assert_array_equal(
+            np.array(decode_kernel.state_input), np.full((2, 2, 3, 32), 7)
+        )
+        np.testing.assert_array_equal(np.array(decode_kernel.slot_mapping), [0, 1])
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0]), np.array(initial_state)
+        )
+        # Draining once publishes the latest update to the active slots.
+        cache.apply_pending_recurrent_state(0)
+        mx.eval(cache.recurrent_states[0])
+        expected_state = np.array(initial_state)
+        expected_state[slot_ids] = 7
         np.testing.assert_array_equal(
             np.array(cache.recurrent_states[0]), expected_state
         )
@@ -866,6 +994,9 @@ class TestLazyRecurrentDecode:
 
         # Assert
         assert lazy_out is not None
+        # The lazy decode path parks its state update; drain it so the pool
+        # can be compared against the C++ oracle's in-place pool.
+        cache_lazy.apply_pending_recurrent_state(0)
         mx.eval(lazy_out, cache_lazy.recurrent_states[0])
 
         q_flat = mx.contiguous(q.reshape(total_tokens, n_hk, d_k))
@@ -1057,9 +1188,15 @@ class TestLazyRecurrentPrefill:
         # Assert
         assert prefill_out is not None
         assert decode_out is not None
-        assert cache.pending_recurrent_state(0, slot_ids) is None
+        # Decode consumed the prefill's compact update in place of the pool and
+        # replaced it with its own, so the pool is never touched in between.
+        pending = cache.pending_recurrent_state(0, slot_ids)
+        assert pending is not None
+        mx.eval(pending)
+        np.testing.assert_array_equal(np.array(pending), np.full((2, 2, 3, 32), 7))
         assert decode_kernel.state_input is not None
         assert decode_kernel.state_input.shape == (2, 2, 3, 32)
+        cache.apply_pending_recurrent_state(0)
         mx.eval(cache.recurrent_states[0], decode_kernel.slot_mapping)
         np.testing.assert_array_equal(np.array(decode_kernel.slot_mapping), [0, 1])
         expected_state = np.array(initial_state)
@@ -1068,7 +1205,7 @@ class TestLazyRecurrentPrefill:
             np.array(cache.recurrent_states[0]), expected_state
         )
 
-    def test_materialized_deferred_prefill_evals_compact_state(
+    def test_deferred_prefill_does_not_materialize_outputs(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Arrange
@@ -1098,7 +1235,6 @@ class TestLazyRecurrentPrefill:
             slot_ids=slot_ids,
             cu_seqlens=[0, 2, 5],
             defer_state_scatter=True,
-            materialize_outputs=True,
         )
 
         # Act
@@ -1111,15 +1247,13 @@ class TestLazyRecurrentPrefill:
 
         # Assert
         assert result is not None
-        assert len(eval_args) == 1
-        assert len(eval_args[0]) == 2
-        assert eval_args[0][1].shape == (2, 2, 3, 32)
-        assert cache.pending_recurrent_state(0, slot_ids) is eval_args[0][1]
+        assert not eval_args
+        assert cache.pending_recurrent_state(0, slot_ids) is not None
         np.testing.assert_array_equal(
             np.array(cache.recurrent_states[0]), np.array(initial_state)
         )
 
-    def test_materialized_scattered_prefill_contiguates_state_pool(
+    def test_scattered_prefill_does_not_force_materialization(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Arrange
@@ -1154,7 +1288,6 @@ class TestLazyRecurrentPrefill:
             slot_ids=slot_ids,
             cu_seqlens=[0, 2, 5],
             defer_state_scatter=False,
-            materialize_outputs=True,
         )
 
         # Act
@@ -1167,10 +1300,8 @@ class TestLazyRecurrentPrefill:
 
         # Assert
         assert result is not None
-        assert len(contiguous_args) == 1
-        assert contiguous_args[0].shape == (4, 2, 3, 32)
-        assert len(eval_args) == 1
-        assert eval_args[0][1] is cache.recurrent_states[0]
+        assert not contiguous_args
+        assert not eval_args
         assert cache.pending_recurrent_state(0, slot_ids) is None
 
     @pytest.mark.parametrize(
@@ -1643,3 +1774,181 @@ class TestGDNLazySharedOwner:
             "gdn_recurrent_decode_v2",
             "gdn_recurrent_prefill_v2",
         ]
+
+
+class TestNativeGDNStateScatter:
+    """The in-place row scatter that replaces MLX's whole-pool copy."""
+
+    @staticmethod
+    def _scatter_fn() -> Any:
+        return _get_native_ops_or_skip().gdn_state_scatter
+
+    @pytest.mark.parametrize(
+        ("shape", "dtype", "slots"),
+        [
+            ((8, 3, 4), mx.float32, [0, 5, 2]),
+            ((8, 1, 4, 32), mx.float32, [7, 1]),
+            ((8, 3, 4), mx.float16, [3]),
+            ((8, 3, 4), mx.bfloat16, [6, 0]),
+            ((16, 2, 6144), mx.float32, [15, 4, 9]),
+            # row lengths not divisible by 4 take the scalar kernel
+            ((8, 3), mx.float32, [0, 5]),
+            ((8, 7), mx.float16, [2]),
+            ((8, 5, 3), mx.bfloat16, [6, 1]),
+        ],
+    )
+    def test_matches_mlx_indexed_assignment(
+        self, shape: tuple[int, ...], dtype: mx.Dtype, slots: list[int]
+    ) -> None:
+        scatter = self._scatter_fn()
+        rng = np.random.default_rng(0)
+        pool_np = rng.standard_normal(shape).astype(np.float32)
+        rows_np = rng.standard_normal((len(slots), *shape[1:])).astype(np.float32)
+        ids = mx.array(slots, dtype=mx.int32)
+
+        reference = mx.array(pool_np).astype(dtype)
+        reference[ids] = mx.array(rows_np).astype(dtype)
+        mx.eval(reference)
+
+        pool = mx.array(pool_np).astype(dtype)
+        mx.eval(pool)
+        out = scatter(pool, mx.array(rows_np).astype(dtype), ids)
+        mx.eval(out)
+
+        np.testing.assert_array_equal(
+            np.array(out.astype(mx.float32)), np.array(reference.astype(mx.float32))
+        )
+
+    def test_writes_through_the_original_buffer(self) -> None:
+        # The output aliases the pool buffer -- that is what avoids the copy,
+        # and what makes the caller's rebind mandatory.
+        scatter = self._scatter_fn()
+        pool = mx.zeros((4, 2, 2), dtype=mx.float32)
+        mx.eval(pool)
+        out = scatter(
+            pool, mx.ones((1, 2, 2), dtype=mx.float32), mx.array([2], mx.int32)
+        )
+        mx.eval(out)
+        np.testing.assert_array_equal(np.array(pool[2]), 1.0)
+
+    def test_empty_update_leaves_the_pool_alone(self) -> None:
+        scatter = self._scatter_fn()
+        pool = mx.ones((4, 2, 2), dtype=mx.float32)
+        mx.eval(pool)
+        out = scatter(
+            pool,
+            mx.zeros((0, 2, 2), dtype=mx.float32),
+            mx.array([], dtype=mx.int32),
+        )
+        mx.eval(out)
+        np.testing.assert_array_equal(np.array(out), 1.0)
+
+    def test_rejects_mismatched_inputs(self) -> None:
+        scatter = self._scatter_fn()
+        pool = mx.zeros((4, 2, 2), dtype=mx.float32)
+        mx.eval(pool)
+        with pytest.raises(RuntimeError, match="dtypes differ"):
+            scatter(
+                pool,
+                mx.ones((1, 2, 2), dtype=mx.float16),
+                mx.array([0], dtype=mx.int32),
+            )
+        with pytest.raises(RuntimeError, match="dst_ids must be int32"):
+            scatter(
+                pool,
+                mx.ones((1, 2, 2), dtype=mx.float32),
+                mx.array([0], dtype=mx.int64),
+            )
+        with pytest.raises(RuntimeError, match="one dst id per src row"):
+            scatter(
+                pool,
+                mx.ones((2, 2, 2), dtype=mx.float32),
+                mx.array([0], dtype=mx.int32),
+            )
+        with pytest.raises(RuntimeError, match="must be mlx.core.array"):
+            # inst_ptr on a non-array is undefined behaviour; this used to
+            # segfault rather than raise.
+            scatter(pool, mx.ones((1, 2, 2), dtype=mx.float32), [0])
+        with pytest.raises(RuntimeError, match="row shape does not match"):
+            scatter(
+                pool,
+                mx.ones((1, 3, 2), dtype=mx.float32),
+                mx.array([0], dtype=mx.int32),
+            )
+        with pytest.raises(RuntimeError, match="row shape does not match"):
+            scatter(
+                pool,
+                mx.array(1, dtype=mx.float32),
+                mx.array([0], dtype=mx.int32),
+            )
+
+    def test_rejects_unsupported_pool_dtype(self) -> None:
+        scatter = self._scatter_fn()
+        with pytest.raises(RuntimeError, match="pool dtype must be"):
+            scatter(
+                mx.zeros((4, 2), dtype=mx.int32),
+                mx.ones((1, 2), dtype=mx.int32),
+                mx.array([0], dtype=mx.int32),
+            )
+
+    def test_materializes_noncontiguous_source_and_ids(self) -> None:
+        scatter = self._scatter_fn()
+        pool = mx.zeros((4, 2), dtype=mx.float32)
+        rows = mx.arange(8, dtype=mx.float32).reshape(2, 4)[:, ::2]
+        ids = mx.array([0, 3, 1, 3], dtype=mx.int32)[::2]
+
+        updated = scatter(pool, rows, ids)
+        mx.eval(updated)
+
+        np.testing.assert_array_equal(np.array(updated[:2]), [[0.0, 2.0], [4.0, 6.0]])
+
+    def test_materializes_noncontiguous_pool(self) -> None:
+        scatter = self._scatter_fn()
+        base = mx.arange(8, dtype=mx.float32).reshape(2, 4)
+        mx.eval(base)
+        pool = base.T
+        updated = scatter(
+            pool,
+            mx.array([[9.0, 10.0]], dtype=mx.float32),
+            mx.array([1], dtype=mx.int32),
+        )
+        mx.eval(updated)
+
+        np.testing.assert_array_equal(
+            np.array(updated),
+            [[0.0, 4.0], [9.0, 10.0], [2.0, 6.0], [3.0, 7.0]],
+        )
+
+    def test_converts_source_dtype_like_mlx_does(self) -> None:
+        # MLX's indexed assignment converts the source implicitly, so callers
+        # pass int literals into fp32 pools; the primitive demands an exact
+        # match, so the cache helper must convert before dispatching.
+        self._scatter_fn()  # skip when the primitive is unavailable
+        cache = _make_state_cache(max_seqs=4, conv_kernel_dim=3, conv_dim=4)
+        pool = cache.conv_states[0]
+        rows = mx.full((1, 2, 4), 5)  # int32, unlike the fp32 pool
+        assert rows.dtype != pool.dtype
+
+        updated = cache._scatter_rows(pool, rows, mx.array([2], dtype=mx.int32))
+        mx.eval(updated)
+
+        np.testing.assert_array_equal(np.array(updated[2]), 5.0)
+
+    def test_shared_cache_drain_chains_native_scatters(self) -> None:
+        self._scatter_fn()  # skip when the primitive is unavailable
+        cache = _make_state_cache(num_layers=2, max_seqs=4)
+        cache.set_layer_layout([0, 1], [0, 0])
+        cache.set_pending_recurrent_state(
+            0, [0], mx.full((1, 1, 4, 32), 3, dtype=mx.float32)
+        )
+        cache.set_pending_recurrent_state(
+            1, [2], mx.full((1, 1, 4, 32), 7, dtype=mx.float32)
+        )
+
+        cache.apply_pending_recurrent_states()
+        mx.eval(cache.recurrent_states[0])
+
+        expected = np.zeros(cache.recurrent_states[0].shape, dtype=np.float32)
+        expected[0] = 3
+        expected[2] = 7
+        np.testing.assert_array_equal(np.array(cache.recurrent_states[0]), expected)

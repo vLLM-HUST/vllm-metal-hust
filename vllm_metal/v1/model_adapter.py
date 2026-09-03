@@ -27,6 +27,13 @@ class TargetModelForwardOutput:
     hidden_states: mx.array | None = None
 
 
+@dataclass(frozen=True)
+class IntermediateForwardOutput:
+    """Projection-free forward output for a no-sample intermediate step."""
+
+    hidden_states: mx.array
+
+
 class MultimodalEncodeResult(Protocol):
     """Adapter-owned vision output for one multimodal feature."""
 
@@ -130,6 +137,18 @@ class ModelAdapter(Protocol):
     def text_model(self, model: Any) -> Any:
         """Return the callable model used for text-only execution."""
 
+    def supports_intermediate_forward(self, model: Any) -> bool:
+        """Whether :meth:`intermediate_forward` can run *model*."""
+
+    def intermediate_forward(
+        self,
+        model: Any,
+        input_ids: mx.array,
+        *,
+        cache: Any | None = None,
+    ) -> IntermediateForwardOutput:
+        """Run *model* without the output projection (cache writes only)."""
+
     def target_forward(
         self,
         model: Any,
@@ -137,8 +156,16 @@ class ModelAdapter(Protocol):
         *,
         cache: Any | None = None,
         collect_hidden_states: bool = False,
+        logits_indices: mx.array | None = None,
     ) -> TargetModelForwardOutput:
-        """Run the target text model and optionally retain target hidden states."""
+        """Run the target text model and optionally retain target hidden states.
+
+        ``logits_indices`` requests logits for those input rows only, and is
+        valid only when :meth:`supports_selective_logits` returned ``True``.
+        """
+
+    def supports_selective_logits(self, model: Any) -> bool:
+        """Whether ``target_forward`` may honour ``logits_indices`` for ``model``."""
 
     def target_input_embeddings(self, model: Any, input_ids: mx.array) -> mx.array:
         """Return target/backbone-dim token embeddings for ``input_ids``."""
@@ -224,35 +251,57 @@ class DefaultModelAdapter(ModelAdapter):
         override once mlx_vlm Gemma4 parity is fixed upstream.
 
         Qwen3.5/Qwen3.6 conditional-generation wrappers: these configs are
-        marked multimodal even when served text-only. Route them through
-        mlx_lm's qwen3_5 text loader so FP8 `*_weight_scale_inv` tensors are
-        consumed correctly instead of failing inside mlx_vlm.load().
+        marked multimodal even when served text-only, and both quantized
+        families diverge under mlx_vlm.load() — FP8 fails on
+        `*_weight_scale_inv` tensors, while MLX affine checkpoints load but,
+        unless the config exposes a real VL shape, run the bare language model
+        with unset mrope state and generate garbled output.  Both route through
+        the mlx_lm text loader instead; MLX-quant wrappers with a native VL
+        config keep the multimodal path.
         """
         if hf_config is None:
             return False
 
-        model_type = getattr(hf_config, "model_type", "")
-        if model_type in _TEXT_BACKBONE_OVERRIDE_TYPES:
+        model_type_from_hf = hf_config.model_type
+        if model_type_from_hf in _TEXT_BACKBONE_OVERRIDE_TYPES:
             return True
 
-        architectures = getattr(hf_config, "architectures", ()) or ()
-        if not any(
-            arch in _TEXT_BACKBONE_OVERRIDE_ARCHITECTURES for arch in architectures
-        ):
+        architectures_from_hf = tuple(hf_config.architectures or ())
+        has_text_backbone_architecture = any(
+            arch in _TEXT_BACKBONE_OVERRIDE_ARCHITECTURES
+            for arch in architectures_from_hf
+        )
+        if not has_text_backbone_architecture:
             return False
 
-        quantization_config = getattr(hf_config, "quantization_config", None)
-        if isinstance(quantization_config, dict):
-            quant_method = quantization_config.get("quant_method")
-        else:
-            quant_method = getattr(quantization_config, "quant_method", None)
-        return quant_method == "fp8"
+        if self._has_fp8_quantization_config(hf_config):
+            return True
+
+        # MLX affine Qwen3.5/Qwen3.6 text wrappers may still carry a
+        # vision_config, but mlx_vlm drives those text-only checkpoints with
+        # unset mRoPE state and produces garbled output.  Real Qwen3-VL uses
+        # Qwen3VLForConditionalGeneration, which is not in the text-wrapper
+        # architecture set above and therefore keeps the native path.
+        return self._has_mlx_quantized_weights(hf_config)
+
+    def _has_fp8_quantization_config(self, hf_config: Any) -> bool:
+        quantization_config_from_hf = getattr(hf_config, "quantization_config", None)
+        if isinstance(quantization_config_from_hf, dict):
+            return quantization_config_from_hf.get("quant_method") == "fp8"
+        return getattr(quantization_config_from_hf, "quant_method", None) == "fp8"
+
+    def _has_mlx_quantized_weights(self, hf_config: Any) -> bool:
+        mlx_quantization_from_hf = getattr(hf_config, "quantization", None)
+        return (
+            isinstance(mlx_quantization_from_hf, dict)
+            and "bits" in mlx_quantization_from_hf
+        )
 
     def should_force_text_backbone(self, hf_config: Any) -> bool:
         """Whether the current serve mode should use the text-only path.
 
-        ``multimodal-native`` disables compatibility overrides. ``auto`` and
-        ``text-only-compat`` share the same compatibility allowlist.
+        ``multimodal-native`` disables compatibility overrides. ``auto`` uses
+        the compatibility allowlist.
         """
         multimodal_mode = self._multimodal_mode()
         if multimodal_mode == "multimodal-native":
@@ -329,6 +378,39 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             return model.language_model
         return model
 
+    def supports_intermediate_forward(self, model: Any) -> bool:
+        """Whether :meth:`intermediate_forward` can run *model*.
+
+        A capability probe for the runner to resolve once at load time; the
+        full-logits forward is the working default whenever it is ``False``.
+        """
+        return self._transformer_body(model) is not None
+
+    def intermediate_forward(
+        self,
+        model: Any,
+        input_ids: mx.array,
+        *,
+        cache: Any | None = None,
+    ) -> IntermediateForwardOutput:
+        """Run *model*'s transformer body without the output projection.
+
+        For a prefill chunk that samples nothing, the KV/GDN cache writes
+        are the real output; skipping the vocab projection over the chunk
+        is pure dead-compute elimination.
+        """
+        body = self._transformer_body(model)
+        if body is None:
+            raise ValueError(
+                f"{type(model).__name__} has no resolvable transformer body; "
+                "callers must gate on supports_intermediate_forward()."
+            )
+        return IntermediateForwardOutput(hidden_states=body(input_ids, cache=cache))
+
+    def _transformer_body(self, model: Any) -> Any | None:
+        backbone = self._target_backbone(model)
+        return backbone if callable(backbone) else None
+
     def target_forward(
         self,
         model: Any,
@@ -336,9 +418,15 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         *,
         cache: Any | None = None,
         collect_hidden_states: bool = False,
+        logits_indices: mx.array | None = None,
     ) -> TargetModelForwardOutput:
-        """Run the target model and return logits plus optional hidden states."""
-        if not collect_hidden_states:
+        """Run the target model and return logits plus optional hidden states.
+
+        ``logits_indices`` projects the head outside the model's own
+        ``__call__``, so callers must gate it on
+        :meth:`supports_selective_logits`; this method trusts them.
+        """
+        if logits_indices is None and not collect_hidden_states:
             output = model(input_ids, cache=cache)
             return TargetModelForwardOutput(
                 logits=self.extract_logits(output),
@@ -350,11 +438,58 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             input_ids,
             cache=cache,
         )
-        logits = self._compute_target_logits(model, hidden_states)
+        flat_hidden_states = self._flatten_target_hidden_states(hidden_states)
+        if logits_indices is None:
+            logits = self._compute_target_logits(model, hidden_states)
+            return TargetModelForwardOutput(
+                logits=logits,
+                hidden_states=flat_hidden_states if collect_hidden_states else None,
+            )
+
+        # `[None]` restores the leading batch axis the callers' `logits[0, row]`
+        # indexing expects. The hidden states stay row-major over ALL input rows,
+        # so the drafter's `target_hidden_row` keeps indexing the packed layout.
+        selected_hidden_states = mx.take(flat_hidden_states, logits_indices, axis=0)
         return TargetModelForwardOutput(
-            logits=logits,
-            hidden_states=self._flatten_target_hidden_states(hidden_states),
+            logits=self._compute_target_logits(model, selected_hidden_states[None]),
+            hidden_states=flat_hidden_states if collect_hidden_states else None,
         )
+
+    def supports_selective_logits(self, model: Any) -> bool:
+        """Whether the split backbone/head path reproduces this model's head.
+
+        No ``mlx_lm`` model exposes a ``compute_logits`` contract, and some scale
+        the head output inside their own ``__call__`` (Cohere's ``logit_scale``,
+        Granite's ``logits_scaling``), which `_compute_target_logits` would not
+        reproduce — a silent wrong-logits bug rather than a crash. Rather than
+        keep a model allowlist in sync with ``mlx_lm``, probe the loaded object
+        for bit-exact agreement on one row.
+
+        Resolved once after load: the probe runs a cacheless forward, which is
+        only safe while no ``PagedAttentionContext`` is installed.
+        """
+        probe_ids = mx.zeros((1, 1), dtype=mx.int32)
+        try:
+            reference = self.extract_logits(model(probe_ids, cache=None))
+            hidden_states = self._forward_target_hidden_states(
+                model, probe_ids, cache=None
+            )
+            split = self._compute_target_logits(model, hidden_states)
+            mx.eval(reference, split)
+            # array_equal is False on a shape mismatch, so this covers both.
+            matches = bool(mx.array_equal(reference, split).item())
+        except Exception:
+            # A wrapper the split path cannot drive (extra forward argument,
+            # missing backbone, unexpected output container).
+            matches = False
+
+        if not matches:
+            logger.info(
+                "Metal: %s output head is not reproducible outside its forward; "
+                "using full logits.",
+                type(model).__name__,
+            )
+        return matches
 
     def target_input_embeddings(self, model: Any, input_ids: mx.array) -> mx.array:
         """Return target/backbone-dim token embeddings for Gemma4 MTP feedback."""

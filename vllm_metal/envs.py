@@ -20,14 +20,18 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     VLLM_METAL_MEMORY_FRACTION: str = "auto"
-    VLLM_METAL_USE_MLX: bool = True
     VLLM_MLX_DEVICE: str = "gpu"
-    VLLM_METAL_DEBUG: bool = False
     VLLM_METAL_USE_PAGED_ATTENTION: bool = True
     VLLM_METAL_MULTIMODAL_MODE: str = "auto"
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
+    VLLM_METAL_DECODE_PIPELINE: bool = True
+    VLLM_METAL_COMPILED_MLP: bool = False
+    VLLM_METAL_NATIVE_SAMPLING: bool = False
     VLLM_METAL_MLA_KERNEL: bool = False
+    VLLM_METAL_DISABLE_NAX: bool = False
+    VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
+    VLLM_METAL_SPEC_INGEST_CHUNK: int = 1024
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
     VLLM_METAL_RING_BASE_PORT: int = 32323
@@ -39,20 +43,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_MEMORY_FRACTION": lambda: os.getenv(
         "VLLM_METAL_MEMORY_FRACTION", "auto"
     ),
-    # Whether to use MLX as the compute backend (default True).
-    "VLLM_METAL_USE_MLX": lambda: os.getenv("VLLM_METAL_USE_MLX", "1") == "1",
     # MLX device type: "gpu" (default) or "cpu".
     "VLLM_MLX_DEVICE": lambda: os.getenv("VLLM_MLX_DEVICE", "gpu"),
-    # Enable verbose debug logging (default False).
-    "VLLM_METAL_DEBUG": lambda: os.getenv("VLLM_METAL_DEBUG", "0") == "1",
     # Use native Metal paged attention (default True).
     "VLLM_METAL_USE_PAGED_ATTENTION": lambda: (
         os.getenv("VLLM_METAL_USE_PAGED_ATTENTION", "1") == "1"
     ),
     # Multimodal serving mode:
     # - "auto": known-incompatible multimodal checkpoints fall back to the
-    #   text-only compatibility path.
-    # - "text-only-compat": force known-safe multimodal checkpoints onto the
     #   text-only compatibility path.
     # - "multimodal-native": keep native multimodal loading enabled.
     "VLLM_METAL_MULTIMODAL_MODE": lambda: os.getenv(
@@ -65,6 +63,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_GDN_LAZY_KERNELS": lambda: (
         os.getenv("VLLM_METAL_GDN_LAZY_KERNELS", "1") == "1"
     ),
+    # One-step-ahead decode pipelining (default on). Eligible pure-decode
+    # greedy steps defer the sampling sync one step so the next step's graph
+    # build and submit overlap the in-flight GPU forward. Set to "0" to
+    # force the fully synchronous per-step sample path.
+    "VLLM_METAL_DECODE_PIPELINE": lambda: (
+        os.getenv("VLLM_METAL_DECODE_PIPELINE", "1") == "1"
+    ),
+    # Compiled stateless-MLP dispatch (opt-in): decode-shaped MLP/MoE
+    # block calls run through an mx.compile trace, fusing the per-layer
+    # elementwise glue. Bitwise-identical on the quantized serving path;
+    # set to "1" to enable, the default keeps the eager per-op dispatch.
+    "VLLM_METAL_COMPILED_MLP": lambda: os.getenv("VLLM_METAL_COMPILED_MLP", "0") == "1",
+    # MLX-native non-greedy sampling for the decode pipeline (opt-in): the
+    # pipeline's deferred sampler learns a temperature/top-k/top-p graph, so
+    # eligible non-greedy pure-decode steps defer like greedy ones instead
+    # of dropping to the synchronous torch path. Requests with seeds,
+    # penalties, logprobs, or token constraints keep the torch path
+    # unchanged. Set to "1" to enable; intended to flip default-on once the
+    # path has serve mileage, with this var remaining as the kill switch.
+    "VLLM_METAL_NATIVE_SAMPLING": lambda: (
+        os.getenv("VLLM_METAL_NATIVE_SAMPLING", "0") == "1"
+    ),
     # Experimental MLA Metal decode kernel (RFC #360). Off by default —
     # the MLA wrapper uses the MLX SDPA per-request slow path unless
     # this opt-in is set. Set to "1" to route absorbed-MLA decode
@@ -73,6 +93,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qk_rope_head_dim=64, block_size ∈ {16, 32}, fp16/bf16,
     # decode-only).
     "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
+    # Emergency override for automatic M5 NAX prefill attention.
+    "VLLM_METAL_DISABLE_NAX": lambda: os.getenv("VLLM_METAL_DISABLE_NAX", "0") == "1",
+    # Spec-decode verification window mode (issue #465). Off by default —
+    # verify windows keep the expanded per-token layout (main behavior)
+    # unless this opt-in is set. Set to "1" to merge K+1 verify windows
+    # into one segment and share each KV block load across the window
+    # rows. Profitability is chip- and shape-dependent: measured wins at
+    # conc >= 4 with 8k+ context (M2 Ultra / M3 Ultra / M4 Pro, up to
+    # +40% e2e at conc 16-32), measured losses single-stream on M4 Pro
+    # and at conc 32 on M2 Max. Outputs are bitwise identical either way.
+    "VLLM_METAL_SPEC_VERIFY_WINDOW": lambda: (
+        os.getenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "0") == "1"
+    ),
+    # Max tokens of cold draft KV ingested per forward (issue #482,
+    # direction 3). The first propose of a fresh prefix ingests the whole
+    # prompt into the draft model's KV in one tiled prefill forward;
+    # chunking bounds the stall at any single dispatch and the logits peak
+    # allocation (draft_vocab x chunk instead of x prompt length). 1024
+    # tokens is ~2 ms of draft-model work on a modern M-series chip; a
+    # multiple of the block size is recommended. Set to "0" to restore the
+    # single-forward behavior.
+    "VLLM_METAL_SPEC_INGEST_CHUNK": lambda: int(
+        os.getenv("VLLM_METAL_SPEC_INGEST_CHUNK", "1024")
+    ),
     # When set, compile the native _paged_ops extension from source at runtime
     # instead of loading the prebuilt artifact shipped in the wheel. Intended
     # for kernel developers / source installs; requires Xcode command-line

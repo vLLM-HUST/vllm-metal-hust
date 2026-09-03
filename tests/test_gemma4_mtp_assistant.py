@@ -79,13 +79,9 @@ def _target_args(**overrides: object) -> dict[str, object]:
 def _validate_assistant_config(
     assistant_config: Any,
     *,
-    target_hf_config: Any | None,
     target_model_args: Mapping[str, Any],
 ) -> Gemma4MTPAssistantMetadata:
-    target_metadata = Gemma4MTPTargetMetadata.from_configs(
-        target_hf_config=target_hf_config,
-        target_model_args=target_model_args,
-    )
+    target_metadata = Gemma4MTPTargetMetadata.from_model_args(target_model_args)
     if isinstance(assistant_config, Gemma4MTPAssistantMetadata):
         metadata = assistant_config
     else:
@@ -97,6 +93,7 @@ def _validate_assistant_config(
 def _speculative_config(*, hf_config: object | None = None) -> SimpleNamespace:
     draft_config = SimpleNamespace(
         model="/assistant",
+        revision=None,
         hf_config=hf_config or SimpleNamespace(model_type="gemma4_mtp"),
     )
     return SimpleNamespace(
@@ -105,14 +102,6 @@ def _speculative_config(*, hf_config: object | None = None) -> SimpleNamespace:
         revision=None,
         draft_model_config=draft_config,
     )
-
-
-class _ConfigWithTextAccessor:
-    def __init__(self, text_config: object) -> None:
-        self._text_config = text_config
-
-    def get_text_config(self) -> object:
-        return self._text_config
 
 
 @pytest.mark.parametrize("model_type", sorted(GEMMA4_MTP_DRAFT_MODEL_TYPES))
@@ -135,7 +124,6 @@ def test_validate_rejects_unknown_assistant_model_type_with_known_architecture()
     with pytest.raises(ValueError, match="model_type='unknown'"):
         _validate_assistant_config(
             _assistant_config(model_type="unknown"),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -149,7 +137,6 @@ def test_detection_ignores_malformed_non_gemma_architectures() -> None:
 def test_validate_accepts_matching_assistant_config() -> None:
     metadata = _validate_assistant_config(
         _assistant_config(),
-        target_hf_config=None,
         target_model_args=_target_args(),
     )
 
@@ -162,159 +149,16 @@ def test_validate_accepts_matching_assistant_config() -> None:
 def test_validate_records_tie_word_embeddings_contract() -> None:
     metadata = _validate_assistant_config(
         _assistant_config(tie_word_embeddings=False),
-        target_hf_config=None,
         target_model_args=_target_args(),
     )
 
     assert metadata.tie_word_embeddings is False
 
 
-def test_validate_accepts_target_metadata_from_hf_text_config() -> None:
-    target_hf_config = SimpleNamespace(
-        text_config=SimpleNamespace(
-            model_type="gemma4_text",
-            vocab_size=262144,
-            hidden_size=1536,
-            num_hidden_layers=4,
-            num_kv_shared_layers=0,
-            layer_types=[
-                "sliding_attention",
-                "sliding_attention",
-                "sliding_attention",
-                "full_attention",
-            ],
-        )
-    )
-
-    metadata = _validate_assistant_config(
-        _assistant_config(),
-        target_hf_config=target_hf_config,
-        target_model_args={
-            "vocab_size": 262144,
-            "hidden_size": 1536,
-        },
-    )
-
-    assert metadata.backbone_hidden_size == 1536
-
-
-def test_validate_rejects_mismatched_target_vocab_sources() -> None:
-    target_hf_config = SimpleNamespace(
-        text_config=SimpleNamespace(
-            model_type="gemma4_text",
-            vocab_size=32000,
-            hidden_size=1536,
-            num_hidden_layers=4,
-            num_kv_shared_layers=0,
-            layer_types=[
-                "sliding_attention",
-                "sliding_attention",
-                "sliding_attention",
-                "full_attention",
-            ],
-        )
-    )
-
-    with pytest.raises(ValueError, match="vocab_size metadata mismatch"):
-        _validate_assistant_config(
-            _assistant_config(),
-            target_hf_config=target_hf_config,
-            target_model_args=_target_args(),
-        )
-
-
-def test_validate_rejects_mismatched_target_layer_type_sources() -> None:
-    target_hf_config = SimpleNamespace(
-        text_config=SimpleNamespace(
-            model_type="gemma4_text",
-            vocab_size=262144,
-            hidden_size=1536,
-            num_hidden_layers=4,
-            num_kv_shared_layers=0,
-            layer_types=[
-                "full_attention",
-                "sliding_attention",
-                "sliding_attention",
-                "full_attention",
-            ],
-        )
-    )
-
-    with pytest.raises(ValueError, match="layer_types metadata mismatch"):
-        _validate_assistant_config(
-            _assistant_config(),
-            target_hf_config=target_hf_config,
-            target_model_args=_target_args(),
-        )
-
-
-def test_validate_rejects_mismatched_target_kv_shared_sources() -> None:
-    target_hf_config = SimpleNamespace(
-        text_config=SimpleNamespace(
-            model_type="gemma4_text",
-            vocab_size=262144,
-            hidden_size=1536,
-            num_hidden_layers=4,
-            num_kv_shared_layers=1,
-            layer_types=[
-                "sliding_attention",
-                "sliding_attention",
-                "sliding_attention",
-                "full_attention",
-            ],
-        )
-    )
-
-    with pytest.raises(ValueError, match="num_kv_shared_layers metadata mismatch"):
-        _validate_assistant_config(
-            _assistant_config(),
-            target_hf_config=target_hf_config,
-            target_model_args=_target_args(),
-        )
-
-
-def test_validate_accepts_top_level_gemma4_target_model_type() -> None:
-    metadata = _validate_assistant_config(
-        _assistant_config(),
-        target_hf_config=None,
-        target_model_args=_target_args(model_type="gemma4"),
-    )
-
-    assert metadata.backbone_hidden_size == 1536
-
-
-def test_validate_accepts_target_metadata_from_get_text_config() -> None:
-    target_hf_config = _ConfigWithTextAccessor(
-        SimpleNamespace(
-            model_type="gemma4_text",
-            num_hidden_layers=4,
-            num_kv_shared_layers=0,
-            layer_types=[
-                "sliding_attention",
-                "sliding_attention",
-                "sliding_attention",
-                "full_attention",
-            ],
-        )
-    )
-
-    metadata = _validate_assistant_config(
-        _assistant_config(),
-        target_hf_config=target_hf_config,
-        target_model_args={
-            "vocab_size": 262144,
-            "hidden_size": 1536,
-        },
-    )
-
-    assert metadata.backbone_hidden_size == 1536
-
-
 def test_validate_rejects_vocab_mismatch() -> None:
     with pytest.raises(ValueError, match="vocab size must match"):
         _validate_assistant_config(
             _assistant_config(),
-            target_hf_config=None,
             target_model_args=_target_args(vocab_size=32000),
         )
 
@@ -323,17 +167,7 @@ def test_validate_rejects_assistant_top_level_vocab_mismatch() -> None:
     with pytest.raises(ValueError, match="vocab_size metadata mismatch"):
         _validate_assistant_config(
             _assistant_config(vocab_size=32000),
-            target_hf_config=None,
             target_model_args=_target_args(),
-        )
-
-
-def test_validate_rejects_non_positive_target_size() -> None:
-    with pytest.raises(ValueError, match="target model hidden_size must be positive"):
-        _validate_assistant_config(
-            _assistant_config(),
-            target_hf_config=None,
-            target_model_args=_target_args(hidden_size=0),
         )
 
 
@@ -341,7 +175,6 @@ def test_validate_rejects_backbone_hidden_size_mismatch() -> None:
     with pytest.raises(ValueError, match="backbone hidden size must match"):
         _validate_assistant_config(
             _assistant_config(),
-            target_hf_config=None,
             target_model_args=_target_args(hidden_size=2048),
         )
 
@@ -363,7 +196,6 @@ def test_validate_rejects_non_positive_assistant_text_sizes(
     with pytest.raises(ValueError, match=f"assistant {field} must be positive"):
         _validate_assistant_config(
             _assistant_config(text_config={**text_config, field: value}),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -375,19 +207,6 @@ def test_validate_rejects_non_positive_assistant_backbone_hidden_size() -> None:
     ):
         _validate_assistant_config(
             _assistant_config(backbone_hidden_size=0),
-            target_hf_config=None,
-            target_model_args=_target_args(),
-        )
-
-
-@pytest.mark.parametrize("value", ["1", "bad", 1.5])
-def test_validate_rejects_non_integer_assistant_config_values(
-    value: object,
-) -> None:
-    with pytest.raises(ValueError, match="assistant n_predict must be an integer"):
-        _validate_assistant_config(
-            _assistant_config(n_predict=value),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -401,7 +220,6 @@ def test_validate_rejects_non_integer_assistant_mask_config_values(
     with pytest.raises(ValueError, match=f"assistant {field} must be an integer"):
         _validate_assistant_config(
             _assistant_config(**{field: value}),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -413,7 +231,6 @@ def test_validate_rejects_non_positive_assistant_mask_config_values(
     with pytest.raises(ValueError, match=f"assistant {field} must be positive"):
         _validate_assistant_config(
             _assistant_config(**{field: 0}),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -427,7 +244,6 @@ def test_validate_rejects_ordered_embedding_vocab_centroid_mismatch() -> None:
                 num_centroids=64,
                 text_config={**text_config, "vocab_size": 262143},
             ),
-            target_hf_config=None,
             target_model_args=_target_args(vocab_size=262143),
         )
 
@@ -436,9 +252,21 @@ def test_validate_rejects_ordered_embedding_top_k_above_centroids() -> None:
     with pytest.raises(ValueError, match="centroid_intermediate_top_k must be <="):
         _validate_assistant_config(
             _assistant_config(num_centroids=8, centroid_intermediate_top_k=9),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
+
+
+def test_validate_ignores_ordered_embedding_fields_when_disabled() -> None:
+    metadata = _validate_assistant_config(
+        _assistant_config(
+            use_ordered_embeddings=False,
+            num_centroids=0,
+            centroid_intermediate_top_k=0,
+        ),
+        target_model_args=_target_args(),
+    )
+
+    assert metadata.use_ordered_embeddings is False
 
 
 def test_validate_rejects_bool_assistant_config_values() -> None:
@@ -447,7 +275,6 @@ def test_validate_rejects_bool_assistant_config_values() -> None:
     with pytest.raises(ValueError, match="assistant hidden_size must be an integer"):
         _validate_assistant_config(
             _assistant_config(text_config={**text_config, "hidden_size": True}),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -457,59 +284,7 @@ def test_validate_rejects_non_bool_assistant_config_values(field: str) -> None:
     with pytest.raises(ValueError, match=f"assistant {field} must be a boolean"):
         _validate_assistant_config(
             _assistant_config(**{field: "false"}),
-            target_hf_config=None,
             target_model_args=_target_args(),
-        )
-
-
-def test_validate_rejects_non_gemma4_target_model_type() -> None:
-    with pytest.raises(ValueError, match="Gemma4 target"):
-        _validate_assistant_config(
-            _assistant_config(),
-            target_hf_config=None,
-            target_model_args=_target_args(model_type="llama"),
-        )
-
-
-def test_validate_rejects_mismatched_target_model_type_sources() -> None:
-    target_hf_config = SimpleNamespace(
-        text_config=SimpleNamespace(
-            model_type="gemma4_text",
-            num_hidden_layers=4,
-            num_kv_shared_layers=0,
-            layer_types=[
-                "sliding_attention",
-                "sliding_attention",
-                "sliding_attention",
-                "full_attention",
-            ],
-        )
-    )
-
-    with pytest.raises(ValueError, match="model_type='llama'"):
-        _validate_assistant_config(
-            _assistant_config(),
-            target_hf_config=target_hf_config,
-            target_model_args=_target_args(model_type="llama"),
-        )
-
-
-def test_validate_rejects_missing_target_model_type() -> None:
-    with pytest.raises(ValueError, match="model_type=None"):
-        _validate_assistant_config(
-            _assistant_config(),
-            target_hf_config=None,
-            target_model_args={
-                "vocab_size": 262144,
-                "hidden_size": 1536,
-                "num_kv_shared_layers": 0,
-                "layer_types": [
-                    "sliding_attention",
-                    "sliding_attention",
-                    "sliding_attention",
-                    "full_attention",
-                ],
-            },
         )
 
 
@@ -518,7 +293,6 @@ def test_validate_accepts_assistant_layer_types_tail_matching_target_non_shared_
 ):
     metadata = _validate_assistant_config(
         _assistant_config(),
-        target_hf_config=None,
         target_model_args=_target_args(
             num_hidden_layers=6,
             layer_types=[
@@ -543,16 +317,17 @@ def test_validate_accepts_assistant_layer_types_tail_matching_target_non_shared_
 def test_validate_rejects_layer_types_not_tail_matching_target_non_shared_layers() -> (
     None
 ):
+    text_config = _assistant_config()["text_config"]
+    assert isinstance(text_config, dict)
     with pytest.raises(ValueError, match="tail-match"):
         _validate_assistant_config(
             _assistant_config(
                 text_config={
-                    **_assistant_config()["text_config"],
+                    **text_config,
                     "num_hidden_layers": 1,
                     "layer_types": ["full_attention"],
                 }
             ),
-            target_hf_config=None,
             target_model_args=_target_args(
                 layer_types=[
                     "sliding_attention",
@@ -568,112 +343,23 @@ def test_validate_rejects_assistant_with_more_layers_than_target_non_shared() ->
     with pytest.raises(ValueError, match="more layers"):
         _validate_assistant_config(
             _assistant_config(),
-            target_hf_config=None,
             target_model_args=_target_args(num_kv_shared_layers=3),
         )
 
 
-def test_validate_rejects_target_layer_types_length_mismatch() -> None:
-    with pytest.raises(ValueError, match="layer_types must match num_hidden_layers"):
+def test_validate_rejects_non_gemma4_target_model_type() -> None:
+    with pytest.raises(ValueError, match="requires a Gemma4 target model"):
         _validate_assistant_config(
             _assistant_config(),
-            target_hf_config=None,
-            target_model_args=_target_args(
-                num_hidden_layers=5,
-                layer_types=[
-                    "sliding_attention",
-                    "sliding_attention",
-                    "sliding_attention",
-                    "full_attention",
-                ],
-            ),
+            target_model_args=_target_args(model_type="qwen3"),
         )
 
 
-def test_validate_rejects_mismatched_target_num_hidden_layer_sources() -> None:
-    target_hf_config = SimpleNamespace(
-        text_config=SimpleNamespace(
-            model_type="gemma4_text",
-            vocab_size=262144,
-            hidden_size=1536,
-            num_hidden_layers=5,
-            num_kv_shared_layers=0,
-            layer_types=[
-                "sliding_attention",
-                "sliding_attention",
-                "sliding_attention",
-                "full_attention",
-            ],
-        )
-    )
-
-    with pytest.raises(ValueError, match="num_hidden_layers metadata mismatch"):
-        _validate_assistant_config(
-            _assistant_config(),
-            target_hf_config=target_hf_config,
-            target_model_args=_target_args(),
-        )
-
-
-def test_validate_rejects_target_with_no_non_shared_kv_layers() -> None:
+def test_validate_rejects_target_kv_shared_layers_past_layer_count() -> None:
     with pytest.raises(ValueError, match="leave at least one non-shared KV layer"):
         _validate_assistant_config(
             _assistant_config(),
-            target_hf_config=None,
-            target_model_args=_target_args(num_kv_shared_layers=4),
-        )
-
-
-def test_validate_rejects_string_target_layer_types() -> None:
-    with pytest.raises(ValueError, match="layer_types must be a non-string sequence"):
-        _validate_assistant_config(
-            _assistant_config(),
-            target_hf_config=None,
-            target_model_args=_target_args(layer_types="full_attention"),
-        )
-
-
-def test_validate_rejects_non_string_target_layer_type_entries() -> None:
-    with pytest.raises(ValueError, match="layer_types entries must be strings"):
-        _validate_assistant_config(
-            _assistant_config(),
-            target_hf_config=None,
-            target_model_args=_target_args(
-                layer_types=[
-                    "sliding_attention",
-                    1,
-                    "sliding_attention",
-                    "full_attention",
-                ],
-            ),
-        )
-
-
-def test_validate_rejects_unknown_target_layer_types() -> None:
-    with pytest.raises(ValueError, match="Unsupported Gemma4 MTP target layer types"):
-        _validate_assistant_config(
-            _assistant_config(),
-            target_hf_config=None,
-            target_model_args=_target_args(
-                layer_types=[
-                    "sliding_attention",
-                    "unknown_attention",
-                    "sliding_attention",
-                    "full_attention",
-                ],
-            ),
-        )
-
-
-def test_validate_rejects_non_integer_target_config_values() -> None:
-    with pytest.raises(
-        ValueError,
-        match="target model num_kv_shared_layers must be an integer",
-    ):
-        _validate_assistant_config(
-            _assistant_config(),
-            target_hf_config=None,
-            target_model_args=_target_args(num_kv_shared_layers="0"),
+            target_model_args=_target_args(num_kv_shared_layers=5),
         )
 
 
@@ -690,7 +376,6 @@ def test_validate_rejects_malformed_assistant_layer_types() -> None:
     with pytest.raises(ValueError, match="layer_types must match num_hidden_layers"):
         _validate_assistant_config(
             config,
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -703,7 +388,6 @@ def test_validate_rejects_string_assistant_layer_types() -> None:
             _assistant_config(
                 text_config={**text_config, "layer_types": "full_attention"}
             ),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -724,16 +408,6 @@ def test_validate_rejects_non_string_assistant_layer_type_entries() -> None:
                     ],
                 }
             ),
-            target_hf_config=None,
-            target_model_args=_target_args(),
-        )
-
-
-def test_validate_rejects_mapped_config_with_unsupported_n_predict() -> None:
-    with pytest.raises(ValueError, match="n_predict=1"):
-        _validate_assistant_config(
-            _assistant_config(model_type="gemma4_mtp", n_predict=2),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -742,7 +416,6 @@ def test_validate_rejects_malformed_assistant_architectures() -> None:
     with pytest.raises(ValueError, match="architectures must be a sequence"):
         _validate_assistant_config(
             _assistant_config(architectures=1),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -754,7 +427,6 @@ def test_validate_rejects_string_assistant_architectures() -> None:
     ):
         _validate_assistant_config(
             _assistant_config(architectures="Gemma4AssistantForCausalLM"),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -763,7 +435,6 @@ def test_validate_rejects_non_string_assistant_architecture_entries() -> None:
     with pytest.raises(ValueError, match="architectures entries must be strings"):
         _validate_assistant_config(
             _assistant_config(architectures=[1]),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -772,7 +443,6 @@ def test_validate_rejects_missing_gemma4_mtp_architecture() -> None:
     with pytest.raises(ValueError, match="requires a Gemma4 MTP architecture"):
         _validate_assistant_config(
             _assistant_config(architectures=["OtherModel"]),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -800,7 +470,6 @@ def test_loader_uses_custom_mlx_model_classes_and_validates_runtime() -> None:
 
     runtime = loader.load_if_needed(
         speculative_config=_speculative_config(),
-        target_hf_config=None,
         target_model_args=_target_args(),
     )
 
@@ -843,7 +512,6 @@ def test_loader_wraps_local_custom_shards_for_mlx_lm(
 
     loader.load_if_needed(
         speculative_config=_speculative_config(),
-        target_hf_config=None,
         target_model_args=_target_args(),
     )
 
@@ -885,7 +553,6 @@ def test_default_loader_downloads_custom_named_safetensors_shards(
 
     loader.load_if_needed(
         speculative_config=spec_config,
-        target_hf_config=None,
         target_model_args=_target_args(),
     )
 
@@ -924,7 +591,6 @@ def test_loader_revalidates_cached_runtime_against_target() -> None:
 
     runtime = loader.load_if_needed(
         speculative_config=_speculative_config(),
-        target_hf_config=None,
         target_model_args=_target_args(),
     )
     assert runtime is not None
@@ -932,7 +598,6 @@ def test_loader_revalidates_cached_runtime_against_target() -> None:
     with pytest.raises(ValueError, match="backbone hidden size must match"):
         loader.load_if_needed(
             speculative_config=_speculative_config(),
-            target_hf_config=None,
             target_model_args=_target_args(hidden_size=2048),
         )
     assert load_model_calls == 1
@@ -946,7 +611,6 @@ def test_loader_skips_non_gemma4_mtp_speculative_config() -> None:
 
     runtime = loader.load_if_needed(
         speculative_config=SimpleNamespace(method="draft_model"),
-        target_hf_config=None,
         target_model_args=_target_args(),
     )
 
@@ -964,7 +628,6 @@ def test_loader_skips_non_gemma4_mtp_without_resolving_model() -> None:
         speculative_config=_speculative_config(
             hf_config=SimpleNamespace(model_type="deepseek_mtp")
         ),
-        target_hf_config=None,
         target_model_args=_target_args(),
     )
 
@@ -988,7 +651,6 @@ def test_loader_rejects_custom_model_file_before_load(
     with pytest.raises(ValueError, match="custom model_file"):
         loader.load_if_needed(
             speculative_config=_speculative_config(),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -1005,7 +667,6 @@ def test_loader_rejects_postload_custom_model_file() -> None:
     with pytest.raises(ValueError, match="custom model_file"):
         loader.load_if_needed(
             speculative_config=_speculative_config(),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -1025,7 +686,6 @@ def test_loader_prevalidates_config_file_before_load(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="assistant hidden_size must be an integer"):
         loader.load_if_needed(
             speculative_config=_speculative_config(),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -1039,7 +699,6 @@ def test_default_loader_rejects_missing_config_before_load(tmp_path: Path) -> No
     with pytest.raises(ValueError, match="must contain config.json"):
         loader.load_if_needed(
             speculative_config=_speculative_config(),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -1055,7 +714,6 @@ def test_loader_rejects_invalid_json_config_before_load(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="config.json is not valid JSON"):
         loader.load_if_needed(
             speculative_config=_speculative_config(),
-            target_hf_config=None,
             target_model_args=_target_args(),
         )
 
@@ -1079,23 +737,20 @@ def test_loader_passes_revision_and_keeps_cache_keys_separate() -> None:
         model_path_resolver=lambda model_name: model_name,
     )
     spec_a = _speculative_config()
-    spec_a.revision = "rev-a"
+    spec_a.draft_model_config.revision = "rev-a"
     spec_b = _speculative_config()
-    spec_b.revision = "rev-b"
+    spec_b.draft_model_config.revision = "rev-b"
 
     first = loader.load_if_needed(
         speculative_config=spec_a,
-        target_hf_config=None,
         target_model_args=_target_args(),
     )
     second = loader.load_if_needed(
         speculative_config=spec_a,
-        target_hf_config=None,
         target_model_args=_target_args(),
     )
     third = loader.load_if_needed(
         speculative_config=spec_b,
-        target_hf_config=None,
         target_model_args=_target_args(),
     )
 
@@ -1105,31 +760,8 @@ def test_loader_passes_revision_and_keeps_cache_keys_separate() -> None:
     assert download_calls == [("/assistant", "rev-a"), ("/assistant", "rev-b")]
 
 
-def test_loader_prefers_resolved_draft_model_revision() -> None:
-    download_calls: list[tuple[str, str | None]] = []
-
-    loader = Gemma4MTPAssistantLoader(
-        load_model_fn=lambda *args, **kwargs: (object(), _assistant_config()),
-        download_fn=lambda model_name, revision: (
-            download_calls.append((model_name, revision)) or Path(model_name)
-        ),
-        model_path_resolver=lambda model_name: model_name,
-    )
-    spec = _speculative_config()
-    spec.revision = "outer-rev"
-    spec.draft_model_config.revision = "draft-rev"
-
-    loader.load_if_needed(
-        speculative_config=spec,
-        target_hf_config=None,
-        target_model_args=_target_args(),
-    )
-
-    assert download_calls == [("/assistant", "draft-rev")]
-
-
 def test_model_args_preserve_text_config_vocab_size() -> None:
-    from vllm_metal.v1.gemma4_mtp_model import Gemma4MTPAssistantModelArgs
+    from vllm_metal.spec_decode.gemma4.model import Gemma4MTPAssistantModelArgs
 
     args = Gemma4MTPAssistantModelArgs(
         vocab_size=262144,
@@ -1142,7 +774,7 @@ def test_model_args_preserve_text_config_vocab_size() -> None:
 
 
 def test_model_args_do_not_mutate_source_text_config() -> None:
-    from vllm_metal.v1.gemma4_mtp_model import Gemma4MTPAssistantModelArgs
+    from vllm_metal.spec_decode.gemma4.model import Gemma4MTPAssistantModelArgs
 
     text_config: dict[str, object] = {"hidden_size": 256}
 
@@ -1158,7 +790,7 @@ def test_model_args_do_not_mutate_source_text_config() -> None:
 
 
 def test_model_rejects_missing_num_hidden_layers() -> None:
-    from vllm_metal.v1.gemma4_mtp_model import (
+    from vllm_metal.spec_decode.gemma4.model import (
         Gemma4MTPAssistantModel,
         Gemma4MTPAssistantModelArgs,
     )
@@ -1173,7 +805,7 @@ def test_model_rejects_missing_num_hidden_layers() -> None:
 
 
 def test_model_rejects_conflicting_num_kv_shared_layers() -> None:
-    from vllm_metal.v1.gemma4_mtp_model import (
+    from vllm_metal.spec_decode.gemma4.model import (
         Gemma4MTPAssistantModel,
         Gemma4MTPAssistantModelArgs,
     )
@@ -1191,7 +823,7 @@ def test_model_rejects_conflicting_num_kv_shared_layers() -> None:
 
 
 def test_model_normalizes_missing_per_layer_input_fields() -> None:
-    from vllm_metal.v1.gemma4_mtp_model import (
+    from vllm_metal.spec_decode.gemma4.model import (
         Gemma4MTPAssistantModel,
         Gemma4MTPAssistantModelArgs,
     )
@@ -1221,7 +853,7 @@ def test_model_rejects_nonzero_per_layer_input_fields(
     field: str,
     value: int,
 ) -> None:
-    from vllm_metal.v1.gemma4_mtp_model import (
+    from vllm_metal.spec_decode.gemma4.model import (
         Gemma4MTPAssistantModel,
         Gemma4MTPAssistantModelArgs,
     )
@@ -1241,7 +873,7 @@ def test_model_rejects_nonzero_per_layer_input_fields(
 def test_masked_embedding_returns_sparse_top_tokens() -> None:
     import mlx.core as mx
 
-    from vllm_metal.v1.gemma4_mtp_model import Gemma4MTPMaskedEmbedding
+    from vllm_metal.spec_decode.gemma4.model import Gemma4MTPMaskedEmbedding
 
     masked = Gemma4MTPMaskedEmbedding(
         hidden_size=2,
@@ -1271,7 +903,7 @@ def test_masked_embedding_returns_sparse_top_tokens() -> None:
 def test_masked_embedding_uses_untied_lm_head_weight() -> None:
     import mlx.core as mx
 
-    from vllm_metal.v1.gemma4_mtp_model import (
+    from vllm_metal.spec_decode.gemma4.model import (
         Gemma4MTPAssistantModel,
         Gemma4MTPAssistantModelArgs,
     )

@@ -17,8 +17,10 @@ from vllm.v1.sample.sampler import Sampler
 
 from tests.stub_runner import make_stub_runner
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.v1 import sampling_batch
 from vllm_metal.v1.model_runner import (
     MetalModelRunner,
+    PrefillRequest,
     RequestState,
     _create_request_generator,
     _ExecutionBatch,
@@ -281,7 +283,7 @@ class TestV1SeededSamplingGenerator:
         )
 
         sp = SamplingParams(temperature=1.0, seed=123)
-        generator = _create_request_generator(runner.device, sp)
+        generator = _create_request_generator(sp)
         assert generator is not None
 
         state = RequestState(
@@ -302,6 +304,69 @@ class TestV1SeededSamplingGenerator:
         assert not torch.equal(after_second, after_first)
 
 
+class TestSamplerDevicePolicy:
+    """Regression tests for #622: torch sampling must never run on MPS.
+
+    ``exponential_()`` on MPS can return exact zeros, which the vLLM
+    sampler's Gumbel-style division turns into inf/NaN rows whose argmax
+    lands on an arbitrary vocab id.
+    """
+
+    def test_sampling_metadata_tensors_live_on_cpu(self) -> None:
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.8, top_k=20, top_p=0.9),
+                SamplingParams(temperature=1.0, presence_penalty=0.5),
+                SamplingParams(temperature=0.7, allowed_token_ids=[1, 2]),
+            ],
+            [[1, 2], [3], [4]],
+            [[], [], []],
+            vocab_size=VOCAB_SIZE,
+        )
+
+        metadata = batch.make_sampling_metadata()
+
+        assert metadata.temperature is not None
+        assert metadata.temperature.device.type == "cpu"
+        assert metadata.top_k is not None
+        assert metadata.top_k.device.type == "cpu"
+        assert metadata.top_p is not None
+        assert metadata.top_p.device.type == "cpu"
+        assert metadata.prompt_token_ids is not None
+        assert metadata.prompt_token_ids.device.type == "cpu"
+        assert metadata.frequency_penalties.device.type == "cpu"
+        assert metadata.presence_penalties.device.type == "cpu"
+        assert metadata.repetition_penalties.device.type == "cpu"
+        assert metadata.allowed_token_ids_mask is not None
+        assert metadata.allowed_token_ids_mask.device.type == "cpu"
+
+    def test_seeded_generator_lives_on_cpu(self) -> None:
+        generator = _create_request_generator(SamplingParams(temperature=1.0, seed=7))
+
+        assert generator is not None
+        assert generator.device.type == "cpu"
+
+    def test_bridged_logits_reach_sampler_on_cpu(self) -> None:
+        logits = mx.array([[0.0, 1.0, 4.0, 2.0]], dtype=mx.float32)
+        batch = SamplingBatch(
+            [SamplingParams(temperature=0.8, top_k=2)],
+            [[1]],
+            [[]],
+            vocab_size=4,
+        )
+        seen_devices: list[torch.device] = []
+
+        class SpySampler(Sampler):
+            def forward(self, logits_torch, sampling_metadata):  # noqa: ANN001
+                seen_devices.append(logits_torch.device)
+                return super().forward(logits_torch, sampling_metadata)
+
+        result = sample_from_logits(logits, batch, SpySampler())
+
+        assert [d.type for d in seen_devices] == ["cpu"]
+        assert 0 <= result.token_ids[0] < 4
+
+
 class TestV1SamplingBatch:
     @staticmethod
     def _batch(params_list: list[SamplingParams]) -> SamplingBatch:
@@ -310,8 +375,64 @@ class TestV1SamplingBatch:
             [[1]] * len(params_list),
             [[]] * len(params_list),
             vocab_size=VOCAB_SIZE,
-            device=torch.device("cpu"),
         )
+
+    def test_prefill_requests_share_one_sampler_batch(self, monkeypatch) -> None:
+        logits = mx.arange(24, dtype=mx.float16).reshape(1, 6, 4)
+        greedy_params = SamplingParams(temperature=0.0, logprobs=1)
+        random_params = SamplingParams(temperature=0.7, top_k=3, logprobs=1)
+        generator = torch.Generator().manual_seed(42)
+        prefill_reqs = [
+            PrefillRequest("p0", [10, 11], greedy_params, [[0]], None, 2, 0, None),
+            PrefillRequest(
+                "p1", [21, 22], random_params, [[1]], generator, 3, 1, [20, 21, 22]
+            ),
+        ]
+        sampler_calls: list[tuple[mx.array, SamplingBatch]] = []
+
+        def capture_batch(
+            logits_2d: mx.array,
+            batch: SamplingBatch,
+            *_args: object,
+        ) -> sampling_batch._SamplingResult:
+            sampler_calls.append((logits_2d, batch))
+            return sampling_batch._SamplingResult([7] * len(batch.sampling_params_list))
+
+        monkeypatch.setattr(sampling_batch, "sample_from_logits", capture_batch)
+
+        result = sampling_batch.sample_prefill_tokens(
+            logits,
+            prefill_reqs,
+            cu_seqlens=[0, 2, 4, 6],
+            num_decode=1,
+            sampler=Sampler(),
+            vocab_size=4,
+        )
+
+        assert len(sampler_calls) == 1
+        sampled_logits, batch = sampler_calls[0]
+        assert sampled_logits.tolist() == [
+            [12.0, 13.0, 14.0, 15.0],
+            [20.0, 21.0, 22.0, 23.0],
+        ]
+        assert sampled_logits.dtype == mx.float16
+        assert batch.sampling_params_list == [greedy_params, random_params]
+        assert batch.prompt_token_id_lists == [[10, 11], [20, 21, 22]]
+        assert batch.output_token_id_lists == [[], []]
+        assert batch.generators == {1: generator}
+        assert result.token_ids == [7, 7]
+
+    def test_empty_prefill_batch_skips_sampling(self) -> None:
+        result = sampling_batch.sample_prefill_tokens(
+            mx.zeros((1, 0, 4)),
+            [],
+            cu_seqlens=[0],
+            num_decode=0,
+            sampler=Sampler(),
+            vocab_size=4,
+        )
+
+        assert result == sampling_batch._SamplingResult([])
 
     def test_can_use_native_greedy_requires_greedy_without_filters(self) -> None:
         assert self._batch([SamplingParams(temperature=0.0)]).can_use_native_greedy()
@@ -341,6 +462,9 @@ class TestV1SamplingBatch:
             [SamplingParams(temperature=0.0, logprobs=1)]
         ).can_use_native_greedy()
         assert not self._batch(
+            [SamplingParams(temperature=0.0, logprob_token_ids=[1, 2])]
+        ).can_use_native_greedy()
+        assert not self._batch(
             [SamplingParams(temperature=0.0, allowed_token_ids=[1, 2])]
         ).can_use_native_greedy()
         bad_sp = SamplingParams(temperature=0.0)
@@ -355,9 +479,8 @@ class TestV1SamplingBatch:
             [[1, 2, 3]],
             [[]],
             vocab_size=4,
-            device=torch.device("cpu"),
         )
-        result = sample_from_logits(logits, batch, Sampler(), torch.device("cpu"))
+        result = sample_from_logits(logits, batch, Sampler())
         assert result.token_ids[0] in [2, 3]
 
     def test_allowed_token_ids_mixed_batch(self) -> None:
@@ -373,11 +496,42 @@ class TestV1SamplingBatch:
             [[1, 2], [3, 4]],
             [[], []],
             vocab_size=4,
-            device=torch.device("cpu"),
         )
-        result = sample_from_logits(logits, batch, Sampler(), torch.device("cpu"))
+        result = sample_from_logits(logits, batch, Sampler())
         assert result.token_ids[0] in [2, 3]
         assert result.token_ids[1] == 1  # unconstrained, should pick highest logit
+
+    def test_mixed_disabled_and_enabled_top_k(self) -> None:
+        """Mixed top_k=0 (disabled) and top_k=64 rows must not crash.
+
+        Regression for issue #646: the disabled row reached vLLM's sampler as
+        raw 0, which the PyTorch top-k path interprets as a gather index of
+        vocab_size (out of bounds). It must carry the vocab_size sentinel
+        instead, matching GPUInputBatch. Exercises the real Sampler.forward()
+        path via sample_from_logits (native greedy is unavailable for a mixed
+        batch).
+        """
+        top_k = 64
+        logits = mx.arange(2 * VOCAB_SIZE, dtype=mx.float32).reshape(2, VOCAB_SIZE)
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.0),
+                SamplingParams(temperature=1.0, top_k=top_k, top_p=0.95),
+            ],
+            [[1], [2]],
+            [[], []],
+            vocab_size=VOCAB_SIZE,
+        )
+        # Disabled row must be normalized to the vocab_size sentinel.
+        metadata = batch.make_sampling_metadata()
+        assert metadata.top_k is not None
+        assert metadata.top_k.tolist() == [VOCAB_SIZE, top_k]
+
+        result = sample_from_logits(logits, batch, Sampler())
+        # Greedy row samples from the full vocab: argmax of row 0.
+        assert result.token_ids[0] == VOCAB_SIZE - 1
+        # Top-k row stays inside the top-64 candidates (values 960..1023).
+        assert VOCAB_SIZE - top_k <= result.token_ids[1] < VOCAB_SIZE
 
     def test_bad_words_blocks_greedy_token(self) -> None:
         """Greedy + bad_words_token_ids must fall back and block the banned token."""
@@ -389,9 +543,8 @@ class TestV1SamplingBatch:
             [[1, 2, 3]],
             [[]],
             vocab_size=4,
-            device=torch.device("cpu"),
         )
-        result = sample_from_logits(logits, batch, Sampler(), torch.device("cpu"))
+        result = sample_from_logits(logits, batch, Sampler())
         assert result.token_ids[0] != 0  # token 0 should be blocked
 
     def test_can_use_native_greedy_requires_every_request_to_match(self) -> None:
@@ -425,7 +578,6 @@ class TestV1SamplingBatch:
             [[1, 2, 3], [4, 5], [6]],
             [[], [], []],
             vocab_size=VOCAB_SIZE,
-            device=torch.device("cpu"),
         )
         assert batch.no_penalties
 
@@ -454,7 +606,6 @@ class TestV1SamplingBatch:
             [[1], [2], [3]],
             [[], [], []],
             vocab_size=VOCAB_SIZE,
-            device=torch.device("cpu"),
         )
         assert not batch.no_penalties
 
@@ -471,7 +622,6 @@ class TestV1SamplingBatch:
             [[1, 2, 3]],
             [[]],
             vocab_size=VOCAB_SIZE,
-            device=torch.device("cpu"),
         )
 
         metadata = batch.make_sampling_metadata()
@@ -484,7 +634,6 @@ class TestV1SamplingBatch:
             [[1, 2, 3]],
             [[]],
             vocab_size=VOCAB_SIZE,
-            device=torch.device("cpu"),
         )
 
         with pytest.raises(
@@ -502,7 +651,6 @@ class TestV1SamplingBatch:
             [[1, 2, 3], [4, 5]],
             [[], []],
             vocab_size=VOCAB_SIZE,
-            device=torch.device("cpu"),
         )
 
         with pytest.raises(
@@ -518,16 +666,178 @@ class TestV1SamplingBatch:
             [[1, 2, 3]],
             [[]],
             vocab_size=4,
-            device=torch.device("cpu"),
         )
 
-        result = sample_from_logits(logits, batch, Sampler(), torch.device("cpu"))
+        result = sample_from_logits(logits, batch, Sampler())
 
         assert result.token_ids == [2]
         assert result.logprobs is not None
         assert result.logprobs.logprob_token_ids.shape == (1, 3)
         assert result.logprobs.logprob_token_ids[0, 0] == 2
         assert result.logprobs.sampled_token_ranks.tolist() == [1]
+
+    def test_sample_from_logits_returns_requested_token_logprobs(self) -> None:
+        logits = mx.array([[0.0, 1.0, 4.0, 2.0]], dtype=mx.float32)
+        batch = SamplingBatch(
+            [SamplingParams(temperature=0.0, logprob_token_ids=[0, 3])],
+            [[1, 2, 3]],
+            [[]],
+            vocab_size=4,
+        )
+
+        result = sample_from_logits(logits, batch, Sampler())
+
+        assert result.token_ids == [2]
+        assert result.logprobs is not None
+        assert result.logprobs.logprob_token_ids.tolist() == [[2, 0, 3]]
+        expected = torch.log_softmax(torch.tensor([0.0, 1.0, 4.0, 2.0]), dim=0)
+        assert result.logprobs.logprobs[0].tolist() == pytest.approx(
+            expected[[2, 0, 3]].tolist()
+        )
+        assert result.logprobs.sampled_token_ranks.tolist() == [1]
+
+    def test_empty_requested_token_list_does_not_request_logprobs(self) -> None:
+        params = SamplingParams(temperature=0.0, logprob_token_ids=[])
+        batch = SamplingBatch([params], [[1, 2, 3]], [[]], vocab_size=4)
+
+        assert params.num_logprobs is None
+        assert batch.can_use_native_greedy()
+        assert batch.make_sampling_metadata().logprob_token_ids is None
+        assert (
+            sample_from_logits(
+                mx.array([[0.0, 1.0, 4.0, 2.0]], dtype=mx.float32),
+                batch,
+                Sampler(),
+            ).logprobs
+            is None
+        )
+
+    @pytest.mark.parametrize("specific_row", [0, 1])
+    def test_mixed_specific_and_topk_logprobs_preserve_each_row(
+        self, specific_row: int
+    ) -> None:
+        raw_logits = [[0.0, 1.0, 4.0, 2.0], [5.0, 1.0, 3.0, 2.0]]
+        logits = mx.array(raw_logits, dtype=mx.float32)
+        specific_params = SamplingParams(temperature=0.0, logprob_token_ids=[0, 3])
+        topk_params = SamplingParams(temperature=0.0, logprobs=2)
+        sampling_params = [
+            specific_params if row == specific_row else topk_params for row in range(2)
+        ]
+        batch = SamplingBatch(
+            sampling_params,
+            [[1, 2], [3, 4]],
+            [[], []],
+            vocab_size=4,
+        )
+
+        topk_ids = [[2, 3], [0, 2]]
+        metadata = batch.make_sampling_metadata(torch.tensor(raw_logits))
+        assert metadata.max_num_logprobs is None
+        assert metadata.logprob_token_ids == {
+            specific_row: [0, 3],
+            1 - specific_row: topk_ids[1 - specific_row],
+        }
+
+        result = sample_from_logits(logits, batch, Sampler())
+
+        assert result.token_ids == [2, 0]
+        assert result.logprobs is not None
+        expected_ids = []
+        for row, sampled_token_id in enumerate(result.token_ids):
+            requested_ids = [0, 3] if row == specific_row else topk_ids[row]
+            expected_ids.append([sampled_token_id, *requested_ids])
+        assert result.logprobs.logprob_token_ids.tolist() == expected_ids
+        expected = torch.log_softmax(
+            torch.tensor([[0.0, 1.0, 4.0, 2.0], [5.0, 1.0, 3.0, 2.0]]),
+            dim=1,
+        )
+        for row, token_ids in enumerate(expected_ids):
+            assert result.logprobs.logprobs[row].tolist() == pytest.approx(
+                expected[row, token_ids].tolist()
+            )
+        assert result.logprobs.sampled_token_ranks.tolist() == [1, 1]
+
+    def test_mixed_logprob_metadata_requires_logits(self) -> None:
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.0, logprob_token_ids=[0, 3]),
+                SamplingParams(temperature=0.0, logprobs=2),
+            ],
+            [[1, 2], [3, 4]],
+            [[], []],
+            vocab_size=4,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="Logits are required when a batch mixes top-k and specific-token",
+        ):
+            batch.make_sampling_metadata()
+
+    def test_same_row_specific_logprobs_override_topk_without_logits(self) -> None:
+        batch = SamplingBatch(
+            [
+                SamplingParams(
+                    temperature=0.0,
+                    logprobs=2,
+                    logprob_token_ids=[0, 3],
+                )
+            ],
+            [[1, 2]],
+            [[]],
+            vocab_size=4,
+        )
+
+        metadata = batch.make_sampling_metadata()
+
+        assert metadata.max_num_logprobs is None
+        assert metadata.logprob_token_ids == {0: [0, 3]}
+
+    def test_mixed_sampled_token_only_and_specific_logprobs_need_no_logits(
+        self,
+    ) -> None:
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.0, logprob_token_ids=[0, 3]),
+                SamplingParams(temperature=0.0, logprobs=0),
+            ],
+            [[1, 2], [3, 4]],
+            [[], []],
+            vocab_size=4,
+        )
+
+        metadata = batch.make_sampling_metadata()
+
+        assert metadata.max_num_logprobs is None
+        assert metadata.logprob_token_ids == {0: [0, 3], 1: []}
+
+    def test_mixed_topk_logprobs_preserve_batch_tie_breaking(self) -> None:
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.0, logprob_token_ids=[0]),
+                SamplingParams(temperature=0.0, logprobs=2),
+                SamplingParams(temperature=0.0, logprobs=5),
+            ],
+            [[1], [2], [3]],
+            [[], [], []],
+            vocab_size=8,
+        )
+        logits = torch.tensor(
+            [
+                [0.0] * 8,
+                [-1.0, -1.0, -1.0, 0.0, -1.0, 1.0, 0.0, 0.0],
+                list(range(8)),
+            ]
+        )
+
+        metadata = batch.make_sampling_metadata(logits)
+
+        assert metadata.max_num_logprobs is None
+        assert metadata.logprob_token_ids == {
+            0: [0],
+            1: [5, 7],
+            2: [7, 6, 5, 4, 3],
+        }
 
     def test_model_runner_output_keeps_logprobs_slot_alignment(self) -> None:
         batch = _ExecutionBatch()
@@ -593,25 +903,6 @@ class TestV1SamplingBatch:
         assert completion_output.logprobs is not None
         assert completion_output.logprobs[0] is not None
         assert completion_output.logprobs[0][7].logprob == pytest.approx(-0.1)
-
-
-class TestV1SamplingMetadataLogitsProcessors:
-    @staticmethod
-    def _make_runner(vocab_size: int = 32) -> MetalModelRunner:
-        return make_stub_runner(model_args={"vocab_size": vocab_size})
-
-    def test_make_sampling_metadata_uses_runner_logitsprocs(self) -> None:
-        runner = self._make_runner()
-        expected_logitsprocs = LogitsProcessors()
-        runner._logitsprocs = expected_logitsprocs
-
-        metadata = runner._make_sampling_metadata(
-            sampling_params_list=[SamplingParams(temperature=0.0)],
-            prompt_token_id_lists=[[]],
-            output_token_id_lists=[[]],
-        )
-
-        assert metadata.logitsprocs is expected_logitsprocs
 
 
 class TestV1PenaltyTokenAccounting:

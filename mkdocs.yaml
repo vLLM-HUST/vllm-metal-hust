@@ -68,11 +68,11 @@ nav:
   - Models:
     - Supported Models: supported_models.md
   - Features:
+    - GGUF: gguf.md
     - Speculative Decoding: speculative_decoding.md
     - Text Pooling: text_embedding_pooling.md
     - Speech-to-Text: stt.md
     - Turboquant: turboquant.md
     - GPU Profiling: profiling.md
-    - Rust Frontend: rust_frontend.md
     - Distributed (Ray): distributed.md
   - Contributing: CONTRIBUTING.md

@@ -30,27 +30,21 @@ class TestMetalConfig:
 
         assert config.memory_fraction == AUTO_MEMORY_FRACTION
         assert config.is_auto_memory is True
-        assert config.use_mlx is True
         assert config.mlx_device == "gpu"
-        assert config.debug is False
         assert config.use_paged_attention is True
         assert config.multimodal_mode == "auto"
 
     def test_custom_config_from_env(self, monkeypatch) -> None:
         """Test configuration from environment variables."""
         monkeypatch.setenv("VLLM_METAL_MEMORY_FRACTION", "0.75")
-        monkeypatch.setenv("VLLM_METAL_USE_MLX", "0")
         monkeypatch.setenv("VLLM_MLX_DEVICE", "cpu")
-        monkeypatch.setenv("VLLM_METAL_DEBUG", "1")
         monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
 
         config = MetalConfig.from_env()
 
         assert config.memory_fraction == 0.75
-        assert config.use_mlx is False
         assert config.mlx_device == "cpu"
-        assert config.debug is True
         assert config.multimodal_mode == "multimodal-native"
 
     def test_paged_attention_can_be_disabled(self, monkeypatch) -> None:
@@ -111,9 +105,7 @@ class TestMetalConfig:
         with pytest.raises(ValueError, match="only supported with paged attention"):
             MetalConfig(
                 memory_fraction=0.7,
-                use_mlx=False,
                 mlx_device="gpu",
-                debug=False,
                 use_paged_attention=False,
             )
 
@@ -121,9 +113,7 @@ class TestMetalConfig:
         with pytest.raises(ValueError, match="Invalid VLLM_METAL_MEMORY_FRACTION"):
             MetalConfig(
                 memory_fraction=1.5,
-                use_mlx=False,
                 mlx_device="gpu",
-                debug=False,
                 use_paged_attention=True,
             )
 
@@ -132,9 +122,7 @@ class TestMetalConfig:
             with pytest.raises(ValueError, match="Invalid VLLM_METAL_MEMORY_FRACTION"):
                 MetalConfig(
                     memory_fraction=fraction,
-                    use_mlx=False,
                     mlx_device="gpu",
-                    debug=False,
                     use_paged_attention=True,
                 )
 
@@ -145,26 +133,14 @@ class TestMetalConfig:
         assert config.k_quant == "q8_0"
         assert config.v_quant == "q3_0"
 
-    def test_text_only_compat_mode_is_accepted(self) -> None:
-        config = MetalConfig(
-            memory_fraction=AUTO_MEMORY_FRACTION,
-            use_mlx=True,
-            mlx_device="gpu",
-            debug=False,
-            use_paged_attention=True,
-            multimodal_mode="text-only-compat",
-        )
-        assert config.multimodal_mode == "text-only-compat"
-
-    def test_invalid_multimodal_mode_rejected(self) -> None:
+    @pytest.mark.parametrize("mode", ["text-only-compat", "vlm"])
+    def test_invalid_multimodal_mode_rejected(self, mode: str) -> None:
         with pytest.raises(ValueError, match="Invalid VLLM_METAL_MULTIMODAL_MODE"):
             MetalConfig(
                 memory_fraction=AUTO_MEMORY_FRACTION,
-                use_mlx=True,
                 mlx_device="gpu",
-                debug=False,
                 use_paged_attention=True,
-                multimodal_mode="vlm",  # type: ignore[arg-type]
+                multimodal_mode=mode,  # type: ignore[arg-type]
             )
 
     def test_turboquant_requires_paged_attention(self) -> None:
@@ -172,9 +148,7 @@ class TestMetalConfig:
         with pytest.raises(ValueError, match="turboquant requires paged attention"):
             MetalConfig(
                 memory_fraction=AUTO_MEMORY_FRACTION,
-                use_mlx=False,
                 mlx_device="gpu",
-                debug=False,
                 use_paged_attention=False,
                 turboquant=True,
                 k_quant="uint8",
@@ -185,9 +159,7 @@ class TestMetalConfig:
         with pytest.raises(ValueError, match="Invalid k_quant"):
             MetalConfig(
                 memory_fraction=AUTO_MEMORY_FRACTION,
-                use_mlx=False,
                 mlx_device="gpu",
-                debug=False,
                 use_paged_attention=True,
                 turboquant=True,
                 k_quant="fp16",
@@ -198,9 +170,7 @@ class TestMetalConfig:
         with pytest.raises(ValueError, match="Invalid v_quant"):
             MetalConfig(
                 memory_fraction=AUTO_MEMORY_FRACTION,
-                use_mlx=False,
                 mlx_device="gpu",
-                debug=False,
                 use_paged_attention=True,
                 turboquant=True,
                 k_quant="q8_0",

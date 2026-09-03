@@ -8,9 +8,8 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
-import torch
 from vllm.sampling_params import SamplingParams
-from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 from vllm_metal.v1.spec_decode import (
@@ -20,23 +19,14 @@ from vllm_metal.v1.spec_decode import (
 
 
 def _state(token_ids: list[int], block_ids: list[int]) -> SimpleNamespace:
-    return SimpleNamespace(token_ids=token_ids, block_ids=block_ids)
+    return SimpleNamespace(token_ids=token_ids, block_ids=[block_ids])
 
 
 def _request_state(
     temperature: float = 0.0,
-    *,
-    generated_tokens: int = 1,
-    min_tokens: int = 0,
-    stop_token_ids: list[int] | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        sampling_params=SamplingParams(
-            temperature=temperature,
-            min_tokens=min_tokens,
-            stop_token_ids=stop_token_ids,
-        ),
-        generated_tokens=generated_tokens,
+        sampling_params=SamplingParams(temperature=temperature),
     )
 
 
@@ -45,28 +35,22 @@ def _scheduler_output(
     scheduled_spec_decode_tokens: dict[str, list[int]],
     num_scheduled_tokens: dict[str, int] | None = None,
     num_invalid_spec_tokens: dict[str, int] | None = None,
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> SchedulerOutput:
+    num_scheduled = num_scheduled_tokens or {
+        req_id: len(tokens) + 1
+        for req_id, tokens in scheduled_spec_decode_tokens.items()
+    }
+    return SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens=num_scheduled,
+        total_num_scheduled_tokens=sum(num_scheduled.values()),
         scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
-        num_scheduled_tokens=num_scheduled_tokens
-        or {
-            req_id: len(tokens) + 1
-            for req_id, tokens in scheduled_spec_decode_tokens.items()
-        },
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
         num_invalid_spec_tokens=num_invalid_spec_tokens,
-    )
-
-
-def _spec_logitsprocs():
-    config = SimpleNamespace(
-        speculative_config=object(),
-        scheduler_config=SimpleNamespace(max_num_seqs=4),
-    )
-    return build_logitsprocs(
-        config,
-        torch.device("cpu"),
-        is_pin_memory=False,
-        is_pooling_model=False,
     )
 
 
@@ -100,7 +84,7 @@ class TestPagedDecodeSegment:
             num_query_tokens=1,
             draft_token_ids=(),
             cache_start_pos=7,
-            block_ids=(11, 12),
+            block_ids=((11, 12),),
         )
 
         assert segment.req_id == "r0"
@@ -129,7 +113,7 @@ class TestBuildPagedDecodeSegments:
         assert segment.num_query_tokens == 1
         assert segment.draft_token_ids == ()
         assert segment.cache_start_pos == 7
-        assert segment.block_ids == (41, 42)
+        assert segment.block_ids == ((41, 42),)
         assert segment.draft_verification_rows == ()
         assert segment.bonus_row == 0
 
@@ -194,118 +178,6 @@ class TestBuildPagedDecodeSegments:
                 paged_request_seq_lens={"r0": 1},
             )
 
-    def test_target_hidden_states_follow_gemma4_mtp_config(self) -> None:
-        controller = SpeculativeDecodeController()
-
-        plain_segments = controller.build_decode_segments(
-            [("r0", _state([1, 2], [10]))],
-            scheduled_spec_decode_tokens={},
-            paged_request_seq_lens={"r0": 1},
-        )
-        draft_segments = controller.build_decode_segments(
-            [("r0", _state([1, 2], [10]))],
-            scheduled_spec_decode_tokens={"r0": [3]},
-            paged_request_seq_lens={"r0": 1},
-        )
-
-        assert not controller.needs_target_hidden_states(plain_segments)
-        assert not controller.needs_target_hidden_states(draft_segments)
-        assert controller.needs_target_hidden_states(
-            draft_segments,
-            speculative_config=_gemma4_mtp_speculative_config(),
-        )
-
-    def test_target_hidden_states_are_needed_for_gemma4_mtp_first_step(self) -> None:
-        controller = SpeculativeDecodeController()
-        segments = controller.build_decode_segments(
-            [("r0", _state([1, 2], [10]))],
-            scheduled_spec_decode_tokens={},
-            paged_request_seq_lens={"r0": 1},
-        )
-
-        assert controller.needs_target_hidden_states(
-            segments,
-            speculative_config=_gemma4_mtp_speculative_config(),
-        )
-
-    def test_target_hidden_states_are_needed_for_gemma4_mtp_final_prefill(
-        self,
-    ) -> None:
-        controller = SpeculativeDecodeController()
-
-        assert controller.needs_target_hidden_states(
-            (),
-            has_final_prefill=True,
-            speculative_config=_gemma4_mtp_speculative_config(),
-        )
-
-    def test_target_hidden_states_skip_gemma4_mtp_intermediate_prefill(self) -> None:
-        controller = SpeculativeDecodeController()
-
-        assert not controller.needs_target_hidden_states(
-            (),
-            has_final_prefill=False,
-            speculative_config=_gemma4_mtp_speculative_config(),
-        )
-
-    def test_target_hidden_states_are_not_needed_for_non_gemma4_spec(self) -> None:
-        controller = SpeculativeDecodeController()
-        speculative_config = SimpleNamespace(
-            method="ngram",
-            draft_model_config=None,
-        )
-        segments = controller.build_decode_segments(
-            [("r0", _state([1, 2], [10]))],
-            scheduled_spec_decode_tokens={"r0": [3]},
-            paged_request_seq_lens={"r0": 1},
-        )
-
-        assert not controller.needs_target_hidden_states(
-            segments,
-            speculative_config=speculative_config,
-        )
-
-    def test_target_hidden_states_are_not_needed_for_non_gemma4_mtp(self) -> None:
-        controller = SpeculativeDecodeController()
-        speculative_config = SimpleNamespace(
-            method="mtp",
-            draft_model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(model_type="eagle")
-            ),
-        )
-        segments = controller.build_decode_segments(
-            [("r0", _state([1, 2], [10]))],
-            scheduled_spec_decode_tokens={"r0": [3]},
-            paged_request_seq_lens={"r0": 1},
-        )
-
-        assert not controller.needs_target_hidden_states(
-            segments,
-            speculative_config=speculative_config,
-        )
-
-    def test_target_hidden_states_detect_mapped_gemma4_mtp_architecture(self) -> None:
-        controller = SpeculativeDecodeController()
-        speculative_config = SimpleNamespace(
-            method="mtp",
-            draft_model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(
-                    model_type="unknown",
-                    architectures=["Gemma4MTPModel"],
-                )
-            ),
-        )
-        segments = controller.build_decode_segments(
-            [("r0", _state([1, 2], [10]))],
-            scheduled_spec_decode_tokens={"r0": [3]},
-            paged_request_seq_lens={"r0": 1},
-        )
-
-        assert controller.needs_target_hidden_states(
-            segments,
-            speculative_config=speculative_config,
-        )
-
 
 class TestSpecDecodePolicy:
     def test_empty_scheduled_tokens_are_supported(self) -> None:
@@ -314,7 +186,6 @@ class TestSpecDecodePolicy:
             (),
             paged_attention_enabled=False,
             is_hybrid=True,
-            logitsprocs=None,
         )
 
     def test_gemma4_mtp_rejects_async_scheduling(self) -> None:
@@ -324,7 +195,6 @@ class TestSpecDecodePolicy:
                 (),
                 paged_attention_enabled=True,
                 is_hybrid=False,
-                logitsprocs=None,
                 use_async_scheduling=True,
                 speculative_config=_gemma4_mtp_speculative_config(),
             )
@@ -336,7 +206,6 @@ class TestSpecDecodePolicy:
                 [("r0", _request_state())],
                 paged_attention_enabled=False,
                 is_hybrid=False,
-                logitsprocs=None,
             )
 
     def test_hybrid_scheduled_tokens_are_rejected(self) -> None:
@@ -346,17 +215,15 @@ class TestSpecDecodePolicy:
                 [("r0", _request_state())],
                 paged_attention_enabled=True,
                 is_hybrid=True,
-                logitsprocs=None,
             )
 
     def test_rejects_invalid_draft_token_sentinel(self) -> None:
         with pytest.raises(NotImplementedError, match="invalid draft-token"):
             SpeculativeDecodeController().validate_supported(
-                _scheduler_output(scheduled_spec_decode_tokens={"r0": [-1]}),
+                _scheduler_output(scheduled_spec_decode_tokens={"r0": [7, -1]}),
                 [("r0", _request_state())],
                 paged_attention_enabled=True,
                 is_hybrid=False,
-                logitsprocs=None,
             )
 
     def test_rejects_scheduler_invalid_spec_tokens(self) -> None:
@@ -369,7 +236,6 @@ class TestSpecDecodePolicy:
                 [("r0", _request_state())],
                 paged_attention_enabled=True,
                 is_hybrid=False,
-                logitsprocs=None,
             )
 
     def test_rejects_handoff_for_request_outside_decode_set(self) -> None:
@@ -379,7 +245,6 @@ class TestSpecDecodePolicy:
                 [("r0", _request_state())],
                 paged_attention_enabled=True,
                 is_hybrid=False,
-                logitsprocs=None,
             )
 
     def test_rejects_empty_handoff_for_request_outside_decode_set(self) -> None:
@@ -389,7 +254,6 @@ class TestSpecDecodePolicy:
                 [("r0", _request_state())],
                 paged_attention_enabled=True,
                 is_hybrid=False,
-                logitsprocs=None,
             )
 
     def test_rejects_mismatched_scheduler_token_accounting(self) -> None:
@@ -402,44 +266,6 @@ class TestSpecDecodePolicy:
                 [("r0", _request_state())],
                 paged_attention_enabled=True,
                 is_hybrid=False,
-                logitsprocs=None,
-            )
-
-    def test_allows_inactive_min_tokens_processor_from_speculative_config(self) -> None:
-        SpeculativeDecodeController().validate_supported(
-            _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
-            [
-                (
-                    "r0",
-                    _request_state(
-                        generated_tokens=2,
-                        min_tokens=1,
-                        stop_token_ids=[2],
-                    ),
-                )
-            ],
-            paged_attention_enabled=True,
-            is_hybrid=False,
-            logitsprocs=_spec_logitsprocs(),
-        )
-
-    def test_rejects_active_min_tokens_constraint(self) -> None:
-        with pytest.raises(NotImplementedError, match="active min_tokens"):
-            SpeculativeDecodeController().validate_supported(
-                _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
-                [
-                    (
-                        "r0",
-                        _request_state(
-                            generated_tokens=0,
-                            min_tokens=3,
-                            stop_token_ids=[2],
-                        ),
-                    )
-                ],
-                paged_attention_enabled=True,
-                is_hybrid=False,
-                logitsprocs=_spec_logitsprocs(),
             )
 
 
@@ -458,7 +284,7 @@ class TestGemma4MTPDraftSeeds:
                     num_query_tokens=2,
                     draft_token_ids=(6,),
                     cache_start_pos=4,
-                    block_ids=(1,),
+                    block_ids=((1,),),
                 ),
                 PagedDecodeSegment(
                     req_id="r1",
@@ -467,7 +293,7 @@ class TestGemma4MTPDraftSeeds:
                     num_query_tokens=1,
                     draft_token_ids=(),
                     cache_start_pos=9,
-                    block_ids=(2,),
+                    block_ids=((2,),),
                 ),
             ],
             decode_token_ids=[[6, 8], [9]],
@@ -477,7 +303,6 @@ class TestGemma4MTPDraftSeeds:
             request_states={},
             cu_seqlens=[0, 2, 3],
             num_decode_segments=2,
-            logitsprocs=None,
         )
 
         assert seeds == (
@@ -486,7 +311,7 @@ class TestGemma4MTPDraftSeeds:
                 token_id=8,
                 target_hidden_row=1,
                 target_position=5,
-                block_ids=(1,),
+                block_ids=((1,),),
             ),
         )
 
@@ -494,13 +319,13 @@ class TestGemma4MTPDraftSeeds:
         final_prefill = SimpleNamespace(
             req_id="p0",
             token_ids=[1, 2, 3],
-            block_ids=[4],
+            block_ids=[[4]],
             start_pos=10,
         )
         intermediate_prefill = SimpleNamespace(
             req_id="p1",
             token_ids=[4, 5],
-            block_ids=[5],
+            block_ids=[[5]],
             start_pos=20,
         )
 
@@ -517,7 +342,6 @@ class TestGemma4MTPDraftSeeds:
             },
             cu_seqlens=[0, 3, 5],
             num_decode_segments=0,
-            logitsprocs=None,
         )
 
         assert seeds == (
@@ -526,12 +350,22 @@ class TestGemma4MTPDraftSeeds:
                 token_id=11,
                 target_hidden_row=2,
                 target_position=12,
-                block_ids=(4,),
+                block_ids=((4,),),
             ),
         )
 
 
 class TestVerifyGreedySpecDecode:
+    def test_specific_token_logprobs_are_not_draft_eligible(self) -> None:
+        state = SimpleNamespace(
+            sampling_params=SamplingParams(
+                temperature=0.0,
+                logprob_token_ids=[0, 3],
+            )
+        )
+
+        assert not SpeculativeDecodeController().can_draft_greedy("r0", state)
+
     def test_accepts_all_drafts_and_emits_bonus_token(self) -> None:
         segment = PagedDecodeSegment(
             req_id="r0",
@@ -540,14 +374,13 @@ class TestVerifyGreedySpecDecode:
             num_query_tokens=3,
             draft_token_ids=(7, 8),
             cache_start_pos=1,
-            block_ids=(0,),
+            block_ids=((0,),),
         )
 
         output = SpeculativeDecodeController().verify_greedy(
             _logits([7, 8, 9]),
             [("r0", _request_state())],
             (segment,),
-            logitsprocs=None,
         )
 
         assert output == [[7, 8, 9]]
@@ -560,14 +393,13 @@ class TestVerifyGreedySpecDecode:
             num_query_tokens=3,
             draft_token_ids=(7, 8),
             cache_start_pos=1,
-            block_ids=(0,),
+            block_ids=((0,),),
         )
 
         output = SpeculativeDecodeController().verify_greedy(
             _logits([7, 5, 9]),
             [("r0", _request_state())],
             (segment,),
-            logitsprocs=None,
         )
 
         assert output == [[7, 5]]
@@ -580,7 +412,7 @@ class TestVerifyGreedySpecDecode:
             num_query_tokens=2,
             draft_token_ids=(7,),
             cache_start_pos=1,
-            block_ids=(0,),
+            block_ids=((0,),),
         )
 
         with pytest.raises(NotImplementedError, match="greedy sampling"):
@@ -588,28 +420,79 @@ class TestVerifyGreedySpecDecode:
                 _logits([7, 9]),
                 [("r0", _request_state(temperature=0.7))],
                 (segment,),
-                logitsprocs=None,
             )
 
-    def test_rejects_logits_processors_that_can_change_argmax(self) -> None:
-        class _NonArgmaxProcessor:
-            def is_argmax_invariant(self) -> bool:
-                return False
 
-        with pytest.raises(NotImplementedError, match="logits processors"):
-            SpeculativeDecodeController().verify_greedy(
-                _logits([7, 9]),
-                [("r0", _request_state())],
-                (
-                    PagedDecodeSegment(
-                        req_id="r0",
-                        input_token_ids=(6, 7),
-                        start_row=0,
-                        num_query_tokens=2,
-                        draft_token_ids=(7,),
-                        cache_start_pos=1,
-                        block_ids=(0,),
-                    ),
-                ),
-                logitsprocs=LogitsProcessors([_NonArgmaxProcessor()]),
-            )
+class TestSchedulerPaddedDrafts:
+    """vLLM 0.25 pads a newly admitted decode request with placeholder drafts."""
+
+    def test_padded_drafts_are_dropped(self) -> None:
+        scheduler_output = _scheduler_output(
+            scheduled_spec_decode_tokens={"r0": [-1, -1]},
+        )
+
+        active = SpeculativeDecodeController.active_spec_decode_tokens(scheduler_output)
+
+        assert active == {}
+
+    @pytest.mark.parametrize(
+        ("spec_tokens", "num_scheduled", "invalid_counts"),
+        [
+            ([7, 8], None, None),
+            ([-1, -1], None, {"r0": 2}),
+            ([-2, -2], None, None),
+            ([-1, -1], {"r0": 5}, None),
+        ],
+        ids=[
+            "real_drafts",
+            "grammar_rejected",
+            "foreign_sentinel",
+            "mismatched_accounting",
+        ],
+    )
+    def test_non_padding_handoffs_are_kept(
+        self,
+        spec_tokens: list[int],
+        num_scheduled: dict[str, int] | None,
+        invalid_counts: dict[str, int] | None,
+    ) -> None:
+        scheduler_output = _scheduler_output(
+            scheduled_spec_decode_tokens={"r0": spec_tokens},
+            num_scheduled_tokens=num_scheduled,
+            num_invalid_spec_tokens=invalid_counts,
+        )
+
+        active = SpeculativeDecodeController.active_spec_decode_tokens(scheduler_output)
+
+        assert active == {"r0": tuple(spec_tokens)}
+
+    def test_padded_request_outside_decode_set_is_accepted(self) -> None:
+        scheduler_output = _scheduler_output(
+            scheduled_spec_decode_tokens={"new": [-1, -1]},
+        )
+
+        SpeculativeDecodeController().validate_supported(
+            scheduler_output,
+            [],
+            paged_attention_enabled=True,
+            is_hybrid=False,
+        )
+
+    def test_padded_drafts_reach_build_decode_segments_as_zero_drafts(self) -> None:
+        controller = SpeculativeDecodeController()
+        scheduler_output = _scheduler_output(
+            scheduled_spec_decode_tokens={"r0": [-1, -1]},
+        )
+        decode_reqs = [("r0", _state([5, 9], [41, 42]))]
+
+        segments = controller.build_decode_segments(
+            decode_reqs,
+            controller.active_spec_decode_tokens(scheduler_output),
+            paged_request_seq_lens={"r0": 7},
+        )
+
+        assert len(segments) == 1
+        assert segments[0].num_query_tokens == 1
+        assert segments[0].input_token_ids == (9,)
+        assert segments[0].draft_token_ids == ()
+        assert segments[0].bonus_row == 0

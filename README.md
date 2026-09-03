@@ -9,15 +9,22 @@ vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX 
 ---
 *Latest News* 🔥
 
+- [2026/08] vLLM Metal now uses M5 NAX tensor units to accelerate MHA, GQA, and MQA prefill.
+- [2026/08] Qwen3.8 now runs on Metal! `mlx-community/Qwen3.8-27B-8bit` serves a 27B hybrid SDPA + GDN linear model on a single Apple Silicon Mac.
 - [2026/04] We released the new version v0.2.0! Unified paged varlen Metal kernel is now the default attention backend. 83x TTFT, 3.6x throughput compared to v0.1.0.
 
 ---
 
+## Architecture
+
+Upstream vLLM supplies the API server, scheduler, and paged block manager; mlx_lm supplies the token-wise model layers; vllm-metal owns the request-aware attention path — the paged varlen kernel, M5 NAX prefill, and speculative decoding.
+
+![vllm-metal in the vLLM stack](https://raw.githubusercontent.com/vllm-project/vllm-metal/main/docs/assets/architecture.svg)
+
 ## Requirements
 
-- macOS on Apple Silicon
+- macOS 15 (Sequoia) or later, on Apple Silicon
 - Native arm64 Python 3.12. Rosetta/x86_64 Python is not supported.
-- Xcode Command Line Tools (`xcode-select --install`). vLLM core is compiled from source via `clang++`. The Metal kernels ship **prebuilt**, so no Metal compiler or toolchain is needed to run them.
 
 ## Supported Models
 
@@ -38,13 +45,3 @@ If you run `source ~/.venv-vllm-metal/bin/activate`, the `vllm` CLI becomes avai
 
 For how to use the `vllm` CLI, please refer to the official vLLM guide.
 https://docs.vllm.ai/en/latest/cli/
-
-### Optional: Rust frontend (experimental)
-
-Pass `--with-vllm-rs` to also install `vllm-rs`, the experimental Rust frontend vendored in the bundled vLLM release. Requires the Rust toolchain (https://rustup.rs):
-
-```bash
-./install.sh --with-vllm-rs
-```
-
-See [docs/rust_frontend.md](docs/rust_frontend.md) for usage and architecture.

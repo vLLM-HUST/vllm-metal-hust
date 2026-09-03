@@ -6,12 +6,8 @@ from typing import Literal
 
 import vllm_metal.envs as envs
 
-# Sentinel value indicating auto memory calculation
+# Sentinel value selecting the active backend's automatic memory policy.
 AUTO_MEMORY_FRACTION = -1.0
-
-# Default memory fraction when user leaves VLLM_METAL_MEMORY_FRACTION as "auto"
-# but enables paged attention (auto is for the MLX path).
-PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION = 0.9
 
 # Minimum blocks required for paged attention to be usable.
 PAGED_ATTENTION_MIN_BLOCKS = 16
@@ -28,9 +24,9 @@ TURBOQUANT_VALID_V_QUANTS: frozenset[str] = frozenset(
     {"q2_0", "q3_0", "q4_0", "q5_0", "q8_0"}
 )
 
-MultimodalMode = Literal["auto", "text-only-compat", "multimodal-native"]
+MultimodalMode = Literal["auto", "multimodal-native"]
 VALID_MULTIMODAL_MODES: frozenset[MultimodalMode] = frozenset(
-    {"auto", "text-only-compat", "multimodal-native"}
+    {"auto", "multimodal-native"}
 )
 
 
@@ -38,10 +34,8 @@ VALID_MULTIMODAL_MODES: frozenset[MultimodalMode] = frozenset(
 class MetalConfig:
     """Configuration for vLLM Metal plugin."""
 
-    memory_fraction: float  # -1.0 means "auto" (calculate minimal needed)
-    use_mlx: bool
+    memory_fraction: float  # -1.0 selects the active backend's auto policy
     mlx_device: Literal["gpu", "cpu"]
-    debug: bool
     use_paged_attention: bool = True
     multimodal_mode: MultimodalMode = "auto"
     turboquant: bool = False  # Enable TurboQuant KV cache compression
@@ -99,6 +93,18 @@ class MetalConfig:
         """Check if memory fraction is set to auto mode."""
         return self.memory_fraction == AUTO_MEMORY_FRACTION
 
+    def effective_memory_fraction(self, gpu_memory_utilization: float) -> float:
+        """Resolve the paged memory fraction against the engine config.
+
+        A numeric ``VLLM_METAL_MEMORY_FRACTION`` wins; auto defers to the
+        engine's ``--gpu-memory-utilization`` (vLLM defaults it to 0.92).
+        Single home for this precedence — the cache planner and the
+        command-buffer default both read it.
+        """
+        if self.is_auto_memory:
+            return gpu_memory_utilization
+        return self.memory_fraction
+
     @classmethod
     def from_env(cls) -> "MetalConfig":
         """Load configuration from environment variables."""
@@ -118,9 +124,7 @@ class MetalConfig:
         # See MetalPlatform.check_and_update_config() for how it's applied.
         return cls(
             memory_fraction=memory_fraction,
-            use_mlx=envs.VLLM_METAL_USE_MLX,
             mlx_device=envs.VLLM_MLX_DEVICE,  # type: ignore[arg-type]
-            debug=envs.VLLM_METAL_DEBUG,
             use_paged_attention=envs.VLLM_METAL_USE_PAGED_ATTENTION,
             multimodal_mode=envs.VLLM_METAL_MULTIMODAL_MODE,  # type: ignore[arg-type]
         )

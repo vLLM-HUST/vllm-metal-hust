@@ -1,15 +1,18 @@
 # Text Pooling
 
-Metal V1 has experimental text-only `embed` pooling support for compatible
-pooling models. Supported requests run as prefill-only work, return one CPU
-L2-normalized embedding tensor per finished request through vLLM's
-`pooler_output` contract, and do not sample generation tokens.
+Metal V1 has experimental text-only `embed`, `classify`, and
+`token_classify` pooling support for compatible pooling models. Supported
+requests return CPU tensors through vLLM's `pooler_output` contract and do not
+sample generation tokens.
 
 It also has experimental text-only `classify` support for original Qwen3
 reranker checkpoints that vLLM converts with
 `Qwen3ForSequenceClassification`, `classifier_from_token=["no", "yes"]`, and
 `is_original_qwen3_reranker=True`. This path returns one scalar score tensor
 per request through the same `pooler_output` contract.
+
+Canonical unquantized `BAAI/bge-m3` is supported on the encoder pooling path
+for dense `embed` output and sparse `token_classify` lexical weights.
 
 ## Scope
 
@@ -22,24 +25,30 @@ Current scope is intentionally narrow:
   and `is_original_qwen3_reranker=True`
 - decoder-style text models that expose token hidden states through the MLX
   transformer body
-- sequence embeddings from the final prompt-token hidden state with LAST
-  pooling and L2 normalization on the paged Metal V1 path
+- decoder sequence embeddings from the final prompt-token hidden state with
+  LAST pooling and L2 normalization on the paged Metal V1 path
 - Qwen3 reranker cross-encoder scores from the final prompt-token hidden state,
   using `lm_head` for untied checkpoints or `embed_tokens.as_linear` when word
   embeddings are tied
+- BGE-M3 dense embeddings from the CLS hidden state, L2-normalized
+- BGE-M3 sparse lexical weights through `/pooling` with
+  `pooler_config.task="token_classify"`
 
 ## Unsupported
 
 The Metal runner rejects these cases with diagnostic errors:
 
 - generic classification heads, generic reranking models, and late interaction
-- sequence pooling strategies other than LAST (`MEAN`, `CLS`, `ALL`, `STEP`)
-- token-level pooling
+- decoder sequence pooling strategies other than LAST (`MEAN`, `CLS`, `ALL`,
+  `STEP`)
+- generic token-level pooling outside the BGE-M3 `token_classify` path
 - chunked long-input embedding aggregation (`enable_chunked_processing`)
-- non-paged pooling execution
+- non-paged decoder pooling execution
 - multimodal embeddings and scheduled encoder inputs
 - prompt embeddings
 - unsafe dimension requests
+- MLX Community BGE-M3 checkpoints that do not ship the sparse sidecar required
+  by `token_classify`
 
 Direct model-provided embedding tensors are intentionally out of scope for this
 MVP. Add that path only after a real model requires it and the output contract
@@ -47,7 +56,8 @@ is validated end to end.
 
 ## Usage
 
-Set `VLLM_METAL_USE_PAGED_ATTENTION=1` for the current text pooling MVP.
+Set `VLLM_METAL_USE_PAGED_ATTENTION=1` for decoder pooling models. Encoder
+pooling models such as BGE-M3 do not use decoder KV cache or paged attention.
 
 ### Offline Embeddings
 
@@ -130,8 +140,42 @@ curl http://localhost:8000/score \
   -d '{"text_1":["What is the capital of China?"],"text_2":["The capital of China is Beijing."]}'
 ```
 
+### BGE-M3 Dense Embeddings
+
+```bash
+vllm serve BAAI/bge-m3 \
+  --runner pooling \
+  --max-model-len 8192
+```
+
+```bash
+curl http://localhost:8000/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"model":"BAAI/bge-m3","input":["what is sparse retrieval?","lexical matching example"]}'
+```
+
+### BGE-M3 Sparse Lexical Weights
+
+Start the server with the `token_classify` pooling task and the BGE-M3
+architecture override expected by vLLM's pooling contract.
+
+```bash
+vllm serve BAAI/bge-m3 \
+  --runner pooling \
+  --max-model-len 8192 \
+  --pooler-config '{"task":"token_classify"}' \
+  --hf-overrides '{"architectures":["BgeM3EmbeddingModel"]}'
+```
+
+```bash
+curl http://localhost:8000/pooling \
+  -H "Content-Type: application/json" \
+  -d '{"model":"BAAI/bge-m3","input":["what is sparse retrieval?"]}'
+```
+
 ## Validation
 
 Do not add a model row to [Supported Models](supported_models.md) until a real
-`LLM.embed`, `/v1/embeddings`, `LLM.score`, or `/score` smoke passes on Apple
-Silicon with the model name, revision, command, and output shape recorded.
+`LLM.embed`, `/v1/embeddings`, `LLM.score`, `/score`, or `/pooling` smoke
+passes on Apple Silicon with the model name, revision, command, and output
+shape recorded.

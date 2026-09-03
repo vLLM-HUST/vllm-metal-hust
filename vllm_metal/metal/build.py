@@ -15,7 +15,11 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from vllm_metal.metal.constants import PARTITION_SIZE
+from vllm_metal.metal.constants import (
+    PA_WINDOW_MAX_HEAD_SIZE,
+    PA_WINDOW_ROWS,
+    PARTITION_SIZE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +48,9 @@ _HASH = _stamp_path(_OUT)
 # ``get_library(name)`` returns the .metallib loaded at startup.
 METALLIB_NAMES = ("paged_attention_v2_kern", "gdn_kern", "paged_mla_kern")
 
+# Kept outside METALLIB_NAMES because wheels built with older SDKs omit it.
+NAX_METALLIB_NAME = "paged_attention_nax_kern"
+
 
 def output_path() -> Path:
     """Path to the prebuilt native extension (whether or not it exists yet)."""
@@ -67,7 +74,48 @@ def metallib_path(name: str) -> Path:
 # do NOT add ``-O3``: MLX compiles its shaders at the metal default optimization
 # (already enabled), so matching keeps the prebuilt path numerically and
 # behaviourally identical to what users get today.
-_METALLIB_FLAGS = ("xcrun", "-sdk", "macosx", "metal", "-fno-fast-math")
+MIN_MACOS_VERSION = "15.0"
+NAX_MIN_MACOS_VERSION = "26.2"
+_METALLIB_BASE_FLAGS = ("xcrun", "-sdk", "macosx", "metal", "-fno-fast-math")
+_METALLIB_FLAGS = (
+    *_METALLIB_BASE_FLAGS,
+    f"-mmacosx-version-min={MIN_MACOS_VERSION}",
+)
+
+# MPP tensor ops need a 26.2 deployment floor at compile and link time.
+_NAX_MIN_SDK = tuple(int(x) for x in NAX_MIN_MACOS_VERSION.split("."))
+_NAX_METALLIB_FLAGS = (
+    *_METALLIB_BASE_FLAGS,
+    f"-mmacosx-version-min={NAX_MIN_MACOS_VERSION}",
+)
+
+
+def _metallib_flags(name: str) -> tuple[str, ...]:
+    return _NAX_METALLIB_FLAGS if name == NAX_METALLIB_NAME else _METALLIB_FLAGS
+
+
+def _sdk_supports_nax() -> bool:
+    """Whether the local macOS SDK can compile the NAX library at all."""
+    try:
+        out = subprocess.run(
+            ["xcrun", "-sdk", "macosx", "--show-sdk-version"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        parts = tuple(int(x) for x in out.split(".")[:2])
+        return parts >= _NAX_MIN_SDK
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return False
+
+
+def require_nax_sdk() -> None:
+    """Fail unless the selected SDK can build the official NAX artifact."""
+    if not _sdk_supports_nax():
+        raise RuntimeError(
+            f"Official wheel builds require macOS SDK >= {NAX_MIN_MACOS_VERSION} "
+            f"to compile {NAX_METALLIB_NAME}."
+        )
 
 
 def _metallib_source(name: str) -> str:
@@ -77,6 +125,7 @@ def _metallib_source(name: str) -> str:
     from vllm_metal.metal import (
         _build_gdn_source,
         _build_mla_paged_attention_source,
+        _build_nax_source,
         _build_v2_paged_attention_source,
     )
 
@@ -84,15 +133,16 @@ def _metallib_source(name: str) -> str:
         "paged_attention_v2_kern": _build_v2_paged_attention_source,
         "gdn_kern": _build_gdn_source,
         "paged_mla_kern": _build_mla_paged_attention_source,
+        NAX_METALLIB_NAME: _build_nax_source,
     }
     return builders[name]()
 
 
-def _metallib_digest(source: str) -> str:
+def _metallib_digest(name: str, source: str) -> str:
     """Content hash of a metallib: its assembled ``.metal`` source + the compile
     flags. Editing any concatenated shader changes ``source`` and so the digest."""
     h = hashlib.sha256()
-    h.update("\0".join(_METALLIB_FLAGS).encode())
+    h.update("\0".join(_metallib_flags(name)).encode())
     h.update(b"\0")
     h.update(source.encode())
     return h.hexdigest()
@@ -119,17 +169,17 @@ def _compile_metallib(name: str, source: str) -> Path:
         tmp.write(source)
         tmp.close()
         _run_or_raise(
-            [*_METALLIB_FLAGS, tmp.name, "-o", str(out)],
+            [*_metallib_flags(name), tmp.name, "-o", str(out)],
             f"compile Metal library '{name}'",
         )
     finally:
         Path(tmp.name).unlink(missing_ok=True)
-    _stamp_path(out).write_text(_metallib_digest(source))
+    _stamp_path(out).write_text(_metallib_digest(name, source))
     return out
 
 
 def build_metallibs() -> list[Path]:
-    """Precompile the three Metal shader libraries to ``.metallib`` files.
+    """Precompile the required libraries and optional NAX library.
 
     PACKAGING-only (CI + release.sh): the default runtime path loads these
     prebuilt libraries, but source mode (``VLLM_METAL_BUILD_FROM_SOURCE=1``)
@@ -137,7 +187,18 @@ def build_metallibs() -> list[Path]:
     the Metal toolchain never reaches this code.
     """
     logger.info("Building Metal shader libraries ...")
-    return [_compile_metallib(name, _metallib_source(name)) for name in METALLIB_NAMES]
+    built = [_compile_metallib(name, _metallib_source(name)) for name in METALLIB_NAMES]
+    if _sdk_supports_nax():
+        built.append(
+            _compile_metallib(NAX_METALLIB_NAME, _metallib_source(NAX_METALLIB_NAME))
+        )
+    else:
+        logger.warning(
+            "macOS SDK < %s: skipping %s",
+            ".".join(map(str, _NAX_MIN_SDK)),
+            NAX_METALLIB_NAME,
+        )
+    return built
 
 
 def _find_package_path(name: str) -> Path:
@@ -188,6 +249,7 @@ def _build_spec() -> _BuildSpec:
         "-shared",
         "-fPIC",
         "-O2",
+        f"-mmacosx-version-min={MIN_MACOS_VERSION}",
         "-fvisibility=default",
         f"-I{py_include}",
         f"-I{nb_path / 'include'}",
@@ -221,6 +283,8 @@ def _build_spec() -> _BuildSpec:
         "-D_METAL_",
         "-DACCELERATE_NEW_LAPACK",
         f"-DVLLM_METAL_PARTITION_SIZE={PARTITION_SIZE}",
+        f"-DVLLM_METAL_PA_WINDOW_ROWS={PA_WINDOW_ROWS}",
+        f"-DVLLM_METAL_PA_WINDOW_MAX_HEAD={PA_WINDOW_MAX_HEAD_SIZE}",
         "-undefined",
         "dynamic_lookup",
         str(nb_src),
@@ -298,13 +362,17 @@ def stale_artifacts() -> list[Path]:
     no source builder (a ``KeyError`` from :func:`_metallib_source`) is
     deliberately left to propagate: that is a bug to fix, not a condition to
     hide behind ``[]``."""
-    artifacts = (_OUT, *(metallib_path(n) for n in METALLIB_NAMES))
+    optional = (NAX_METALLIB_NAME,) if metallib_path(NAX_METALLIB_NAME).exists() else ()
+    all_names = (*METALLIB_NAMES, *optional)
+    artifacts = (_OUT, *(metallib_path(n) for n in all_names))
     if not any(_stamp_path(a).exists() for a in artifacts):
         return []
     try:
         digests = {_OUT: _input_hash(_build_spec())}
-        for name in METALLIB_NAMES:
-            digests[metallib_path(name)] = _metallib_digest(_metallib_source(name))
+        for name in all_names:
+            digests[metallib_path(name)] = _metallib_digest(
+                name, _metallib_source(name)
+            )
     except (OSError, ImportError, RuntimeError) as exc:
         # The check couldn't run (not a verdict on the artifacts); don't block a
         # loadable install, but leave a breadcrumb instead of failing silently.

@@ -143,12 +143,10 @@ def _generate_with_acceptance_counting(llm: LLM, prompt: str, max_tokens: int):
     original_verify = controller.verify_greedy
     counts = {"accepted": 0, "drafted": 0}
 
-    def counting_verify(logits, decode_reqs, decode_segments, *, logitsprocs):
+    def counting_verify(logits, decode_reqs, decode_segments):
         # Each verified row is (accepted drafts) + 1 trailing token (bonus on full
         # accept, else the target's correction), so accepted = len - 1.
-        result = original_verify(
-            logits, decode_reqs, decode_segments, logitsprocs=logitsprocs
-        )
+        result = original_verify(logits, decode_reqs, decode_segments)
         for segment, output_ids in zip(decode_segments, result, strict=True):
             counts["drafted"] += len(segment.draft_token_ids)
             counts["accepted"] += len(output_ids) - 1

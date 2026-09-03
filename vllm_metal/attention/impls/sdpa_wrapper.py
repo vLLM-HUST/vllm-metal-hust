@@ -10,8 +10,8 @@ appropriate Metal attention impl based on the module's structure:
 
 All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 
-Reuses ``PagedAttentionContext``, ``OffsetCache``, ``prepare_unified``,
-``clear_context`` from ``context``.
+Reuses ``PagedAttentionContext``, ``OffsetCache``, ``prepare_grouped``,
+``prepare_unified``, and ``clear_context`` from ``context``.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
+from vllm_metal.attention.attention_contracts import attention_contract_for
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.context import get_context
 from vllm_metal.attention.impls.sdpa import (
@@ -72,6 +73,9 @@ class SDPAPagedAttentionWrapper(nn.Module):
         object.__setattr__(self, "_mk_layer_idx", layer_idx)
         object.__setattr__(self, "_mk_kv_cache", kv_cache)
         object.__setattr__(self, "_mk_block_size", block_size)
+        object.__setattr__(
+            self, "_mk_attention_contract", attention_contract_for(inner)
+        )
         # For compact caches (hybrid models), cache_idx maps to the
         # per-type cache array.  Defaults to layer_idx for non-hybrid.
         object.__setattr__(
@@ -166,6 +170,7 @@ class SDPAPagedAttentionWrapper(nn.Module):
             self._mk_cache_idx,
             shared_kv=shared_kv,
             position_embeddings=position_embeddings,
+            attention_contract=self._mk_attention_contract,
         )
 
         # YOCO models (Gemma4) expect (output, shared_kv, offset) return.

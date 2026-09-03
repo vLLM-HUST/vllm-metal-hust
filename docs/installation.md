@@ -2,19 +2,17 @@
 
 ## Requirements
 
-- macOS on Apple Silicon
+- macOS 15 (Sequoia) or later, on Apple Silicon. The prebuilt wheel's
+  native extension and Metal kernels target macOS 15, so the wheel is
+  tagged `macosx_15_0_arm64` and will not install on earlier releases.
 - Native arm64 Python 3.12. Rosetta/x86_64 Python is not supported.
-- Xcode Command Line Tools (`xcode-select --install`). The installer compiles vLLM core from source via `clang++`.
 
-> **Metal kernels are prebuilt.** Release wheels ship the native paged-attention
-> extension (`_paged_ops*.so`) and its precompiled Metal shader libraries
-> (`*.metallib`), so `pip install` requires no compiler or Metal toolchain to
-> *run* the kernels — nothing is compiled on first request. The Command Line
-> Tools above are still needed because the installer builds vLLM core from
-> source. Building the Metal kernels yourself is only for contributors editing
-> them; see [Contributing](CONTRIBUTING.md).
+> **No compiler required.** The install script below fetches vLLM core and the
+> vllm-metal plugin as prebuilt wheels, so nothing is compiled on your machine.
+> Installing from a source checkout instead builds the native Metal kernels
+> locally and needs a toolchain; see [Contributing](CONTRIBUTING.md).
 
-`uv` is bootstrapped automatically; the Rust toolchain is only needed for the optional [Rust frontend](rust_frontend.md).
+`uv` is bootstrapped automatically.
 
 Verify the Python architecture before installing:
 
@@ -36,19 +34,19 @@ If you run `source ~/.venv-vllm-metal/bin/activate`, the `vllm` CLI becomes avai
 
 For how to use the `vllm` CLI, please refer to the [official vLLM guide](https://docs.vllm.ai/en/latest/cli/).
 
+Development channel (default):
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
 ```
 
-### Optional: Rust frontend
-
-Pass `--with-vllm-rs` to also install `vllm-rs`, the experimental Rust frontend vendored in the bundled vLLM release. Requires the Rust toolchain on `PATH` (install from <https://rustup.rs>):
+Stable channel:
 
 ```bash
-./install.sh --with-vllm-rs
+curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash -s -- --stable
 ```
 
-The `vllm-rs` binary is installed to `~/.cargo/bin/`. See [Rust Frontend](rust_frontend.md) for usage.
+`pip install vllm-metal` is not supported. Use one of the commands above.
 
 ## Reinstallation and Update
 

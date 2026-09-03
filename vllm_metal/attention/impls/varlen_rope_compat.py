@@ -6,6 +6,21 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import mlx.core as mx
+import mlx.nn as nn
+from mlx_lm.models.rope_utils import (
+    Llama3RoPE,
+    ProportionalRoPE,
+    SuScaledRoPE,
+    YarnRoPE,
+)
+
+_VECTOR_OFFSET_ROPE_TYPES = (
+    nn.RoPE,
+    Llama3RoPE,
+    ProportionalRoPE,
+    SuScaledRoPE,
+    YarnRoPE,
+)
 
 
 def _apply_mrope_segment(
@@ -50,6 +65,21 @@ def _apply_mrope_segment_with_positions(
 
     cos, sin = rotary_emb(q_seg, position_ids)  # type: ignore[operator]
     return apply_multimodal_rotary_pos_emb(q_seg, k_seg, cos, sin)
+
+
+def _apply_single_token_batched_rope(
+    rope_fn: Callable[..., mx.array],
+    x: mx.array,
+    offsets: mx.array,
+) -> mx.array:
+    """Apply RoPE to packed decode rows as one native batch.
+
+    ``x`` is ``(1, heads, segment_count, head_dim)`` and each segment is one
+    token, so ``offsets`` must be the vector ``(segment_count,)``.
+    """
+    batched = mx.transpose(x, (2, 1, 0, 3))
+    rotated = rope_fn(batched, offset=offsets)
+    return mx.transpose(rotated, (2, 1, 0, 3))
 
 
 def apply_precomputed_mrope(
@@ -170,9 +200,32 @@ def apply_packed_rope(
     rope_fn = getattr(attn_module, "rope", None)
     rotary_emb = getattr(attn_module, "rotary_emb", None) if rope_fn is None else None
 
+    segment_count = len(cu_seqlens) - 1
+    if (
+        rope_fn is not None
+        and positions is None
+        and segment_count > 1
+        and queries.shape[0] == 1
+        and queries.shape[2] == segment_count
+        and (not apply_keys or keys.shape[2] == segment_count)
+        and all(cu_seqlens[i] == i for i in range(segment_count + 1))
+        and isinstance(rope_fn, _VECTOR_OFFSET_ROPE_TYPES)
+    ):
+        # Batch packed decode rows while preserving each row's absolute offset.
+        batch_offsets = (
+            mx.zeros((segment_count,), dtype=mx.int32)
+            if offsets is None
+            else mx.array(offsets, dtype=mx.int32)
+        )
+        rotated_q = _apply_single_token_batched_rope(rope_fn, queries, batch_offsets)
+        if not apply_keys:
+            return rotated_q, keys
+        rotated_k = _apply_single_token_batched_rope(rope_fn, keys, batch_offsets)
+        return rotated_q, rotated_k
+
     q_parts = []
     k_parts = []
-    for i in range(len(cu_seqlens) - 1):
+    for i in range(segment_count):
         start = cu_seqlens[i]
         end = cu_seqlens[i + 1]
         off = offsets[i] if offsets is not None else 0

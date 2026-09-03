@@ -12,6 +12,7 @@ from vllm_metal.multimodal.paddleocr_vl import PaddleOCRVLMultimodalAdapter
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1.model_adapter import (
     DefaultModelAdapter,
+    IntermediateForwardOutput,
     TargetModelForwardOutput,
 )
 
@@ -54,6 +55,115 @@ class TestShouldForceTextBackbone:
         result = adapter.should_force_text_backbone(hf_config)
         assert result is True
 
+    @pytest.mark.parametrize("bits", [4, 8])
+    @pytest.mark.parametrize(
+        ("model_type", "architecture"),
+        [
+            # Dense and MoE MLX 4-bit wrappers from issues #580 and #571.
+            ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+            ("qwen3_6", "Qwen3_6ForConditionalGeneration"),
+        ],
+    )
+    def test_mlx_quant_conditional_generation_uses_auto_override(
+        self, model_type: str, architecture: str, bits: int
+    ) -> None:
+        hf_config = SimpleNamespace(
+            model_type=model_type,
+            architectures=[architecture],
+            quantization={"group_size": 64, "bits": bits, "mode": "affine"},
+        )
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is True
+
+    @pytest.mark.parametrize(
+        ("model_type", "architecture", "vision_config"),
+        [
+            # The flagship native-multimodal checkpoint family
+            # (mlx-community Qwen3-VL MLX conversions carry the same
+            # top-level quantization dict) must keep the native path.
+            (
+                "qwen3_vl",
+                "Qwen3VLForConditionalGeneration",
+                SimpleNamespace(spatial_merge_size=2),
+            ),
+            # An arbitrary non-allowlisted multimodal model.
+            ("llava", "LlavaForConditionalGeneration", None),
+        ],
+    )
+    def test_mlx_quant_natively_adapted_arch_skips_auto_override(
+        self, model_type: str, architecture: str, vision_config: object | None
+    ) -> None:
+        hf_config = SimpleNamespace(
+            model_type=model_type,
+            architectures=[architecture],
+            quantization={"group_size": 64, "bits": 4, "mode": "affine"},
+            vision_config=vision_config,
+        )
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is False
+
+    def test_mlx_quant_qwen35_wrapper_uses_auto_override_with_vision_config(
+        self,
+    ) -> None:
+        hf_config = SimpleNamespace(
+            model_type="qwen3_5",
+            architectures=["Qwen3_5ForConditionalGeneration"],
+            quantization={"group_size": 64, "bits": 4, "mode": "affine"},
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+            text_config=SimpleNamespace(model_type="qwen3_5_text"),
+        )
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is True
+
+    def test_multimodal_native_mode_disables_mlx_quant_override(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
+        reset_config()
+
+        hf_config = SimpleNamespace(
+            model_type="qwen3_6",
+            architectures=["Qwen3_6MoeForConditionalGeneration"],
+            quantization={"group_size": 64, "bits": 4, "mode": "affine"},
+        )
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is False
+
+    def test_omitted_quantization_key_skips_auto_override(self) -> None:
+        # The common dense-checkpoint case: no `quantization` key at all.
+        hf_config = SimpleNamespace(
+            model_type="qwen3_6",
+            architectures=["Qwen3_6ForConditionalGeneration"],
+        )
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is False
+
+    def test_non_dict_quantization_value_skips_auto_override(self) -> None:
+        hf_config = SimpleNamespace(
+            model_type="qwen3_6",
+            architectures=["Qwen3_6ForConditionalGeneration"],
+            quantization="int4",
+        )
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is False
+
+    def test_quantization_dict_without_bits_skips_auto_override(self) -> None:
+        hf_config = SimpleNamespace(
+            model_type="qwen3_6",
+            architectures=["Qwen3_6ForConditionalGeneration"],
+            quantization={"group_size": 64},
+        )
+        adapter = DefaultModelAdapter()
+        result = adapter.should_force_text_backbone(hf_config)
+        assert result is False
+
     def test_qwen35_non_fp8_conditional_generation_skips_auto_override(self) -> None:
         hf_config = SimpleNamespace(
             model_type="qwen3_5",
@@ -65,33 +175,7 @@ class TestShouldForceTextBackbone:
         assert result is False
 
     def test_non_overridden_model_type_is_not_forced_in_auto_mode(self) -> None:
-        hf_config = SimpleNamespace(model_type="qwen3_5")
-        adapter = DefaultModelAdapter()
-        result = adapter.should_force_text_backbone(hf_config)
-        assert result is False
-
-    def test_text_only_compat_mode_forces_allowlisted_text_backbone(
-        self, monkeypatch
-    ) -> None:
-        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
-        reset_config()
-
-        hf_config = SimpleNamespace(
-            model_type="qwen3_6",
-            architectures=["Qwen3_6MoeForConditionalGeneration"],
-            quantization_config={"quant_method": "fp8"},
-        )
-        adapter = DefaultModelAdapter()
-        result = adapter.should_force_text_backbone(hf_config)
-        assert result is True
-
-    def test_text_only_compat_mode_does_not_force_generic_vlm(
-        self, monkeypatch
-    ) -> None:
-        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
-        reset_config()
-
-        hf_config = SimpleNamespace(model_type="phi3_v")
+        hf_config = SimpleNamespace(model_type="qwen3_5", architectures=[])
         adapter = DefaultModelAdapter()
         result = adapter.should_force_text_backbone(hf_config)
         assert result is False
@@ -105,12 +189,6 @@ class TestShouldForceTextBackbone:
             architectures=["Qwen3_5ForConditionalGeneration"],
             quantization_config={"quant_method": "fp8"},
         )
-        adapter = DefaultModelAdapter()
-        result = adapter.should_force_text_backbone(hf_config)
-        assert result is False
-
-    def test_missing_model_type_is_not_forced(self) -> None:
-        hf_config = SimpleNamespace()
         adapter = DefaultModelAdapter()
         result = adapter.should_force_text_backbone(hf_config)
         assert result is False
@@ -248,6 +326,144 @@ class TestTargetForward:
         assert output.hidden_states.tolist() == [[2.0, 3.0]]
         assert output.logits.tolist() == [[[6.0, 7.0]]]
 
+    def test_selective_logits_match_the_full_projection_rows(self) -> None:
+        # The head must see only the requested rows, and the result must equal
+        # those rows of the full projection.
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.array([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]])
+
+        class Head:
+            def __init__(self) -> None:
+                self.seen_rows: int | None = None
+
+            def __call__(self, hidden_states):
+                self.seen_rows = hidden_states.shape[-2]
+                return hidden_states * 3.0
+
+        head = Head()
+        model = SimpleNamespace(
+            model=Backbone(), lm_head=head, final_logit_softcapping=None
+        )
+        adapter = DefaultModelAdapter()
+
+        full = adapter.target_forward(
+            model, mx.array([[1, 2, 3, 4]]), cache=[], collect_hidden_states=True
+        )
+        selected = adapter.target_forward(
+            model,
+            mx.array([[1, 2, 3, 4]]),
+            cache=[],
+            logits_indices=mx.array([1, 3], dtype=mx.int32),
+        )
+
+        assert head.seen_rows == 2
+        assert selected.logits.tolist() == [
+            [full.logits[0, 1].tolist(), full.logits[0, 3].tolist()]
+        ]
+
+    def test_selective_logits_keep_full_hidden_states_for_mtp(self) -> None:
+        # Gemma4 MTP seeds index target_hidden_row in the packed layout, so the
+        # hidden states must stay row-major over every input row.
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.array([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]])
+
+        model = SimpleNamespace(
+            model=Backbone(),
+            lm_head=lambda hidden_states: hidden_states,
+            final_logit_softcapping=None,
+        )
+
+        output = DefaultModelAdapter().target_forward(
+            model,
+            mx.array([[1, 2, 3]]),
+            cache=[],
+            collect_hidden_states=True,
+            logits_indices=mx.array([2], dtype=mx.int32),
+        )
+
+        assert output.hidden_states.shape == (3, 2)
+        assert output.logits.shape == (1, 1, 2)
+
+    def test_selective_logits_apply_softcapping_to_selected_rows(self) -> None:
+        # Post-projection scaling must not be skipped by the selective path.
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.array([[[-2.0, 0.0], [2.0, 4.0]]])
+
+        model = SimpleNamespace(
+            model=Backbone(),
+            lm_head=lambda hidden_states: hidden_states,
+            final_logit_softcapping=2.0,
+        )
+
+        output = DefaultModelAdapter().target_forward(
+            model,
+            mx.array([[1, 2]]),
+            cache=[],
+            logits_indices=mx.array([1], dtype=mx.int32),
+        )
+
+        expected = mx.tanh(mx.array([[[2.0, 4.0]]]) / 2.0) * 2.0
+        mx.eval(output.logits, expected)
+        assert mx.allclose(output.logits, expected).item()
+
+
+class TestSupportsSelectiveLogits:
+    """The load-time probe that decides whether the split backbone/head path
+    reproduces a model's own output head.
+
+    A wrapper may scale inside its own ``__call__``, which the split path would
+    not reproduce, so the probe compares a one-row forward both ways and only
+    accepts an exact match."""
+
+    def test_accepts_a_head_reproduced_by_the_split_path(self) -> None:
+        class Model:
+            def __init__(self) -> None:
+                self.model = lambda input_ids, cache=None: mx.array([[[1.0, 2.0]]])
+                self.final_logit_softcapping = None
+
+            def __call__(self, input_ids, cache=None):
+                return self.compute_logits(self.model(input_ids, cache=cache))
+
+            def compute_logits(self, hidden_states):
+                return hidden_states * 3.0
+
+        assert DefaultModelAdapter().supports_selective_logits(Model()) is True
+
+    def test_rejects_a_head_with_scaling_hidden_in_the_forward(self) -> None:
+        # The wrapper multiplies after the head, the way Cohere's logit_scale or
+        # Granite's logits_scaling do.  The split path cannot see that, so the
+        # probe must decline rather than return wrong logits.
+        class Model:
+            def __init__(self) -> None:
+                self.model = lambda input_ids, cache=None: mx.array([[[1.0, 2.0]]])
+                self.final_logit_softcapping = None
+
+            def __call__(self, input_ids, cache=None):
+                return self.compute_logits(self.model(input_ids, cache=cache)) * 0.5
+
+            def compute_logits(self, hidden_states):
+                return hidden_states * 3.0
+
+        assert DefaultModelAdapter().supports_selective_logits(Model()) is False
+
+    def test_rejects_a_model_the_split_path_cannot_drive(self) -> None:
+        # No `.model` backbone: the split path raises, so the probe declines
+        # instead of propagating out of load_model.
+        class Model:
+            def __call__(self, input_ids, cache=None):
+                del input_ids, cache
+                return mx.array([[[1.0, 2.0]]])
+
+        assert DefaultModelAdapter().supports_selective_logits(Model()) is False
+
+
+class TestTargetForwardEmbeddings:
     def test_target_input_embeddings_use_target_embed_scale(self) -> None:
         class Embedding:
             def __call__(self, input_ids):
@@ -335,18 +551,23 @@ class TestNormalizeModelConfig:
 
         assert model_config.multimodal_config is None
 
-    def test_text_only_compat_mode_clears_multimodal_for_allowlisted_vlm(
-        self, monkeypatch
+    @pytest.mark.parametrize(
+        ("model_type", "architecture"),
+        [
+            ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+            ("qwen3_6", "Qwen3_6ForConditionalGeneration"),
+        ],
+    )
+    def test_clears_multimodal_config_for_mlx_quant_wrapper_in_auto_mode(
+        self, model_type: str, architecture: str
     ) -> None:
-        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
-        reset_config()
-
         model_config = SimpleNamespace(
             multimodal_config=SimpleNamespace(language_model_only=False),
             hf_config=SimpleNamespace(
-                model_type="qwen3_6",
-                architectures=["Qwen3_6ForConditionalGeneration"],
-                quantization_config={"quant_method": "fp8"},
+                model_type=model_type,
+                architectures=[architecture],
+                quantization={"group_size": 64, "bits": 4, "mode": "affine"},
             ),
         )
 
@@ -354,25 +575,11 @@ class TestNormalizeModelConfig:
 
         assert model_config.multimodal_config is None
 
-    def test_text_only_compat_mode_preserves_generic_vlm(self, monkeypatch) -> None:
-        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
-        reset_config()
-
-        sentinel = SimpleNamespace(language_model_only=False)
-        model_config = SimpleNamespace(
-            multimodal_config=sentinel,
-            hf_config=SimpleNamespace(model_type="phi3_v"),
-        )
-
-        DefaultModelAdapter().normalize_model_config(model_config)
-
-        assert model_config.multimodal_config is sentinel
-
     def test_preserves_multimodal_config_for_other_models(self) -> None:
         sentinel = SimpleNamespace(language_model_only=False)
         model_config = SimpleNamespace(
             multimodal_config=sentinel,
-            hf_config=SimpleNamespace(model_type="qwen3_vl"),
+            hf_config=SimpleNamespace(model_type="qwen3_vl", architectures=[]),
         )
 
         DefaultModelAdapter().normalize_model_config(model_config)
@@ -409,22 +616,6 @@ class TestNormalizeModelConfig:
 
         assert model_config.multimodal_config is None
 
-    def test_text_only_compat_mode_preserves_missing_hf_config(
-        self, monkeypatch
-    ) -> None:
-        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
-        reset_config()
-
-        sentinel = SimpleNamespace(language_model_only=False)
-        model_config = SimpleNamespace(
-            multimodal_config=sentinel,
-            hf_config=None,
-        )
-
-        DefaultModelAdapter().normalize_model_config(model_config)
-
-        assert model_config.multimodal_config is sentinel
-
 
 class TestTextModel:
     def test_returns_language_model_when_present(self) -> None:
@@ -437,6 +628,57 @@ class TestTextModel:
         model = object()
         adapter = DefaultModelAdapter()
         assert adapter.text_model(model) is model
+
+
+def _body_stub(input_ids, cache=None):
+    return mx.array([[7.0]])
+
+
+class TestIntermediateForward:
+    """Adapter-owned projection-free forward for intermediate chunks."""
+
+    def test_supports_text_model_body(self) -> None:
+        adapter = DefaultModelAdapter()
+        assert adapter.supports_intermediate_forward(SimpleNamespace(model=_body_stub))
+
+    def test_supports_wrapped_language_model_body(self) -> None:
+        adapter = DefaultModelAdapter()
+        model = SimpleNamespace(language_model=SimpleNamespace(model=_body_stub))
+        assert adapter.supports_intermediate_forward(model)
+
+    def test_unresolvable_structure_is_unsupported(self) -> None:
+        adapter = DefaultModelAdapter()
+        assert not adapter.supports_intermediate_forward(SimpleNamespace())
+
+    def test_runs_body_and_returns_typed_hidden_states(self) -> None:
+        # Arrange
+        captured: dict[str, object] = {}
+        hidden = mx.zeros((1, 2, 8))
+        sentinel_cache = object()
+
+        def body(input_ids, cache=None):
+            captured["input_ids"] = input_ids.tolist()
+            captured["cache"] = cache
+            return hidden
+
+        adapter = DefaultModelAdapter()
+        model = SimpleNamespace(model=body)
+
+        # Act
+        output = adapter.intermediate_forward(
+            model, mx.array([[5, 6]]), cache=sentinel_cache
+        )
+
+        # Assert
+        assert isinstance(output, IntermediateForwardOutput)
+        assert output.hidden_states is hidden
+        assert captured["input_ids"] == [[5, 6]]
+        assert captured["cache"] is sentinel_cache
+
+    def test_unsupported_model_raises(self) -> None:
+        adapter = DefaultModelAdapter()
+        with pytest.raises(ValueError, match="supports_intermediate_forward"):
+            adapter.intermediate_forward(SimpleNamespace(), mx.array([[5]]))
 
 
 class _Qwen35LanguageModelStub:

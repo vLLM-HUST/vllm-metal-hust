@@ -4,7 +4,7 @@
 The hybrid paged runtime owns two different state systems:
 
 - SDPA KV cache, indexed by scheduler block tables
-- GDN recurrent state, indexed by one stable slot per active request
+- GDN recurrent state, indexed by one stable slot per resident request
 
 `HybridGDNStateManager` owns the second one. It keeps request-to-slot
 assignment stable across request reordering, grows the recurrent cache when new
@@ -49,9 +49,21 @@ class HybridGDNStateManager:
         return self._needs_materialize
 
     def populate_step_context(
-        self, *, req_ids: list[str], ctx: PagedAttentionContext
+        self,
+        *,
+        req_ids: list[str],
+        ctx: PagedAttentionContext,
+        state_block_ids: list[list[list[int]]] | None = None,
+        step_positions: list[tuple[int, int]] | None = None,
     ) -> None:
-        """Attach stable GDN slot ids to one forward-pass context."""
+        """Attach stable GDN slot ids to one forward-pass context.
+
+        Scheduler block ids and step positions drive align-mode state motion
+        (see ``AlignGDNStateManager``); this manager keeps one private slot
+        per request for its whole lifetime, so it ignores them.  Accepting
+        them keeps both managers on one signature.
+        """
+        del state_block_ids, step_positions
         ctx.gdn_slot_mapping = self.assign_step_slots(req_ids)
 
     def assign_step_slots(self, req_ids: list[str]) -> list[int]:
@@ -108,7 +120,7 @@ class HybridGDNStateManager:
         outputs.extend(self._state_cache.updated_state_arrays())
 
     def release_requests(self, req_ids: set[str]) -> None:
-        """Release slots for finished requests and mark state for eval."""
+        """Release slots for requests whose recurrent state is no longer valid."""
         freed_slots: list[int] = []
         for req_id in req_ids:
             slot = self._req_to_slot.pop(req_id, None)

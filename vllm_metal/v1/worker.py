@@ -19,7 +19,11 @@ from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
+    DraftTokenIds,
+    ModelRunnerOutput,
+)
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_metal.config import get_config
@@ -112,21 +116,19 @@ class MetalWorker(WorkerBase):
 
     def init_device(self) -> None:
         """Initialize the Metal device and distributed environment."""
-        # Set up MLX device
-        if self.metal_config.use_mlx:
-            device_type = (
-                mx.DeviceType.gpu
-                if self.metal_config.mlx_device == "gpu"
-                else mx.DeviceType.cpu
-            )
-            mx.set_default_device(mx.Device(device_type))
-            logger.info(f"MLX device set to: {mx.default_device()}")
-            set_wired_limit()
+        device_type = (
+            mx.DeviceType.gpu
+            if self.metal_config.mlx_device == "gpu"
+            else mx.DeviceType.cpu
+        )
+        mx.set_default_device(mx.Device(device_type))
+        logger.info(f"MLX device set to: {mx.default_device()}")
+        set_wired_limit()
 
-        # Use MetalPlatform.get_torch_device() to properly support MPS when available.
-        # This ensures consistency with the platform's device selection logic and
-        # allows using MPS for PyTorch operations (like vLLM's sampler) when supported,
-        # while falling back to CPU if MPS is not available.
+        # ``self.device`` is the upstream WorkerBase contract field for the
+        # torch device. Torch sampling deliberately does not follow it: the
+        # sampler is pinned to ``SamplingBatch.SAMPLER_DEVICE`` (CPU) because
+        # MPS ``exponential_()`` can corrupt sampled tokens (#622).
         self.device = MetalPlatform.get_torch_device(0)
         logger.info(f"PyTorch device set to: {self.device}")
 
@@ -185,10 +187,7 @@ class MetalWorker(WorkerBase):
         else:
             from vllm_metal.v1.model_runner import MetalModelRunner
 
-            self.model_runner = MetalModelRunner(
-                vllm_config=self.vllm_config,
-                device=self.device,
-            )
+            self.model_runner = MetalModelRunner(vllm_config=self.vllm_config)
             # Hand the pipeline group to the runner so its forward path can pipe
             # activations stage-to-stage. None on the default single-stage path.
             self.model_runner.pp = self.pp
@@ -196,11 +195,6 @@ class MetalWorker(WorkerBase):
     def load_model(self) -> None:
         """Load the model onto the Metal device."""
         self.model_runner.load_model()
-        # Phase 0 = load-then-slice: every stage loaded full weights above; now
-        # drop the layers (and, off the last stage, the final norm) this stage
-        # does not own. No-op when self.pp is None (single-stage path).
-        if self.pp is not None:
-            self.model_runner.apply_pipeline_split(self.pp)
 
     def _one_sequence_kv_bytes(self) -> int:
         """Bytes for one max-length sequence of cache state.
@@ -285,7 +279,7 @@ class MetalWorker(WorkerBase):
 
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
-    ) -> ModelRunnerOutput | None:
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         """Return sampled tokens for the previously executed batch."""
         return self.model_runner.sample_tokens(grammar_output)
 

@@ -9,6 +9,7 @@ one copy instead of three.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
@@ -45,22 +46,50 @@ class PagedAttentionRuntimeBase:
     def num_blocks(self) -> int:
         return self._require_initialized("num_blocks").num_blocks
 
+    def kv_scheduler_group_indices(self) -> tuple[int, ...]:
+        """Return scheduler KV groups consumed by this runtime."""
+        self._require_initialized("kv_scheduler_group_indices")
+        return (0,)
+
+    def kv_group_block_sizes(self) -> tuple[int, ...]:
+        """Return scheduler page sizes owned by this runtime."""
+        return (self._require_initialized("kv_group_block_sizes").block_size,)
+
+    # Scheduler groups holding per-request state (mamba) blocks — empty for
+    # runtimes whose layers are all block-table addressed.  The hybrid runtime
+    # overwrites this when it adopts mamba cache groups so the runner forwards
+    # those groups' block ids alongside the KV block tables.
+    _state_group_indices: tuple[int, ...] = ()
+
+    def state_scheduler_group_indices(self) -> tuple[int, ...]:
+        """Return scheduler groups holding per-request state (mamba) blocks."""
+        return self._state_group_indices
+
+    def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
+        """Apply scheduler copy-on-write operations to the primary cache."""
+        self._require_initialized("copy_blocks").copy_blocks(block_copies)
+
     def needs_step_context(self) -> bool:
         """Return whether this runtime attaches request-ordered step metadata."""
         return False
 
     def populate_step_context(
-        self, *, req_ids: list[str], ctx: PagedAttentionContext
+        self,
+        *,
+        req_ids: list[str],
+        ctx: PagedAttentionContext,
+        state_block_ids: list[list[list[int]]] | None = None,
+        step_positions: list[tuple[int, int]] | None = None,
     ) -> None:
         """Attach runtime-specific metadata to one forward-pass context."""
-        del req_ids, ctx
+        del req_ids, ctx, state_block_ids, step_positions
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
         """Append runtime-owned side-effect arrays that must be eval'd."""
         del outputs
 
     def release_requests(self, req_ids: set[str]) -> None:
-        """Release any runtime-owned state for finished requests."""
+        """Release runtime-owned state for requests whose state is invalid."""
         del req_ids
 
     def materialize_pending_state(self) -> None:

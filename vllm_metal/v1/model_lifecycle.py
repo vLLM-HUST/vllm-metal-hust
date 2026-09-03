@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.compat import apply_compat_patches
+from vllm_metal.compiled_mlp import CompiledMLPBlocks
 from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_loader import AWQQuantLoader
@@ -25,6 +26,14 @@ from vllm_metal.v1.mlx_lm_paths import (
 )
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_adapter import ModelAdapter
+from vllm_metal.v1.pooling.backends.decoder.factory import (
+    build_decoder_pooling_backend,
+)
+from vllm_metal.v1.pooling.backends.encoder.factory import (
+    load_encoder_pooling_backend,
+    supports_encoder_pooling_backend,
+)
+from vllm_metal.v1.pooling.contract import LoadedEncoderBackend
 
 # Engine-core subprocesses don't always re-invoke `vllm_metal._register()`,
 # so the compat patches applied there may be missing here. Reapply on import
@@ -65,6 +74,7 @@ class GenerationLoadRequest:
     target_dtype: Any
     tokenizer_config: Mapping[str, Any]
     gguf_source: GGUFLoadSource | None
+    lazy_weights: bool
 
     @classmethod
     def from_runner(
@@ -78,7 +88,24 @@ class GenerationLoadRequest:
         is_vlm = bool(getattr(model_config, "is_multimodal_model", False))
         if model_adapter.should_force_text_backbone(hf_config):
             is_vlm = False
-        gguf_source = None if is_vlm else GGUFLoadSource.from_model_config(model_config)
+        if is_vlm and model_config.quantization == "gguf":
+            raise NotImplementedError(
+                "Multimodal GGUF checkpoints are not supported by vllm-metal."
+            )
+        gguf_source = (
+            None
+            if is_vlm
+            else GGUFLoadSource.from_model_config(
+                model_config,
+                runner.vllm_config.load_config,
+            )
+        )
+
+        # A pipeline-parallel stage prunes its non-owned layers right after load, so
+        # the generic MLX loaders stay lazy until the stage-owned weights are known.
+        # The custom GGUF and AWQ loaders cannot honor this contract.
+        pp = runner.pp
+        lazy_weights = pp is not None and pp.size > 1
 
         return cls(
             model_name=(
@@ -92,6 +119,7 @@ class GenerationLoadRequest:
             target_dtype=torch_to_mlx(torch.empty(0, dtype=model_config.dtype)).dtype,
             tokenizer_config={"trust_remote_code": model_config.trust_remote_code},
             gguf_source=gguf_source,
+            lazy_weights=lazy_weights,
         )
 
 
@@ -114,7 +142,12 @@ class ModelLifecycle:
         self._model_adapter = model_adapter
 
     def load(self) -> None:
-        """Load the generation model and install runner runtime state."""
+        """Load the configured model and install runner runtime state."""
+
+        loaded_encoder_model = self._load_encoder_pooling()
+        if loaded_encoder_model is not None:
+            self._install_encoder_pooling_model(loaded_encoder_model)
+            return
 
         request = GenerationLoadRequest.from_runner(self._runner, self._model_adapter)
         loaded_model = self._load_generation(request)
@@ -128,6 +161,28 @@ class ModelLifecycle:
             request,
         )
 
+    def install_pooling_backend(self) -> None:
+        """Install the pooling backend after load-time model mutation."""
+        runner = self._runner
+        runner._pooling_backend = build_decoder_pooling_backend(
+            runner._forward_model,
+            runner.model_config,
+            runner.tokenizer,
+        )
+
+    def install_decode_dispatch(self) -> None:
+        """Install the compiled-MLP decode dispatch."""
+        if self._runner._is_pooling:
+            # Pooling runners never decode; their backends may also wrap the
+            # model in non-nn.Module shims the installer must not walk.
+            return
+        if getattr(self._runner.vllm_config, "lora_config", None) is not None:
+            # LoRA setup rebinds projection modules inside the blocks after
+            # install and swaps adapter state per batch; a compiled trace
+            # would freeze that state at first call. LoRA serves stay eager.
+            return
+        CompiledMLPBlocks.install(self._runner._forward_model)
+
     def resolve_model_dims(self) -> None:
         """Resolve loaded model args into runner attention/cache dimensions."""
         args = self._runner.model_args
@@ -136,6 +191,24 @@ class ModelLifecycle:
         self._install_per_layer_attention_metadata(args, default_head_dim)
         self._reject_pipeline_parallel_with_per_layer_metadata()
         self._install_hybrid_attention_dims(args)
+
+    def _load_encoder_pooling(self) -> LoadedEncoderBackend | None:
+        runner = self._runner
+        if not runner._is_pooling or not supports_encoder_pooling_backend(
+            runner.model_config
+        ):
+            return None
+
+        if runner.pp is not None and runner.pp.size > 1:
+            raise NotImplementedError(
+                "Metal encoder pooling does not support pipeline parallelism yet."
+            )
+        if runner.vllm_config.lora_config is not None:
+            raise NotImplementedError(
+                "Metal encoder pooling does not support LoRA yet."
+            )
+
+        return load_encoder_pooling_backend(runner.model_config)
 
     def _load_generation(
         self,
@@ -148,12 +221,28 @@ class ModelLifecycle:
             target_dtype=request.target_dtype,
             tokenizer_config=request.tokenizer_config,
             gguf_source=request.gguf_source,
+            lazy_weights=request.lazy_weights,
         )
         return LoadedGenerationModel(
             model=model,
             tokenizer=tokenizer,
             model_args=self._extract_model_args(model, request.is_vlm),
         )
+
+    def _install_encoder_pooling_model(
+        self,
+        loaded_model: LoadedEncoderBackend,
+    ) -> None:
+        runner = self._runner
+        runner.model = loaded_model.model
+        runner.tokenizer = loaded_model.tokenizer
+        runner._is_vlm = False
+        runner._multimodal_adapter = None
+        runner.encoder_cache = None
+        runner.model_args = loaded_model.model_args
+        runner._vocab_size = int(loaded_model.model_args["vocab_size"])
+        runner._pooling_backend = loaded_model.pooling_backend
+        logger.debug("Model args: %s", loaded_model.model_args)
 
     def _load_generation_model(
         self,
@@ -164,6 +253,7 @@ class ModelLifecycle:
         target_dtype: Any | None = None,
         tokenizer_config: Mapping[str, Any] | None = None,
         gguf_source: GGUFLoadSource | None = None,
+        lazy_weights: bool = False,
     ) -> tuple[Any, Any]:
         """Load a text or VLM generation model."""
 
@@ -180,7 +270,10 @@ class ModelLifecycle:
 
         start_time = time.time()
         if gguf_source is None and not is_vlm:
-            gguf_source = GGUFLoadSource.from_model_config(model_config)
+            gguf_source = GGUFLoadSource.from_model_config(
+                model_config,
+                self._runner.vllm_config.load_config,
+            )
         is_gguf = gguf_source is not None
         awq_loader = None if is_gguf or is_vlm else AWQQuantLoader.for_model(model_name)
 
@@ -194,7 +287,7 @@ class ModelLifecycle:
 
         elif is_vlm:
             load_label = "MLX-VLM model"
-            model, tokenizer = mlx_vlm_load(model_name)
+            model, tokenizer = mlx_vlm_load(model_name, lazy=lazy_weights)
 
         elif awq_loader is not None:
             load_label = "AWQ model"
@@ -210,6 +303,7 @@ class ModelLifecycle:
             model, tokenizer = self._load_mlx_lm_text_model(
                 model_name,
                 tokenizer_config,
+                lazy=lazy_weights,
             )
 
         loaded_from = (
@@ -259,11 +353,14 @@ class ModelLifecycle:
         self,
         model_name: str,
         tokenizer_config: Mapping[str, Any],
+        *,
+        lazy: bool = False,
     ) -> tuple[Any, Any]:
         with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
             model, tokenizer = mlx_lm_load(
                 str(compatible_model_name),
                 tokenizer_config=tokenizer_config,
+                lazy=lazy,
             )
         return model, tokenizer
 
@@ -295,8 +392,7 @@ class ModelLifecycle:
         # Dimension resolution reads model_args immediately after this phase.
         runner.model_args = loaded_model.model_args
         runner._vocab_size = int(loaded_model.model_args["vocab_size"])
-        if runner.metal_config.debug:
-            logger.info("Model args: %s", loaded_model.model_args)
+        logger.debug("Model args: %s", loaded_model.model_args)
 
     def _install_runner_attention_dims(self, args: dict[str, Any]) -> int | None:
         """Install runner-wide attention dims and return the default head_dim."""
@@ -430,7 +526,6 @@ class ModelLifecycle:
         runner._gemma4_mtp_assistant = None
         gemma4_mtp_assistant = Gemma4MTPAssistantLoader().load_if_needed(
             speculative_config=runner.vllm_config.speculative_config,
-            target_hf_config=request.hf_config,
             target_model_args=model_args,
         )
         runner.kv_cache_dtype = request.target_dtype
@@ -442,7 +537,7 @@ class ModelLifecycle:
         # its keys onto the top level so every key sits in one flat dict.
         model_args = getattr(model, "args", None)
         if model_args is not None:
-            model_values = self._config_to_mapping(model_args, label="model.args")
+            model_values = self._config_to_mapping(model_args)
         else:
             config = getattr(model, "config", None)
             if config is None:
@@ -451,12 +546,9 @@ class ModelLifecycle:
                     ".config attribute."
                 )
 
-            config_values = self._config_to_mapping(config, label="config")
+            config_values = self._config_to_mapping(config)
             if is_vlm and "text_config" in config_values:
-                model_values = self._config_to_mapping(
-                    config_values["text_config"],
-                    label="text_config",
-                )
+                model_values = self._config_to_mapping(config_values["text_config"])
             else:
                 model_values = config_values
 
@@ -465,42 +557,12 @@ class ModelLifecycle:
             return model_values
 
         merged_values = dict(model_values)
-        text_values = self._config_to_mapping(text_config, label="text_config")
+        text_values = self._config_to_mapping(text_config)
         for key, value in text_values.items():
             merged_values.setdefault(key, value)
         return merged_values
 
-    def _config_to_mapping(self, config: Any, *, label: str) -> dict[str, Any]:
-        missing = object()
-
+    def _config_to_mapping(self, config: Any) -> dict[str, Any]:
         if isinstance(config, Mapping):
             return dict(config)
-
-        to_dict = getattr(config, "to_dict", None)
-        if callable(to_dict):
-            values = to_dict()
-            if isinstance(values, Mapping):
-                return dict(values)
-            raise TypeError(f"{label}.to_dict() must return a mapping.")
-
-        instance_dict = getattr(config, "__dict__", None)
-        if instance_dict is not None:
-            return dict(instance_dict)
-
-        slot_values: dict[str, Any] = {}
-        for cls in type(config).__mro__:
-            slots = cls.__dict__.get("__slots__", ())
-            if isinstance(slots, str):
-                slots = (slots,)
-            for name in slots:
-                if not isinstance(name, str) or name.startswith("__"):
-                    continue
-                value = getattr(config, name, missing)
-                if value is not missing:
-                    slot_values[name] = value
-        if slot_values:
-            return slot_values
-
-        raise TypeError(
-            f"{label} must expose a mapping, to_dict(), __dict__, or __slots__."
-        )
+        return dict(vars(config))

@@ -12,6 +12,8 @@ from types import ModuleType
 
 import numpy as np
 import pytest
+from transformers import AutoConfig
+from transformers.models.auto import configuration_auto
 
 import vllm_metal.compat as compat
 
@@ -127,7 +129,7 @@ class TestByteLevelTokenizerCompatPatch:
         from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
         _write_mismatched_bytelevel_tokenizer_repo(tmp_path)
-        compat._patch_vllm_bytelevel_tokenizer_loading()
+        compat.ensure_vllm_bytelevel_tokenizer_patch()
 
         tokenizer = tokenizer_registry.get_tokenizer(tmp_path, tokenizer_mode="hf")
         decoded = tokenizer.decode([0, 1])
@@ -206,11 +208,19 @@ class TestByteLevelTokenizerCompatPatch:
 
 
 class TestGemma4MTPConfigCompatPatch:
-    def test_transformers_autoconfig_loads_raw_assistant_config(
-        self,
-        tmp_path,
+    def test_missing_registration_uses_compat_assistant_config(
+        self, monkeypatch, tmp_path
     ) -> None:
-        from transformers import AutoConfig
+        config_mapping = configuration_auto.CONFIG_MAPPING
+        monkeypatch.setattr(config_mapping, "_mapping", dict(config_mapping._mapping))
+        monkeypatch.setattr(
+            config_mapping, "_extra_content", dict(config_mapping._extra_content)
+        )
+        config_mapping._mapping.pop("gemma4_assistant", None)
+        config_mapping._extra_content.pop("gemma4_assistant", None)
+
+        with pytest.raises(ValueError, match="gemma4_assistant"):
+            AutoConfig.for_model("gemma4_assistant")
 
         _write_gemma4_assistant_config(tmp_path)
         compat._patch_vllm_gemma4_mtp_config_loading()
@@ -224,29 +234,7 @@ class TestGemma4MTPConfigCompatPatch:
         assert config.text_config.num_hidden_layers == 4
         assert config.get_text_config() is config.text_config
 
-    def test_vllm_get_config_applies_existing_gemma4_mtp_override(
-        self,
-        tmp_path,
-    ) -> None:
-        from vllm.config.speculative import SpeculativeConfig
-        from vllm.transformers_utils.config import get_config, get_hf_text_config
-
-        _write_gemma4_assistant_config(tmp_path)
-        compat._patch_vllm_gemma4_mtp_config_loading()
-
-        config = get_config(
-            tmp_path,
-            trust_remote_code=False,
-            hf_overrides_fn=SpeculativeConfig.hf_config_override,
-        )
-
-        assert config.model_type == "gemma4_mtp"
-        assert config.architectures == ["Gemma4MTPModel"]
-        assert config.n_predict == 1
-        assert config.text_config.num_kv_shared_layers == 0
-        assert get_hf_text_config(config).model_type == "gemma4_text"
-
-    def test_missing_gemma4_config_module_does_not_stop_other_patches(
+    def test_registration_time_failures_do_not_stop_other_patches(
         self,
         monkeypatch,
     ) -> None:
@@ -267,25 +255,25 @@ class TestGemma4MTPConfigCompatPatch:
             "_gemma4_assistant_config_class",
             _raise_missing_gemma4_config,
         )
+
+        def _raise_bytelevel_import_error() -> None:
+            calls.append("bytelevel")
+            raise ImportError("partial vLLM import")
+
         monkeypatch.setattr(
             compat,
-            "_patch_vllm_bytelevel_tokenizer_loading",
-            lambda: calls.append("bytelevel"),
+            "ensure_vllm_bytelevel_tokenizer_patch",
+            _raise_bytelevel_import_error,
         )
         monkeypatch.setattr(
             compat,
             "_patch_mlx_lm_qwen35_fp8_sanitize",
             lambda: calls.append("qwen35_fp8"),
         )
-        monkeypatch.setattr(
-            compat,
-            "_patch_mlx_lm_gemma4_kv_shared_sanitize",
-            lambda: calls.append("gemma4_kv"),
-        )
 
         compat.apply_compat_patches()
 
-        assert calls == ["bytelevel", "qwen35_fp8", "gemma4_kv"]
+        assert calls == ["bytelevel", "qwen35_fp8"]
 
 
 def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):
@@ -606,149 +594,6 @@ class TestQwen35Fp8CompatPatch:
         ].shape == (128, 128)
 
 
-def _install_fake_gemma4_text_module(
-    monkeypatch,
-    *,
-    num_hidden_layers: int,
-    num_kv_shared_layers: int,
-):
-    mlx_lm_pkg = ModuleType("mlx_lm")
-    mlx_lm_models = ModuleType("mlx_lm.models")
-    mlx_lm_pkg.models = mlx_lm_models
-    monkeypatch.setitem(sys.modules, "mlx_lm", mlx_lm_pkg)
-    monkeypatch.setitem(sys.modules, "mlx_lm.models", mlx_lm_models)
-
-    module = ModuleType("mlx_lm.models.gemma4_text")
-
-    class FakeArgs:
-        def __init__(self) -> None:
-            self.num_hidden_layers = num_hidden_layers
-            self.num_kv_shared_layers = num_kv_shared_layers
-
-    class FakeModel:
-        def __init__(self) -> None:
-            self.args = FakeArgs()
-
-        def sanitize(self, weights):
-            return dict(weights)
-
-    module.Model = FakeModel
-    monkeypatch.setitem(sys.modules, "mlx_lm.models.gemma4_text", module)
-    mlx_lm_models.gemma4_text = module
-
-    def _fake_find_spec(name: str):
-        if name == "mlx_lm.models.gemma4_text":
-            return object()
-        return None
-
-    monkeypatch.setattr(importlib.util, "find_spec", _fake_find_spec)
-    return module
-
-
-class TestGemma4KvSharedCompatPatch:
-    def test_drop_helper_removes_54_phantom_keys_for_e4b_layout(self) -> None:
-        # E4B: 42 layers total, last 18 are KV-shared.
-        weights = {}
-        for i in range(42):
-            for suffix in (
-                "k_proj",
-                "v_proj",
-                "k_norm",
-                "q_proj",
-                "q_norm",
-                "o_proj",
-            ):
-                weights[
-                    f"language_model.model.layers.{i}.self_attn.{suffix}.weight"
-                ] = f"T{i}_{suffix}"
-
-        out = compat._drop_gemma4_kv_shared_phantom_weights(
-            weights, num_hidden_layers=42, num_kv_shared_layers=18
-        )
-
-        assert len(weights) - len(out) == 54
-        for i in range(24):
-            for suffix in (
-                "k_proj",
-                "v_proj",
-                "k_norm",
-                "q_proj",
-                "q_norm",
-                "o_proj",
-            ):
-                assert (
-                    f"language_model.model.layers.{i}.self_attn.{suffix}.weight" in out
-                )
-        for i in range(24, 42):
-            for suffix in ("k_proj", "v_proj", "k_norm"):
-                assert (
-                    f"language_model.model.layers.{i}.self_attn.{suffix}.weight"
-                    not in out
-                )
-            for suffix in ("q_proj", "q_norm", "o_proj"):
-                assert (
-                    f"language_model.model.layers.{i}.self_attn.{suffix}.weight" in out
-                )
-
-    def test_drop_helper_is_noop_without_sharing(self) -> None:
-        weights = {
-            "language_model.model.layers.0.self_attn.k_proj.weight": "T",
-            "language_model.model.layers.41.self_attn.k_proj.weight": "T",
-        }
-        out = compat._drop_gemma4_kv_shared_phantom_weights(
-            weights, num_hidden_layers=42, num_kv_shared_layers=0
-        )
-        assert out == weights
-
-    def test_drop_helper_ignores_unrelated_or_malformed_keys(self) -> None:
-        weights = {
-            "language_model.model.layers.30.self_attn.q_proj.weight": "keep",
-            "language_model.model.weird.self_attn.k_proj.weight": "keep",
-            "language_model.model.layers.5.self_attn.k_proj.weight": "keep",
-            "language_model.model.layers.30.self_attn.k_proj.weight": "drop",
-        }
-        out = compat._drop_gemma4_kv_shared_phantom_weights(
-            weights, num_hidden_layers=42, num_kv_shared_layers=18
-        )
-        assert "language_model.model.layers.30.self_attn.k_proj.weight" not in out
-        assert "language_model.model.layers.30.self_attn.q_proj.weight" in out
-        assert "language_model.model.weird.self_attn.k_proj.weight" in out
-        assert "language_model.model.layers.5.self_attn.k_proj.weight" in out
-
-    def test_patch_wraps_gemma4_text_sanitize_and_drops_phantom_keys(
-        self, monkeypatch
-    ) -> None:
-        module = _install_fake_gemma4_text_module(
-            monkeypatch, num_hidden_layers=42, num_kv_shared_layers=18
-        )
-
-        compat._patch_mlx_lm_gemma4_kv_shared_sanitize()
-
-        weights = {
-            "language_model.model.layers.0.self_attn.k_proj.weight": "T",
-            "language_model.model.layers.30.self_attn.k_proj.weight": "phantom",
-            "language_model.model.layers.30.self_attn.q_proj.weight": "real",
-        }
-        sanitized = module.Model().sanitize(weights)
-
-        assert "language_model.model.layers.30.self_attn.k_proj.weight" not in sanitized
-        assert "language_model.model.layers.0.self_attn.k_proj.weight" in sanitized
-        assert "language_model.model.layers.30.self_attn.q_proj.weight" in sanitized
-
-    def test_patch_is_idempotent(self, monkeypatch) -> None:
-        module = _install_fake_gemma4_text_module(
-            monkeypatch, num_hidden_layers=42, num_kv_shared_layers=18
-        )
-
-        compat._patch_mlx_lm_gemma4_kv_shared_sanitize()
-        once = module.Model.sanitize
-        compat._patch_mlx_lm_gemma4_kv_shared_sanitize()
-        twice = module.Model.sanitize
-
-        assert once is twice
-        assert getattr(twice, "_vllm_metal_gemma4_kv_shared_patch", False) is True
-
-
 class TestExaone4ConfigCompatPatch:
     def test_no_sliding_window_config_loads_all_full_attention(self) -> None:
         from transformers.models.exaone4.configuration_exaone4 import Exaone4Config
@@ -810,8 +655,9 @@ class TestWrapModelSanitize:
 class TestMetalRayLocalGpuIds:
     """Pure-logic coverage for the Ray V2 worker resource resolver.
 
-    Exercises the decision the ``get_node_and_gpu_ids`` override delegates to —
-    no Ray, no cluster — so it runs in CI on the validated single-node path.
+    Exercises the decision the ``get_node_and_physical_gpu_ids`` override
+    delegates to — no Ray, no cluster — so it runs in CI on the validated
+    single-node path.
     """
 
     def test_single_mlx_resource_maps_to_local_index_zero(self) -> None:
@@ -837,3 +683,90 @@ class TestMetalRayLocalGpuIds:
     def test_none_assignment_fails_loud(self) -> None:
         with pytest.raises(RuntimeError, match="was not assigned"):
             compat._metal_ray_local_gpu_ids("node-1", None, "mlx")
+
+
+class _StubWorkerWithMethod:
+    """Stands in for RayWorkerProc: exposes the upstream method name so the
+    override has something to replace."""
+
+    def get_node_and_physical_gpu_ids(self) -> tuple[str, list[int]]:
+        return ("stock", [])
+
+
+class _StubWorkerMissingMethod:
+    """A worker actor without the tracked method — the shape a future upstream
+    rename would produce."""
+
+
+class TestInstallMetalOverride:
+    """Coverage for installing the Metal Ray worker override on a worker class.
+
+    Pins that the override lands on the method vLLM actually calls
+    (``get_node_and_physical_gpu_ids``, renamed from ``get_node_and_gpu_ids`` at
+    vLLM 0.24.0); the old code bound the pre-0.24 name and silently left the
+    stock method — which KeyErrors on the "mlx" custom resource — in place.
+    """
+
+    def test_override_replaces_the_upstream_method_and_resolves_mlx(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ray = pytest.importorskip("ray")
+
+        class _FakeRuntimeContext:
+            def get_node_id(self) -> str:
+                return "node-x"
+
+            def get_assigned_resources(self) -> dict[str, float]:
+                return {"mlx": 1.0}
+
+        monkeypatch.setattr(ray, "get_runtime_context", lambda: _FakeRuntimeContext())
+
+        compat._install_metal_override(_StubWorkerWithMethod)
+
+        assert _StubWorkerWithMethod._metal_patched is True
+        # The override lands on the method upstream calls, NOT the pre-0.24 name.
+        assert not hasattr(_StubWorkerWithMethod, "get_node_and_gpu_ids")
+        resolved = _StubWorkerWithMethod().get_node_and_physical_gpu_ids()
+        assert resolved == ("node-x", [0])
+
+    def test_missing_method_fails_loud(self) -> None:
+        with pytest.raises(RuntimeError) as excinfo:
+            compat._install_metal_override(_StubWorkerMissingMethod)
+        assert str(excinfo.value) == (
+            "Ray worker actor _StubWorkerMissingMethod has no "
+            "'get_node_and_physical_gpu_ids' method; vllm-metal's Metal Ray "
+            "override tracks that upstream name and vLLM appears to have renamed "
+            "it. Update vllm_metal.compat for the installed vLLM version."
+        )
+
+    def test_second_install_is_a_noop(self) -> None:
+        class _Stub:
+            def get_node_and_physical_gpu_ids(self) -> tuple[str, list[int]]:
+                return ("stock", [])
+
+        compat._install_metal_override(_Stub)
+        first = _Stub.get_node_and_physical_gpu_ids
+        compat._install_metal_override(_Stub)
+        assert _Stub.get_node_and_physical_gpu_ids is first
+
+    def test_patch_ray_distributed_targets_real_worker(self) -> None:
+        pytest.importorskip("ray")
+        from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
+
+        original = RayWorkerProc.__dict__.get("get_node_and_physical_gpu_ids")
+        had_sentinel = "_metal_patched" in RayWorkerProc.__dict__
+        try:
+            compat._patch_ray_distributed()
+            assert RayWorkerProc._metal_patched is True
+            assert (
+                RayWorkerProc.__dict__["get_node_and_physical_gpu_ids"] is not original
+            )
+        finally:
+            if original is not None:
+                RayWorkerProc.get_node_and_physical_gpu_ids = original
+            elif "get_node_and_physical_gpu_ids" in RayWorkerProc.__dict__:
+                # Upstream defined it on a base class; drop our install so the
+                # inherited method is visible again.
+                delattr(RayWorkerProc, "get_node_and_physical_gpu_ids")
+            if not had_sentinel and "_metal_patched" in RayWorkerProc.__dict__:
+                delattr(RayWorkerProc, "_metal_patched")

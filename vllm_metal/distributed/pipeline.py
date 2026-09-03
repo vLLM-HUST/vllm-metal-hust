@@ -92,7 +92,9 @@ class PipelineGroup:
         these IPs (e.g. an ``all_gather`` of each worker's address over the
         control-plane group). Each worker writes its own copy of the (identical)
         hostfile and points ``MLX_HOSTFILE`` at it; the backend selects this
-        worker's slot via ``MLX_RANK``.
+        worker's slot via ``MLX_RANK``. MLX consumes both variables during
+        synchronous ring initialization, after which the temporary hostfile is
+        removed and the process environment is restored.
 
         Fails loud if the formed group's size does not match ``len(peer_ips)``
         (e.g. ``MLX_RANK``/``MLX_HOSTFILE`` never reached the backend, or a node
@@ -100,36 +102,46 @@ class PipelineGroup:
         """
         world_size = len(peer_ips)
         hosts = _ring_hosts(peer_ips)
+        previous_env = {
+            name: os.environ.get(name) for name in ("MLX_RANK", "MLX_HOSTFILE")
+        }
         fd, path = tempfile.mkstemp(prefix=f"mlx_ring_rank{rank}_", suffix=".json")
-        with os.fdopen(fd, "w") as f:
-            json.dump(hosts, f)
-        os.environ["MLX_RANK"] = str(rank)
-        os.environ["MLX_HOSTFILE"] = path
-        logger.info(
-            "MLX ring bootstrap: rank=%d/%d hosts=%s hostfile=%s",
-            rank,
-            world_size,
-            [h[0] for h in hosts],
-            path,
-        )
-
-        # Form the real ring group from the MLX_RANK / MLX_HOSTFILE env set
-        # above. backend="ring" pins the transport: the default "any" takes the
-        # first backend that initializes (e.g. a singleton MPI group when
-        # libmpi is present), which would fail the size check below with a
-        # misleading hint.
-        pp = cls(mx.distributed.init(backend="ring"))
-        # init() consumed the hostfile synchronously; drop the temp file now
-        # (before the size check, so the raise path is cleaned up too).
-        Path(path).unlink(missing_ok=True)
-        if pp.size != world_size:
-            raise RuntimeError(
-                "MLX ring did not form the expected pipeline group: "
-                f"got size {pp.size}, expected {world_size}. Check that "
-                "MLX_RANK/MLX_HOSTFILE reached the ring backend and that every "
-                "node IP in the hostfile is reachable."
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(hosts, f)
+            os.environ["MLX_RANK"] = str(rank)
+            os.environ["MLX_HOSTFILE"] = path
+            logger.info(
+                "MLX ring bootstrap: rank=%d/%d hosts=%s hostfile=%s",
+                rank,
+                world_size,
+                [h[0] for h in hosts],
+                path,
             )
-        return pp
+
+            # Form the real ring group from the MLX_RANK / MLX_HOSTFILE env set
+            # above. backend="ring" pins the transport: the default "any" takes
+            # the first backend that initializes (e.g. a singleton MPI group
+            # when libmpi is present), which would fail the size check below
+            # with a misleading hint.
+            pp = cls(mx.distributed.init(backend="ring"))
+            if pp.size != world_size:
+                raise RuntimeError(
+                    "MLX ring did not form the expected pipeline group: "
+                    f"got size {pp.size}, expected {world_size}. Check that "
+                    "MLX_RANK/MLX_HOSTFILE reached the ring backend and that every "
+                    "node IP in the hostfile is reachable."
+                )
+            return pp
+        finally:
+            try:
+                Path(path).unlink(missing_ok=True)
+            finally:
+                for name, previous_value in previous_env.items():
+                    if previous_value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = previous_value
 
 
 def is_non_last_stage(pp: PipelineGroup | None) -> bool:
@@ -266,13 +278,34 @@ class PipelinedModel:
         )
 
     def __call__(self, input_ids: mx.array, *, cache: Any = None) -> mx.array:
-        pp = self._pp
         h_in: mx.array | None = None
-        if not pp.is_first:
+        if not self._pp.is_first:
             h_in = pipeline_recv(
-                pp, input_ids.shape[1], self._wire_hidden, self._wire_dtype
+                self._pp, input_ids.shape[1], self._wire_hidden, self._wire_dtype
             )
-        if pp.is_last:
+        return self._stage_forward(input_ids, h_in, cache=cache)
+
+    def dummy_forward(self, input_ids: mx.array) -> mx.array:
+        """Run this stage's forward locally for profiling/warm-up: no ring I/O.
+
+        Non-first stages take a zeros hidden state at the wire descriptor in
+        place of ``pipeline_recv`` (mirroring upstream vLLM's ``_dummy_run`` +
+        ``make_empty_intermediate_tensors``), so profiling never materializes
+        the embedding a non-first stage does not use; the stage body — and its
+        wire-dtype fail-fast — is shared with ``__call__``.
+        """
+        h_in: mx.array | None = None
+        if not self._pp.is_first:
+            h_in = mx.zeros(
+                (input_ids.shape[0], input_ids.shape[1], self._wire_hidden),
+                dtype=self._wire_dtype,
+            )
+        return self._stage_forward(input_ids, h_in)
+
+    def _stage_forward(
+        self, input_ids: mx.array, h_in: mx.array | None, *, cache: Any = None
+    ) -> mx.array:
+        if self._pp.is_last:
             # full backbone + final norm + tied/explicit head -> model output
             return self._model(input_ids, cache=cache, input_embeddings=h_in)
         # backbone only (norm is nn.Identity on non-last) -> raw hidden state.

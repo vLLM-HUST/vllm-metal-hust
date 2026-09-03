@@ -4,8 +4,9 @@
 Pure functions: logits in, token IDs out.  No model runner state accessed.
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import ClassVar
 
 import mlx.core as mx
 import numpy as np
@@ -20,6 +21,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 
 GREEDY_TEMPERATURE_EPS = 1e-5
+_EMPTY_LOGITSPROCS = LogitsProcessors()
 
 
 @dataclass(frozen=True)
@@ -37,11 +39,14 @@ class SamplingBatch:
     ``SamplingMetadata`` construction out of ``model_runner.py`` while the
     runner is being slimmed down.
 
-    Today it owns only the sampling-side state for one step. As more per-step
-    batch state moves out of ``model_runner.py``, this should evolve into a
-    fuller ``MetalInputBatch``-style owner that can absorb request indexing,
-    token views, generators, logits processor ownership, and metadata refresh.
+    Today it owns only the sampling-side state for one step.
     """
+
+    # The torch sampler always runs on CPU. ``Tensor.exponential_()`` on MPS
+    # can return exact zeros, and the Gumbel-style ``probs.div(q).argmax()``
+    # in vLLM's sampler maps a zero draw to an inf/NaN row whose argmax picks
+    # an arbitrary vocab id (issue #622).
+    SAMPLER_DEVICE: ClassVar[torch.device] = torch.device("cpu")
 
     def __init__(
         self,
@@ -50,8 +55,6 @@ class SamplingBatch:
         output_token_id_lists: Sequence[list[int]],
         *,
         vocab_size: int,
-        device: torch.device,
-        logitsprocs: LogitsProcessors | None = None,
         generators: dict[int, torch.Generator] | None = None,
     ) -> None:
         batch_size = len(sampling_params_list)
@@ -72,8 +75,6 @@ class SamplingBatch:
         self.prompt_token_id_lists = list(prompt_token_id_lists)
         self.output_token_id_lists = list(output_token_id_lists)
         self.vocab_size = vocab_size
-        self.device = device
-        self.logitsprocs = logitsprocs or LogitsProcessors()
         self.generators = {} if generators is None else generators
         self.all_greedy = all(
             sampling_params.temperature < GREEDY_TEMPERATURE_EPS
@@ -111,7 +112,10 @@ class SamplingBatch:
 
     @property
     def needs_logprobs(self) -> bool:
-        return self.max_num_logprobs is not None
+        return any(
+            sampling_params.num_logprobs is not None
+            for sampling_params in self.sampling_params_list
+        )
 
     @staticmethod
     def merge_logprobs_rows(
@@ -166,8 +170,18 @@ class SamplingBatch:
 
     def can_use_native_greedy(self) -> bool:
         """Return whether MLX argmax matches the requested sampling behavior."""
-        if any(self.logitsprocs.non_argmax_invariant):
-            return False
+        return self.params_allow_native_greedy(self.sampling_params_list)
+
+    @staticmethod
+    def params_allow_native_greedy(
+        sampling_params_list: Sequence[SamplingParams],
+    ) -> bool:
+        """Whether MLX argmax matches *sampling_params_list* exactly.
+
+        Single source of truth for the native-greedy decision so callers that
+        gate before constructing a :class:`SamplingBatch` (e.g. the decode
+        pipeline) cannot drift from the sampling-time check.
+        """
         return all(
             sampling_params.temperature < GREEDY_TEMPERATURE_EPS
             and sampling_params.top_k <= 0
@@ -175,11 +189,141 @@ class SamplingBatch:
             and sampling_params.frequency_penalty == 0.0
             and sampling_params.presence_penalty == 0.0
             and sampling_params.repetition_penalty == 1.0
-            and sampling_params.logprobs is None
+            and sampling_params.num_logprobs is None
             and not sampling_params.allowed_token_ids
             and not sampling_params.bad_words_token_ids
-            for sampling_params in self.sampling_params_list
+            for sampling_params in sampling_params_list
         )
+
+    @staticmethod
+    def params_allow_native_random(
+        sampling_params_list: Sequence[SamplingParams],
+    ) -> bool:
+        """Whether MLX categorical sampling matches *sampling_params_list*.
+
+        Mirror of :meth:`params_allow_native_greedy` for the non-greedy case:
+        every request must use plain temperature/top-k/top-p sampling, with
+        one shared ``(top_k, top_p)`` across the batch so a single mask graph
+        covers every row. Seeded requests keep the torch path, whose
+        per-request ``torch.Generator`` contract MLX keys do not reproduce.
+        Options the platform rejects outright (``min_p``, ``logit_bias``)
+        are not re-checked here.
+        """
+        if not sampling_params_list:
+            return False
+        shared_top_k = len({sp.top_k for sp in sampling_params_list}) == 1
+        shared_top_p = len({sp.top_p for sp in sampling_params_list}) == 1
+        return (
+            shared_top_k
+            and shared_top_p
+            and all(
+                sp.temperature >= GREEDY_TEMPERATURE_EPS
+                and sp.seed is None
+                and sp.frequency_penalty == 0.0
+                and sp.presence_penalty == 0.0
+                and sp.repetition_penalty == 1.0
+                and sp.num_logprobs is None
+                and not sp.allowed_token_ids
+                and not sp.bad_words_token_ids
+                for sp in sampling_params_list
+            )
+        )
+
+    @classmethod
+    def native_decode_tokens(
+        cls,
+        logits_2d: mx.array,
+        sampling_params_list: Sequence[SamplingParams],
+        *,
+        vocab_size: int,
+        next_key: Callable[[], mx.array] | None,
+    ) -> mx.array:
+        """Build the lazy native token graph for a deferred decode batch.
+
+        Owns the sampling policy for the decode pipeline's deferred step:
+        greedy argmax when the batch allows it, otherwise the temperature/
+        top-k/top-p categorical graph over the vocab-sliced logits (unlike
+        argmax, categorical can select a padded lm_head column). The caller
+        owns evaluation and RNG state; ``next_key`` is consumed only on the
+        random path. Raises on batches neither native path admits — the
+        pipeline gate must not let those reach here.
+        """
+        if cls.params_allow_native_greedy(sampling_params_list):
+            return mlx_greedy_tokens(logits_2d)
+        if next_key is not None and cls.params_allow_native_random(
+            sampling_params_list
+        ):
+            return cls._native_random_tokens(
+                logits_2d[..., :vocab_size], sampling_params_list, next_key()
+            )
+        key_state = "live" if next_key is not None else "absent"
+        raise RuntimeError(
+            "Deferred sampling requires a native-greedy or native-random "
+            f"eligible batch (native sample key {key_state}, random-eligible="
+            f"{cls.params_allow_native_random(sampling_params_list)}) "
+            "— gate desync."
+        )
+
+    @staticmethod
+    def _top_k_top_p_masked_logits(
+        scaled_logits: mx.array,
+        top_k: int,
+        top_p: float,
+    ) -> mx.array:
+        """Mask temperature-scaled logits to the top-k/top-p candidate set.
+
+        Mask semantics match vLLM's ``apply_top_k_top_p``: ties at the top-k
+        threshold survive, while top-p masks sorted positions individually
+        (boundary ties do NOT all survive; which tied token survives follows
+        sort order). The leading sorted position carries zero leading mass,
+        so every valid ``top_p > 0`` keeps at least one candidate.
+        Non-candidates become ``-inf``.
+        """
+        vocab_size = int(scaled_logits.shape[-1])
+        if 0 < top_k < vocab_size:
+            kth_largest = mx.min(
+                mx.topk(scaled_logits, k=top_k, axis=-1), axis=-1, keepdims=True
+            )
+            scaled_logits = mx.where(
+                scaled_logits < kth_largest, -mx.inf, scaled_logits
+            )
+        if top_p < 1.0:
+            order_desc = mx.argsort(scaled_logits, axis=-1)[..., ::-1]
+            sorted_desc = mx.take_along_axis(scaled_logits, order_desc, axis=-1)
+            sorted_probs = mx.softmax(sorted_desc, axis=-1)
+            leading_mass = mx.cumsum(sorted_probs, axis=-1) - sorted_probs
+            keep = leading_mass < top_p
+            masked_sorted = mx.where(keep, sorted_desc, -mx.inf)
+            scaled_logits = mx.put_along_axis(
+                mx.full(scaled_logits.shape, -mx.inf, dtype=scaled_logits.dtype),
+                order_desc,
+                masked_sorted,
+                axis=-1,
+            )
+        return scaled_logits
+
+    @classmethod
+    def _native_random_tokens(
+        cls,
+        logits_2d: mx.array,
+        sampling_params_list: Sequence[SamplingParams],
+        key: mx.array,
+    ) -> mx.array:
+        """Lazy temperature/top-k/top-p token ids, one per row.
+
+        Only valid for batches that pass :meth:`params_allow_native_random`:
+        per-row temperature with one shared ``(top_k, top_p)``.
+        """
+        temperatures = mx.array(
+            [sp.temperature for sp in sampling_params_list], dtype=mx.float32
+        )
+        scaled = logits_2d.astype(mx.float32) / temperatures[:, None]
+        masked = cls._top_k_top_p_masked_logits(
+            scaled,
+            sampling_params_list[0].top_k,
+            sampling_params_list[0].top_p,
+        )
+        return mx.random.categorical(masked, axis=-1, key=key)
 
     def _make_temperature(self) -> torch.Tensor | None:
         if self.all_greedy:
@@ -191,7 +335,7 @@ class SamplingBatch:
                 for sampling_params in self.sampling_params_list
             ],
             dtype=torch.float32,
-            device=self.device,
+            device=self.SAMPLER_DEVICE,
         )
 
     def _make_top_p(self) -> torch.Tensor | None:
@@ -201,17 +345,27 @@ class SamplingBatch:
         return torch.tensor(
             [sampling_params.top_p for sampling_params in self.sampling_params_list],
             dtype=torch.float32,
-            device=self.device,
+            device=self.SAMPLER_DEVICE,
         )
 
     def _make_top_k(self) -> torch.Tensor | None:
         if self.no_top_k:
             return None
 
+        # Match vLLM's per-row convention: top_k <= 0 (or >= vocab_size)
+        # disables top-k, and the sentinel is vocab_size, not 0. The PyTorch
+        # top-k path computes a gather index of vocab_size - top_k, so a 0
+        # sentinel indexes out of bounds (issue #646). GPUInputBatch and the
+        # v1 sampler states normalize the same way.
         return torch.tensor(
-            [sampling_params.top_k for sampling_params in self.sampling_params_list],
+            [
+                sampling_params.top_k
+                if 0 < sampling_params.top_k < self.vocab_size
+                else self.vocab_size
+                for sampling_params in self.sampling_params_list
+            ],
             dtype=torch.int32,
-            device=self.device,
+            device=self.SAMPLER_DEVICE,
         )
 
     def _make_prompt_token_ids(self) -> torch.Tensor | None:
@@ -221,7 +375,7 @@ class SamplingBatch:
         return make_tensor_with_pad(
             self.prompt_token_id_lists,
             pad=self.vocab_size,
-            device=self.device,
+            device=self.SAMPLER_DEVICE,
             dtype=torch.int64,
             pin_memory=False,
         )
@@ -237,7 +391,7 @@ class SamplingBatch:
         avoid allocating ``batch_size`` tensors three times every step.
         """
         if self.no_penalties:
-            empty = torch.empty(0, dtype=torch.float32, device=self.device)
+            empty = torch.empty(0, dtype=torch.float32, device=self.SAMPLER_DEVICE)
             return empty, empty, empty
 
         frequency_penalties = torch.tensor(
@@ -246,7 +400,7 @@ class SamplingBatch:
                 for sampling_params in self.sampling_params_list
             ],
             dtype=torch.float32,
-            device=self.device,
+            device=self.SAMPLER_DEVICE,
         )
         presence_penalties = torch.tensor(
             [
@@ -254,7 +408,7 @@ class SamplingBatch:
                 for sampling_params in self.sampling_params_list
             ],
             dtype=torch.float32,
-            device=self.device,
+            device=self.SAMPLER_DEVICE,
         )
         repetition_penalties = torch.tensor(
             [
@@ -262,7 +416,7 @@ class SamplingBatch:
                 for sampling_params in self.sampling_params_list
             ],
             dtype=torch.float32,
-            device=self.device,
+            device=self.SAMPLER_DEVICE,
         )
         return frequency_penalties, presence_penalties, repetition_penalties
 
@@ -278,7 +432,7 @@ class SamplingBatch:
             len(self.sampling_params_list),
             self.vocab_size,
             dtype=torch.bool,
-            device=self.device,
+            device=self.SAMPLER_DEVICE,
         )
         for i, sp in enumerate(self.sampling_params_list):
             if sp.allowed_token_ids:
@@ -294,13 +448,55 @@ class SamplingBatch:
                 result[i] = sp.bad_words_token_ids
         return result
 
-    def make_sampling_metadata(self) -> SamplingMetadata:
+    def _make_logprob_args(
+        self,
+        logits: torch.Tensor | None,
+    ) -> tuple[int | None, dict[int, list[int]] | None]:
+        """Build mutually exclusive logprob arguments for vLLM's sampler.
+
+        vLLM's compatibility sampler treats any ``logprob_token_ids`` mapping
+        as a batch-wide override of ``max_num_logprobs``. When a batch mixes
+        both request types, materialize the ordinary rows' raw-logit top-k IDs
+        into the mapping and disable the batch-wide top-k argument.
+        """
+        max_num_logprobs = self.max_num_logprobs
+        token_ids_by_row: dict[int, list[int]] = {}
+        for i, sampling_params in enumerate(self.sampling_params_list):
+            if sampling_params.logprob_token_ids:
+                token_ids_by_row[i] = sampling_params.logprob_token_ids
+        if not token_ids_by_row:
+            return max_num_logprobs, None
+
+        topk_requests = [
+            (i, sampling_params.logprobs)
+            for i, sampling_params in enumerate(self.sampling_params_list)
+            if i not in token_ids_by_row and sampling_params.logprobs is not None
+        ]
+        max_topk = max((num_logprobs for _, num_logprobs in topk_requests), default=0)
+        if max_topk > 0:
+            if logits is None:
+                raise ValueError(
+                    "Logits are required when a batch mixes top-k and "
+                    "specific-token logprobs."
+                )
+            topk_token_ids = torch.topk(logits, max_topk, dim=-1).indices
+            for i, num_logprobs in topk_requests:
+                token_ids_by_row[i] = topk_token_ids[i, :num_logprobs].tolist()
+        else:
+            for i, _ in topk_requests:
+                token_ids_by_row[i] = []
+        return None, token_ids_by_row
+
+    def make_sampling_metadata(
+        self, logits: torch.Tensor | None = None
+    ) -> SamplingMetadata:
         """Create vLLM ``SamplingMetadata`` for this batch."""
         (
             frequency_penalties,
             presence_penalties,
             repetition_penalties,
         ) = self._make_penalty_tensors()
+        max_num_logprobs, logprob_token_ids = self._make_logprob_args(logits)
 
         return SamplingMetadata(
             temperature=self._make_temperature(),
@@ -309,7 +505,7 @@ class SamplingBatch:
             top_p=self._make_top_p(),
             top_k=self._make_top_k(),
             generators=self.generators,
-            max_num_logprobs=self.max_num_logprobs,
+            max_num_logprobs=max_num_logprobs,
             prompt_token_ids=self._make_prompt_token_ids(),
             output_token_ids=self.output_token_id_lists,
             frequency_penalties=frequency_penalties,
@@ -318,8 +514,8 @@ class SamplingBatch:
             no_penalties=self.no_penalties,
             allowed_token_ids_mask=self._make_allowed_token_ids_mask(),
             bad_words_token_ids=self._make_bad_words_token_ids(),
-            logitsprocs=self.logitsprocs,
-            logprob_token_ids=None,
+            logitsprocs=_EMPTY_LOGITSPROCS,
+            logprob_token_ids=logprob_token_ids,
         )
 
 
@@ -328,34 +524,40 @@ class SamplingBatch:
 # ---------------------------------------------------------------------------
 
 
-def _mlx_greedy_sample(logits: mx.array) -> mx.array:
-    """Native MLX greedy sampling — avoids PyTorch round-trip."""
-    return mx.argmax(logits, axis=-1)
+def mlx_greedy_tokens(logits_2d: mx.array) -> mx.array:
+    """Lazy native-greedy token ids for pre-sliced 2D logits.
+
+    Pure graph construction — callers own evaluation, which lets the decode
+    pipeline submit the argmax asynchronously and defer the sync one step.
+    """
+    return mx.argmax(logits_2d, axis=-1)
 
 
 def sample_from_logits(
     logits_2d: mx.array,
     batch: SamplingBatch,
     sampler: Sampler,
-    device: torch.device,
 ) -> _SamplingResult:
     """Sample tokens from pre-sliced 2D logits ``(batch_size, vocab)``.
 
     Single entry point for all sampling paths.  Chooses native MLX greedy
-    when possible, otherwise bridges to the vLLM torch sampler. Requests that
-    need sample logprobs must use the vLLM sampler so ``ModelRunnerOutput`` can
-    satisfy the OpenAI serving contract.
+    when possible, otherwise bridges to the vLLM torch sampler on
+    ``SamplingBatch.SAMPLER_DEVICE``. Requests that need sample logprobs must
+    use the vLLM sampler so ``ModelRunnerOutput`` can satisfy the OpenAI
+    serving contract.
     """
     if batch.can_use_native_greedy() and not batch.needs_logprobs:
-        tokens = _mlx_greedy_sample(logits_2d)
+        tokens = mlx_greedy_tokens(logits_2d)
         mx.eval(tokens)
         if tokens.ndim == 0:
             return _SamplingResult([int(tokens.item())])
         return _SamplingResult(tokens.tolist())  # type: ignore[arg-type]
 
     mx.eval(logits_2d)
-    logits_torch = mlx_to_torch(logits_2d.astype(mx.float32), device=device)
-    metadata = batch.make_sampling_metadata()
+    logits_torch = mlx_to_torch(
+        logits_2d.astype(mx.float32), device=SamplingBatch.SAMPLER_DEVICE
+    )
+    metadata = batch.make_sampling_metadata(logits_torch)
     output = sampler.forward(logits_torch, metadata)
     logprobs = (
         output.logprobs_tensors.tolists()
@@ -370,10 +572,8 @@ def sample_decode_tokens(
     decode_reqs: list[tuple[str, object]],
     num_decode: int,
     sampler: Sampler,
-    device: torch.device,
     *,
     vocab_size: int,
-    logitsprocs: LogitsProcessors | None = None,
 ) -> _SamplingResult:
     """Sample one token per decode request from evaluated logits.
 
@@ -382,10 +582,7 @@ def sample_decode_tokens(
         decode_reqs: ``(req_id, RequestState)`` pairs for decode requests.
         num_decode: Number of decode requests (prefix of the token dimension).
         sampler: vLLM Sampler instance.
-        device: PyTorch device for the torch bridge path.
         vocab_size: Model vocabulary size.
-        logitsprocs: Optional logits processors.
-
     Returns:
         Sampled token IDs and optional logprobs, one row per decode request.
     """
@@ -412,11 +609,9 @@ def sample_decode_tokens(
         prompt_token_ids_list,
         output_tokens_list,
         vocab_size=vocab_size,
-        device=device,
-        logitsprocs=logitsprocs,
         generators=generators,
     )
-    return sample_from_logits(decode_logits, batch, sampler, device)
+    return sample_from_logits(decode_logits, batch, sampler)
 
 
 def sample_prefill_tokens(
@@ -425,10 +620,8 @@ def sample_prefill_tokens(
     cu_seqlens: list[int],
     num_decode: int,
     sampler: Sampler,
-    device: torch.device,
     *,
     vocab_size: int,
-    logitsprocs: LogitsProcessors | None = None,
 ) -> _SamplingResult:
     """Sample one token per prefill request from the last logit position.
 
@@ -438,48 +631,40 @@ def sample_prefill_tokens(
         cu_seqlens: Cumulative sequence lengths for logit position lookup.
         num_decode: Number of decode requests (offset into cu_seqlens).
         sampler: vLLM Sampler instance.
-        device: PyTorch device for the torch bridge path.
         vocab_size: Model vocabulary size.
-        logitsprocs: Optional logits processors.
-
     Returns:
         Sampled token IDs and optional logprobs, one row per prefill request.
     """
-    prefill_next_tokens: list[int] = []
-    logprobs_rows: list[LogprobsLists | None] = []
-    for j, pr in enumerate(prefill_reqs):
-        last_idx = cu_seqlens[num_decode + j + 1] - 1
-        last_logits = logits[0, last_idx : last_idx + 1, :]  # (1, vocab)
+    if not prefill_reqs:
+        return _SamplingResult([])
 
-        if pr.full_prompt_token_ids is not None:
-            prompt_len = len(pr.full_prompt_token_ids)
-        elif pr.prompt_len is not None:
-            prompt_len = pr.prompt_len
-        else:
-            prompt_len = len(pr.token_ids)
-
-        prompt_for_meta = (
+    prompt_token_id_lists: list[list[int]] = []
+    output_token_id_lists: list[list[int]] = []
+    for pr in prefill_reqs:
+        token_ids = (
             pr.full_prompt_token_ids
             if pr.full_prompt_token_ids is not None
             else pr.token_ids
         )
-        generators = {} if pr.generator is None else {0: pr.generator}
+        prompt_len = pr.prompt_len if pr.prompt_len is not None else len(token_ids)
+        prompt_token_id_lists.append(token_ids[:prompt_len])
+        output_token_id_lists.append(token_ids[prompt_len:])
 
-        batch = SamplingBatch(
-            [pr.sampling_params],
-            [prompt_for_meta[:prompt_len]],
-            [prompt_for_meta[prompt_len:]],
-            vocab_size=vocab_size,
-            device=device,
-            logitsprocs=logitsprocs,
-            generators=generators,
-        )
-        result = sample_from_logits(last_logits, batch, sampler, device)
-        [next_token] = result.token_ids
-        prefill_next_tokens.append(next_token)
-        logprobs_rows.append(result.logprobs)
-
-    return _SamplingResult(
-        prefill_next_tokens,
-        SamplingBatch.merge_logprobs_rows(logprobs_rows),
+    last_logits = mx.stack(
+        [
+            logits[0, cu_seqlens[num_decode + j + 1] - 1, :]
+            for j in range(len(prefill_reqs))
+        ]
     )
+    batch = SamplingBatch(
+        [pr.sampling_params for pr in prefill_reqs],
+        prompt_token_id_lists,
+        output_token_id_lists,
+        vocab_size=vocab_size,
+        generators={
+            j: pr.generator
+            for j, pr in enumerate(prefill_reqs)
+            if pr.generator is not None
+        },
+    )
+    return sample_from_logits(last_logits, batch, sampler)

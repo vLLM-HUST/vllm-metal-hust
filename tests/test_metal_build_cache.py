@@ -161,7 +161,26 @@ def test_metallib_digest_changes_with_source():
     # The metallib staleness stamp is keyed on the assembled shader source, so a
     # one-byte shader edit must change the digest (else an edited kernel loads
     # silently stale).
-    assert build._metallib_digest("shader A") != build._metallib_digest("shader B")
+    name = build.METALLIB_NAMES[0]
+    assert build._metallib_digest(name, "shader A") != build._metallib_digest(
+        name, "shader B"
+    )
+
+
+def test_nax_metallib_has_its_own_deployment_floor():
+    required = build._metallib_flags(build.METALLIB_NAMES[0])
+    nax = build._metallib_flags(build.NAX_METALLIB_NAME)
+    assert required[-1] == f"-mmacosx-version-min={build.MIN_MACOS_VERSION}"
+    assert nax[-1] == f"-mmacosx-version-min={build.NAX_MIN_MACOS_VERSION}"
+
+
+def test_official_build_requires_nax_sdk(monkeypatch):
+    monkeypatch.setattr(build, "_sdk_supports_nax", lambda: False)
+    with pytest.raises(
+        RuntimeError,
+        match=r"Official wheel builds require macOS SDK >= 26\.2",
+    ):
+        build.require_nax_sdk()
 
 
 # --------------------------------------------------------------------------
@@ -236,7 +255,7 @@ def _seed_fresh() -> None:
     for name in build.METALLIB_NAMES:
         lib = build.metallib_path(name)
         lib.write_bytes(b"lib")
-        build._stamp_path(lib).write_text(build._metallib_digest(f"SRC::{name}"))
+        build._stamp_path(lib).write_text(build._metallib_digest(name, f"SRC::{name}"))
 
 
 def test_stale_artifacts_empty_when_all_fresh(stale_env):

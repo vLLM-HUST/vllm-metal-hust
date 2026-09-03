@@ -7,13 +7,23 @@ Run with:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
+from mlx_lm.models.rope_utils import (
+    Llama3RoPE,
+    ProportionalRoPE,
+    SuScaledRoPE,
+    YarnRoPE,
+)
 
 from vllm_metal.attention.context import (
     OffsetCache,
     clear_context,
     get_context,
+    prepare_grouped,
     prepare_unified,
 )
 from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
@@ -189,10 +199,46 @@ class TestPrepare:
         assert ctx.offsets == [7]
         assert ctx.cu_seqlens == [0, 1]
 
-    def test_prepare_unified_spec_decode_splits_query_tokens(self):
+    def test_prepare_unified_spec_decode_keeps_window_whole(self):
         # Speculative verification appends draft rows after the last token.
-        # Each row is a separate attention segment with its own position.
+        # With the merged layout requested, the window stays ONE multi-token
+        # segment (cu_seqlens aligned with decode requests); per-row
+        # causality is the kernel's varlen job.
+        prepare_unified(
+            [([5, 6, 7], 7, 3)], [], block_size=4, merge_verify_windows=True
+        )
+        ctx = get_context()
+
+        assert ctx is not None
+        assert ctx.slot_mapping == [27, 28, 29]
+        assert ctx.block_tables == [[5, 6, 7]]
+        assert ctx.context_lens == [10]
+        assert ctx.offsets == [7]
+        assert ctx.cu_seqlens == [0, 3]
+        assert ctx.verify_window_q == 3
+        assert ctx.num_decode_requests == 1
+
+    def test_prepare_unified_defaults_to_expanded_layout(self):
+        # Window mode is opt-in runtime policy: a caller that does not pass
+        # merge_verify_windows gets the expanded per-token layout, never the
+        # experimental merged shape.
         prepare_unified([([5, 6, 7], 7, 3)], [], block_size=4)
+        ctx = get_context()
+
+        assert ctx is not None
+        assert ctx.cu_seqlens == [0, 1, 2, 3]
+        assert ctx.context_lens == [8, 9, 10]
+        assert ctx.verify_window_q == 1
+
+    def test_prepare_unified_expands_window_when_merge_disabled(self):
+        # merge_verify_windows=False restores the expanded per-token layout
+        # for models the window path does not serve (MLA native decode,
+        # hybrid GDN layers, heads past PA_WINDOW_MAX_HEAD_SIZE): one
+        # single-token segment per window row, byte-for-byte the
+        # pre-window-mode metadata.
+        prepare_unified(
+            [([5, 6, 7], 7, 3)], [], block_size=4, merge_verify_windows=False
+        )
         ctx = get_context()
 
         assert ctx is not None
@@ -201,6 +247,30 @@ class TestPrepare:
         assert ctx.context_lens == [8, 9, 10]
         assert ctx.offsets == [7, 8, 9]
         assert ctx.cu_seqlens == [0, 1, 2, 3]
+        assert ctx.verify_window_q == 1
+        assert ctx.num_decode_requests == 1
+
+    def test_prepare_unified_mixed_window_and_prefill_stays_off_window_mode(self):
+        # A verify window sharing the batch with a prefill chunk keeps its
+        # merged segment but the batch reports verify_window_q=1, so the
+        # dispatch routes it down a prefill kernel (tiled, or NAX on M5)
+        # exactly like the non-speculative case, never window mode.
+        prepare_unified(
+            [([5, 6, 7], 7, 3)],
+            [([10, 11], 5, 0)],
+            block_size=4,
+            merge_verify_windows=True,
+        )
+        ctx = get_context()
+
+        assert ctx is not None
+        assert ctx.slot_mapping == [27, 28, 29, 40, 41, 42, 43, 44]
+        assert ctx.block_tables == [[5, 6, 7], [10, 11]]
+        assert ctx.cu_seqlens == [0, 3, 8]
+        assert ctx.context_lens == [10, 5]
+        assert ctx.offsets == [7, 0]
+        assert ctx.verify_window_q == 1
+        assert ctx.num_decode_requests == 1
 
     def test_prepare_unified_mixed(self):
         # 1 decode + 1 prefill
@@ -220,8 +290,230 @@ class TestPrepare:
         assert ctx.block_tables == [[5, 6], [10, 11]]
 
 
+class TestPrepareGrouped:
+    def teardown_method(self):
+        clear_context()
+
+    def test_builds_distinct_group_metadata(self):
+        decode = [([[3, 4], [8]], 17, 1)]
+        prefill = [([[5, 6], [9]], 2, 0)]
+
+        prepare_grouped(decode, prefill, (16, 32))
+
+        ctx = get_context()
+
+        assert ctx is not None
+        assert ctx.kv_groups is not None
+        assert ctx.kv_groups[0].slot_mapping == [4 * 16 + 1, 5 * 16, 5 * 16 + 1]
+        assert ctx.kv_groups[1].slot_mapping == [8 * 32 + 17, 9 * 32, 9 * 32 + 1]
+        assert ctx.kv_groups[0].block_tables == [[3, 4], [5, 6]]
+        assert ctx.kv_groups[1].block_tables == [[8], [9]]
+        assert ctx.slot_mapping == ctx.kv_groups[0].slot_mapping
+        assert ctx.block_tables == ctx.kv_groups[0].block_tables
+
+    def test_repeats_decode_table_for_each_verification_token(self):
+        prepare_grouped([([[3], [8, 9]], 17, 2)], [], (32, 16))
+
+        ctx = get_context()
+
+        assert ctx is not None
+        assert ctx.kv_groups is not None
+        assert ctx.context_lens == [18, 19]
+        assert ctx.kv_groups[0].block_tables == [[3], [3]]
+        assert ctx.kv_groups[1].block_tables == [[8, 9], [8, 9]]
+
+
 class TestPackedRoPE:
     """Tests for per-request RoPE position reset in packed prefill."""
+
+    class RecordingRoPE(nn.RoPE):
+        def __init__(self) -> None:
+            super().__init__(dims=8, traditional=False, base=10_000.0)
+            self.calls = []
+
+        def __call__(self, x, offset=0):
+            self.calls.append((x.shape, offset))
+            return super().__call__(x, offset=offset)
+
+    def test_native_rope_batches_single_token_segments(self):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        rope = self.RecordingRoPE()
+        reference_rope = nn.RoPE(dims=8, traditional=False, base=10_000.0)
+        module = SimpleNamespace(rope=rope)
+        q = mx.arange(1 * 3 * 4 * 8, dtype=mx.float32).reshape(1, 3, 4, 8) / 100
+        k = mx.arange(1 * 2 * 4 * 8, dtype=mx.float32).reshape(1, 2, 4, 8) / 100
+        cu_seqlens = [0, 1, 2, 3, 4]
+        offsets = [3, 11, 29, 47]
+
+        expected_q = mx.concatenate(
+            [
+                reference_rope(q[:, :, i : i + 1, :], offset=offsets[i])
+                for i in range(4)
+            ],
+            axis=2,
+        )
+        expected_k = mx.concatenate(
+            [
+                reference_rope(k[:, :, i : i + 1, :], offset=offsets[i])
+                for i in range(4)
+            ],
+            axis=2,
+        )
+        q_out, k_out = apply_packed_rope(module, q, k, cu_seqlens, offsets=offsets)
+        mx.eval(expected_q, expected_k, q_out, k_out)
+
+        assert len(rope.calls) == 2
+        assert rope.calls[0][0] == (4, 3, 1, 8)
+        assert rope.calls[1][0] == (4, 2, 1, 8)
+        assert rope.calls[0][1].shape == (4,)
+        assert rope.calls[0][1].tolist() == offsets
+        assert rope.calls[1][1].shape == (4,)
+        assert rope.calls[1][1].tolist() == offsets
+        assert mx.allclose(q_out, expected_q, rtol=1e-5, atol=1e-5).item()
+        assert mx.allclose(k_out, expected_k, rtol=1e-5, atol=1e-5).item()
+
+    @pytest.mark.parametrize(
+        "rope",
+        [
+            Llama3RoPE(
+                8,
+                scaling_config={
+                    "factor": 8.0,
+                    "low_freq_factor": 1.0,
+                    "high_freq_factor": 4.0,
+                    "original_max_position_embeddings": 8192,
+                },
+            ),
+            ProportionalRoPE(8, 8),
+            SuScaledRoPE(8),
+            YarnRoPE(8),
+        ],
+    )
+    def test_mlx_lm_rope_wrappers_match_segment_reference(self, rope):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        module = SimpleNamespace(rope=rope)
+        q = mx.arange(1 * 3 * 4 * 8, dtype=mx.float32).reshape(1, 3, 4, 8) / 100
+        k = mx.arange(1 * 2 * 4 * 8, dtype=mx.float32).reshape(1, 2, 4, 8) / 100
+        cu_seqlens = [0, 1, 2, 3, 4]
+        offsets = [3, 11, 29, 47]
+
+        expected_q = mx.concatenate(
+            [rope(q[:, :, i : i + 1, :], offset=offsets[i]) for i in range(4)],
+            axis=2,
+        )
+        expected_k = mx.concatenate(
+            [rope(k[:, :, i : i + 1, :], offset=offsets[i]) for i in range(4)],
+            axis=2,
+        )
+        q_out, k_out = apply_packed_rope(module, q, k, cu_seqlens, offsets=offsets)
+        mx.eval(expected_q, expected_k, q_out, k_out)
+
+        assert mx.allclose(q_out, expected_q, rtol=1e-5, atol=1e-5).item()
+        assert mx.allclose(k_out, expected_k, rtol=1e-5, atol=1e-5).item()
+
+    def test_native_rope_uses_vector_zero_offsets_for_implicit_offsets(self):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        rope = self.RecordingRoPE()
+        module = SimpleNamespace(rope=rope)
+        cu_seqlens = [0, 1, 2, 3, 4]
+        q = mx.zeros((1, 3, 4, 8), dtype=mx.float32)
+        k = mx.zeros((1, 2, 4, 8), dtype=mx.float32)
+
+        apply_packed_rope(module, q, k, cu_seqlens)
+
+        assert len(rope.calls) == 2
+        assert rope.calls[0][1].shape == (4,)
+        assert rope.calls[0][1].tolist() == [0, 0, 0, 0]
+        assert rope.calls[1][1].shape == (4,)
+        assert rope.calls[1][1].tolist() == [0, 0, 0, 0]
+
+    def test_batched_rope_preserves_keys_when_not_applied(self):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        rope = self.RecordingRoPE()
+        reference_rope = nn.RoPE(dims=8, traditional=False, base=10_000.0)
+        module = SimpleNamespace(rope=rope)
+        cu_seqlens = [0, 1, 2, 3, 4]
+        offsets = [3, 17, 41, 83]
+        q = mx.arange(1 * 3 * 4 * 8, dtype=mx.float32).reshape(1, 3, 4, 8) / 100
+        k = mx.zeros((1, 2, 4, 8), dtype=mx.float32)
+        expected_q = mx.concatenate(
+            [
+                reference_rope(q[:, :, i : i + 1, :], offset=offsets[i])
+                for i in range(4)
+            ],
+            axis=2,
+        )
+
+        q_out, k_out = apply_packed_rope(
+            module,
+            q,
+            k,
+            cu_seqlens,
+            offsets=offsets,
+            apply_keys=False,
+        )
+        mx.eval(expected_q, q_out)
+
+        assert len(rope.calls) == 1
+        assert mx.allclose(q_out, expected_q, rtol=1e-5, atol=1e-5).item()
+        assert k_out is k
+
+    def test_multi_token_segments_keep_per_segment_call_contract(self):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        rope = self.RecordingRoPE()
+        module = SimpleNamespace(rope=rope)
+        q = mx.zeros((1, 2, 6, 8))
+        k = mx.zeros((1, 1, 6, 8))
+
+        apply_packed_rope(module, q, k, [0, 2, 4, 6], offsets=[3, 5, 8])
+
+        assert rope.calls == [
+            ((1, 2, 2, 8), 3),
+            ((1, 1, 2, 8), 3),
+            ((1, 2, 2, 8), 5),
+            ((1, 1, 2, 8), 5),
+            ((1, 2, 2, 8), 8),
+            ((1, 1, 2, 8), 8),
+        ]
+
+    def test_custom_rope_keeps_per_segment_call_contract(self):
+        from vllm_metal.attention.impls.varlen_rope_compat import (
+            apply_packed_rope,
+        )
+
+        class RecordingRoPE:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, x, offset=0):
+                self.calls.append((x.shape, offset))
+                return x + offset
+
+        rope = RecordingRoPE()
+        module = SimpleNamespace(rope=rope)
+        q = mx.zeros((1, 2, 3, 8))
+        k = mx.zeros((1, 1, 3, 8))
+
+        q_out, k_out = apply_packed_rope(module, q, k, [0, 1, 2, 3], offsets=[3, 5, 8])
+
+        assert [offset for _, offset in rope.calls] == [3, 3, 5, 5, 8, 8]
+        assert q_out[0, 0, :, 0].tolist() == [3.0, 5.0, 8.0]
+        assert k_out[0, 0, :, 0].tolist() == [3.0, 5.0, 8.0]
 
     def test_positions_reset_per_request(self):
         """Each packed request's RoPE should start from position 0."""

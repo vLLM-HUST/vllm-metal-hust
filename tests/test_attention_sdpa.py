@@ -12,16 +12,28 @@ Metal kernel dispatch itself is covered by the end-to-end smoke tests,
 not here.
 """
 
+from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 import vllm_metal.attention.impls.sdpa as sdpa_mod
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
-from vllm_metal.attention.context import PagedAttentionContext
+from vllm_metal.attention.caches.mha_layout import (
+    MHAKVCacheLayout,
+    MHALayerKVLayout,
+)
+from vllm_metal.attention.context import (
+    PagedAttentionContext,
+    clear_context,
+    get_context,
+    prepare_grouped,
+)
 from vllm_metal.attention.impls.sdpa import (
+    apply_g_proj_gate,
     pad_qkv_to_cache_head_dim,
     prepare_sdpa_qkv,
     sdpa_forward,
@@ -37,6 +49,12 @@ _N_HEADS = 2
 _N_KV_HEADS = 2
 _HEAD_DIM = 4  # small enough for fast unit tests
 _CACHE_HEAD_DIM = 8  # Gemma4-style: cache wider than layer head_dim
+
+
+@pytest.fixture(autouse=True)
+def _clear_attention_context() -> Iterator[None]:
+    yield
+    clear_context()
 
 
 class _FakeLinear:
@@ -568,8 +586,103 @@ class TestPrepareSDPAQKV:
         assert kv_for_sharing == (expected_k, values)
 
 
+class _PagedRoutingOpsSpy:
+    def __init__(self) -> None:
+        self.calls: list[SimpleNamespace] = []
+
+    def reshape_and_cache(
+        self,
+        _key,
+        _value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+    ) -> tuple[mx.array, mx.array]:
+        self.calls.append(SimpleNamespace(slot_mapping=slot_mapping.tolist()))
+        return key_cache, value_cache
+
+    def paged_attention_primitive(
+        self,
+        _query: mx.array,
+        _key_cache: mx.array,
+        _value_cache: mx.array,
+        _num_kv_heads: int,
+        _scale: float,
+        _softcap: float,
+        block_tables: mx.array,
+        _seq_lens: mx.array,
+        _cu_seqlens: mx.array,
+        block_size: int,
+        _max_seq_len: int,
+        _sliding_window: int,
+        _out: mx.array,
+        window_seqlen_q: int = 1,
+        sinks: mx.array | None = None,
+    ) -> None:
+        del window_seqlen_q, sinks
+        self.calls[-1].block_tables = block_tables.tolist()
+        self.calls[-1].block_size = block_size
+
+
 class TestSDPAForward:
     """Tests for ``sdpa_forward`` runtime argument propagation."""
+
+    def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
+        """Full and sliding layers consume their scheduler-group metadata."""
+        layout = MHAKVCacheLayout(
+            num_blocks=11,
+            tensor_sizes=(1, 1),
+            layers=(
+                MHALayerKVLayout(0, 0, 32, _N_KV_HEADS, _HEAD_DIM, -1),
+                MHALayerKVLayout(1, 1, 16, _N_KV_HEADS, _HEAD_DIM, 1024),
+            ),
+            group_block_sizes=(32, 16),
+            slot_layers=((0,), (1,)),
+        )
+        cache = MetalPagedKVCache.from_layout(layout, mx.float16)
+        prepare_grouped(
+            [([[3], [8, 9]], 17, 1)],
+            [([[4], [10]], 2, 0)],
+            (32, 16),
+        )
+        ctx = get_context()
+        assert ctx is not None
+
+        inner = SimpleNamespace(
+            n_heads=_N_HEADS,
+            n_kv_heads=_N_KV_HEADS,
+            scale=_HEAD_DIM**-0.5,
+            o_proj=lambda out: out,
+        )
+        x = mx.ones((_BATCH, 3, _HIDDEN))
+        queries = mx.ones((_BATCH, _N_HEADS, 3, _HEAD_DIM))
+        keys = mx.ones((_BATCH, _N_KV_HEADS, 3, _HEAD_DIM))
+        values = mx.ones((_BATCH, _N_KV_HEADS, 3, _HEAD_DIM))
+        ops = _PagedRoutingOpsSpy()
+
+        with (
+            patch.object(
+                sdpa_mod,
+                "prepare_sdpa_qkv",
+                return_value=(queries, keys, values, None, (keys, values)),
+            ),
+            patch.object(sdpa_mod, "get_ops", return_value=ops),
+            patch.object(
+                sdpa_mod,
+                "truncate_padded_output",
+                return_value=mx.zeros((_BATCH, 3, _N_HEADS * _HEAD_DIM)),
+            ),
+        ):
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+            sdpa_forward(inner, x, ctx, cache, layer_idx=1)
+
+        full_call, sliding_call = ops.calls
+        assert full_call.slot_mapping == [3 * 32 + 17, 4 * 32, 4 * 32 + 1]
+        assert full_call.block_tables == [[3], [4]]
+        assert full_call.block_size == 32
+        assert sliding_call.slot_mapping == [9 * 16 + 1, 10 * 16, 10 * 16 + 1]
+        assert sliding_call.block_tables == [[8, 9], [10, 0]]
+        assert sliding_call.block_size == 16
 
     def test_kernel_receives_per_layer_kv_heads(self) -> None:
         """Heterogeneous layers must pass their concrete KV-head count.
@@ -644,6 +757,77 @@ class TestSDPAForward:
             sdpa_forward(inner, x, ctx, cache, layer_idx=1)
 
         assert captured["num_kv_heads"] == actual_kv_heads
+
+    def test_gpt_oss_scale_and_sinks_reach_kernel(self) -> None:
+        """GPT-OSS exposes ``sm_scale`` and per-head attention sinks."""
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=1,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        expected_scale = 0.125
+        fp16_sinks = mx.arange(_N_HEADS, dtype=mx.float16)
+        inner = SimpleNamespace(
+            num_attention_heads=_N_HEADS,
+            num_key_value_heads=_N_KV_HEADS,
+            sm_scale=expected_scale,
+            sinks=fp16_sinks,
+            o_proj=lambda out: out,
+        )
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+        queries = mx.ones((_BATCH, _N_HEADS, _SEQ_LEN, _HEAD_DIM))
+        keys = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
+        values = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
+        captured: dict[str, object] = {}
+
+        class _FakeOps:
+            def reshape_and_cache(
+                self,
+                _key,
+                _value,
+                key_cache,
+                value_cache,
+                _slot_mapping,
+            ) -> tuple[mx.array, mx.array]:
+                return key_cache, value_cache
+
+            def paged_attention_primitive(
+                self,
+                _query,
+                _key_cache,
+                _value_cache,
+                _num_kv_heads,
+                scale,
+                *_args,
+                sinks=None,
+                **_kwargs,
+            ) -> None:
+                captured["scale"] = scale
+                captured["sinks"] = sinks
+
+        with (
+            patch.object(
+                sdpa_mod,
+                "prepare_sdpa_qkv",
+                return_value=(queries, keys, values, None, (keys, values)),
+            ),
+            patch.object(sdpa_mod, "get_ops", return_value=_FakeOps()),
+            patch.object(
+                sdpa_mod,
+                "truncate_padded_output",
+                return_value=mx.zeros((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM)),
+            ),
+        ):
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+
+        sinks = captured["sinks"]
+        assert captured["scale"] == expected_scale
+        assert isinstance(sinks, mx.array)
+        assert sinks.dtype == mx.float32
 
     def test_shared_kv_path_does_not_rebind_cache_arrays(self) -> None:
         """Shared-KV attention must read the existing cache without writing."""
@@ -763,3 +947,44 @@ class TestSDPAForward:
         assert cache.value_caches[0] is original_v_cache
         assert captured["key_cache"] is original_k_cache
         assert captured["value_cache"] is original_v_cache
+
+
+# === Laguna g_proj per-head gating ===
+
+
+class TestApplyGProjGate:
+    """Cover Laguna-style ``g_proj`` + softplus per-head output gating."""
+
+    def test_noop_without_g_proj(self) -> None:
+        """Modules without ``g_proj`` (every non-Laguna SDPA model) pass through."""
+        inner = SimpleNamespace()  # no g_proj, no gating
+        out = mx.ones((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM))
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+        result = apply_g_proj_gate(inner, out, x, _N_HEADS, _HEAD_DIM)
+        assert result is out
+
+    def test_noop_when_gating_disabled(self) -> None:
+        """A ``g_proj`` with ``gating=False`` is ignored (defensive guard)."""
+        inner = SimpleNamespace(gating=False, g_proj=nn.Linear(_HIDDEN, _N_HEADS))
+        out = mx.ones((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM))
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+        result = apply_g_proj_gate(inner, out, x, _N_HEADS, _HEAD_DIM)
+        assert result is out
+
+    def test_matches_reference_gating(self) -> None:
+        """Output matches the mlx_lm Laguna reference gating computation."""
+        g_proj = nn.Linear(_HIDDEN, _N_HEADS, bias=False)
+        inner = SimpleNamespace(gating=True, g_proj=g_proj)
+        x = mx.random.normal((_BATCH, _SEQ_LEN, _HIDDEN))
+        out = mx.random.normal((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM))
+
+        result = apply_g_proj_gate(inner, out, x, _N_HEADS, _HEAD_DIM)
+
+        # Reference: gate = softplus(g_proj(x)); out *= gate per head.
+        gate = nn.softplus(g_proj(x).astype(mx.float32)).astype(out.dtype)
+        expected = (
+            out.reshape(_BATCH, _SEQ_LEN, _N_HEADS, _HEAD_DIM) * gate[..., None]
+        ).reshape(_BATCH, _SEQ_LEN, -1)
+
+        assert result.shape == out.shape
+        assert mx.allclose(result, expected, atol=1e-6).item()

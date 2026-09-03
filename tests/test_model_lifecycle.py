@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -16,6 +17,7 @@ import vllm_metal.envs as envs
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.config import reset_config
+from vllm_metal.distributed.pipeline import PipelineGroup
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1 import model_lifecycle
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
@@ -40,42 +42,6 @@ def _reset_env(monkeypatch: pytest.MonkeyPatch):
     reset_config()
 
 
-class _BaseSlotTextConfig:
-    __slots__ = ("vocab_size", "num_hidden_layers", "num_attention_heads")
-
-    def __init__(
-        self,
-        *,
-        vocab_size: int,
-        num_hidden_layers: int,
-        num_attention_heads: int,
-    ) -> None:
-        self.vocab_size = vocab_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-
-
-class _SlotTextConfig(_BaseSlotTextConfig):
-    __slots__ = ("num_key_value_heads", "hidden_size")
-
-    def __init__(
-        self,
-        *,
-        vocab_size: int,
-        num_hidden_layers: int,
-        num_attention_heads: int,
-        num_key_value_heads: int,
-        hidden_size: int,
-    ) -> None:
-        super().__init__(
-            vocab_size=vocab_size,
-            num_hidden_layers=num_hidden_layers,
-            num_attention_heads=num_attention_heads,
-        )
-        self.num_key_value_heads = num_key_value_heads
-        self.hidden_size = hidden_size
-
-
 def _runner_model_config(**overrides: object) -> object:
     values = {
         "model": "stub-model",
@@ -85,6 +51,10 @@ def _runner_model_config(**overrides: object) -> object:
         "dtype": torch.float16,
         "quantization": None,
         "model_weights": "",
+        "hf_token": None,
+        "revision": None,
+        "tokenizer": None,
+        "tokenizer_revision": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -169,7 +139,6 @@ def _make_lifecycle(
 ) -> tuple[ModelLifecycle, object]:
     runner = make_stub_runner(
         model_args=model_args,
-        metal_config=SimpleNamespace(debug=False),
         model_config=model_config or _runner_model_config(),
     )
     lifecycle = ModelLifecycle(runner, runner._model_adapter)
@@ -242,7 +211,7 @@ class TestModelLifecycle:
 
         assert runner._is_vlm is False
 
-    def test_generation_load_request_resolves_effective_vlm_once(self) -> None:
+    def test_model_load_request_resolves_effective_vlm_once(self) -> None:
         hf_config = SimpleNamespace(model_type="custom")
         calls: list[object] = []
 
@@ -252,7 +221,6 @@ class TestModelLifecycle:
                 return True
 
         runner = make_stub_runner(
-            metal_config=SimpleNamespace(debug=False),
             model_config=_runner_model_config(
                 hf_config=hf_config,
                 is_multimodal_model=True,
@@ -268,6 +236,77 @@ class TestModelLifecycle:
         assert request.target_dtype is not None
         assert request.tokenizer_config == {"trust_remote_code": True}
         assert calls == [hf_config]
+
+    def test_effective_multimodal_gguf_is_rejected(self) -> None:
+        runner = make_stub_runner(
+            model_config=_runner_model_config(
+                hf_config=SimpleNamespace(model_type="custom_vlm"),
+                is_multimodal_model=True,
+                quantization="gguf",
+                model_weights="stub-model.gguf",
+            ),
+        )
+
+        with pytest.raises(NotImplementedError, match="Multimodal GGUF"):
+            GenerationLoadRequest.from_runner(
+                runner,
+                SimpleNamespace(should_force_text_backbone=lambda _: False),
+            )
+
+    def test_model_load_request_marks_pipeline_stage_lazy(self) -> None:
+        # A pipeline-parallel stage (pp.size > 1) loads weights lazily so it can
+        # prune its non-owned layers before the first eval; a single-stage load
+        # stays eager. lazy_weights is the typed contract the mlx_lm loader reads.
+        class _Adapter:
+            def should_force_text_backbone(self, config: object) -> bool:
+                return False
+
+        class _FakeGroup:
+            def __init__(self, size: int) -> None:
+                self._size = size
+
+            def rank(self) -> int:
+                return 0
+
+            def size(self) -> int:
+                return self._size
+
+        def _lazy_for(pp: PipelineGroup | None) -> bool:
+            runner = make_stub_runner(
+                model_config=_runner_model_config(),
+                pp=pp,
+            )
+            return GenerationLoadRequest.from_runner(runner, _Adapter()).lazy_weights
+
+        assert _lazy_for(None) is False
+        assert _lazy_for(PipelineGroup(_FakeGroup(1))) is False
+        assert _lazy_for(PipelineGroup(_FakeGroup(2))) is True
+
+    def test_load_mlx_lm_text_model_forwards_lazy_flag(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The pp lazy_weights flag must reach mlx_lm's loader so a stage can prune
+        # its non-owned layers before the first eval; a single-stage load is eager.
+        captured: dict[str, object] = {}
+
+        def _fake_load(
+            path: str, *, tokenizer_config: object, lazy: bool
+        ) -> tuple[object, object]:
+            captured["lazy"] = lazy
+            return object(), object()
+
+        monkeypatch.setattr(model_lifecycle, "mlx_lm_load", _fake_load)
+        monkeypatch.setattr(
+            model_lifecycle,
+            "_mlx_lm_compatible_model_path",
+            lambda name: contextlib.nullcontext(name),
+        )
+        lifecycle, _ = _make_lifecycle()
+
+        lifecycle._load_mlx_lm_text_model("stub", {}, lazy=True)
+        assert captured["lazy"] is True
+        lifecycle._load_mlx_lm_text_model("stub", {}, lazy=False)
+        assert captured["lazy"] is False
 
     def test_load_uses_adapter_override_for_qwen35_fp8_conditional_generation(
         self,
@@ -309,6 +348,29 @@ class TestModelLifecycle:
         lifecycle.load()
 
         assert runner._is_vlm is False
+
+    def test_load_uses_adapter_override_for_qwen35_mlx_quant_dense_wrapper(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _stub_generation_model(monkeypatch, config=_text_config())
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(
+                hf_config=SimpleNamespace(
+                    model_type="qwen3_5",
+                    architectures=["Qwen3_5ForConditionalGeneration"],
+                    quantization={"group_size": 64, "bits": 4, "mode": "affine"},
+                    vision_config=SimpleNamespace(spatial_merge_size=2),
+                    text_config=SimpleNamespace(model_type="qwen3_5_text"),
+                ),
+                is_multimodal_model=True,
+            )
+        )
+
+        lifecycle.load()
+
+        assert runner._is_vlm is False
+        assert runner._multimodal_adapter is None
 
     def test_load_multimodal_native_mode_keeps_qwen35_fp8_as_vlm(
         self,
@@ -385,7 +447,7 @@ class TestModelLifecycle:
         )
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
-                hf_config=SimpleNamespace(model_type="phi3_v"),
+                hf_config=SimpleNamespace(model_type="phi3_v", architectures=[]),
                 is_multimodal_model=True,
             )
         )
@@ -396,31 +458,28 @@ class TestModelLifecycle:
         assert runner._multimodal_adapter is None
         assert runner.encoder_cache is None
 
-    def test_load_separates_text_and_vlm_loader_paths(
+    def test_load_forced_text_backbone_uses_mlx_lm_loader(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         text_model = SimpleNamespace(config=_text_config())
         text_tokenizer = object()
-        vlm_model = _qwen35_vlm_model()
-        vlm_tokenizer = object()
 
         class _StubAWQLoader:
             @classmethod
             def for_model(cls, _model_name: str) -> None:
                 return None
 
+        def _load_text(
+            _model_name: str,
+            *,
+            tokenizer_config: object,
+            lazy: bool,
+        ) -> tuple[object, object]:
+            return text_model, text_tokenizer
+
         monkeypatch.setattr(model_lifecycle, "AWQQuantLoader", _StubAWQLoader)
-        monkeypatch.setattr(
-            model_lifecycle,
-            "mlx_lm_load",
-            lambda *_args, **_kwargs: (text_model, text_tokenizer),
-        )
-        monkeypatch.setattr(
-            model_lifecycle,
-            "mlx_vlm_load",
-            lambda _model_name: (vlm_model, vlm_tokenizer),
-        )
+        monkeypatch.setattr(model_lifecycle, "mlx_lm_load", _load_text)
 
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
@@ -434,8 +493,22 @@ class TestModelLifecycle:
         assert runner.tokenizer is text_tokenizer
         assert runner._is_vlm is False
 
+    def test_load_vlm_pipeline_parallel_uses_mlx_vlm_lazy_loading(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        vlm_model = _qwen35_vlm_model()
+        vlm_tokenizer = object()
+        vlm_lazy: list[bool] = []
+
+        def _load_vlm(_model_name: str, *, lazy: bool) -> tuple[object, object]:
+            vlm_lazy.append(lazy)
+            return vlm_model, vlm_tokenizer
+
+        monkeypatch.setattr(model_lifecycle, "mlx_vlm_load", _load_vlm)
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
         reset_config()
+
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
                 hf_config=SimpleNamespace(
@@ -446,38 +519,17 @@ class TestModelLifecycle:
                 is_multimodal_model=True,
             )
         )
+        runner.pp = PipelineGroup(SimpleNamespace(rank=lambda: 0, size=lambda: 2))
         lifecycle.load()
 
         assert runner.model is vlm_model
         assert runner.tokenizer is vlm_tokenizer
         assert runner._is_vlm is True
-
-    def test_load_text_only_compat_mode_keeps_generic_vlm_native(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
-        reset_config()
-        _stub_generation_model(
-            monkeypatch,
-            config=SimpleNamespace(text_config=_text_config()),
-            is_vlm=True,
-        )
-        lifecycle, runner = _make_lifecycle(
-            model_config=_runner_model_config(
-                hf_config=SimpleNamespace(model_type="phi3_v"),
-                is_multimodal_model=True,
-            )
-        )
-
-        lifecycle.load()
-
-        assert runner._is_vlm is True
+        assert vlm_lazy == [True]
 
     @pytest.mark.slow
-    def test_load_text_only_compat_real_qwen_fp8_checkpoint(
+    def test_load_auto_mode_real_qwen_fp8_checkpoint(
         self,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         model_path = os.environ.get("VLLM_METAL_QWEN_FP8_COMPAT_MODEL_PATH")
         if not model_path:
@@ -489,8 +541,6 @@ class TestModelLifecycle:
 
         from vllm_metal.compat import _patch_mlx_lm_qwen35_fp8_sanitize
 
-        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only-compat")
-        reset_config()
         Gemma4MTPAssistantLoader.clear_cache()
         _patch_mlx_lm_qwen35_fp8_sanitize()
 
@@ -555,13 +605,14 @@ class TestModelLifecycle:
             method="mtp",
             draft_model_config=SimpleNamespace(
                 model="assistant",
+                revision=None,
                 hf_config=SimpleNamespace(model_type="gemma4_mtp"),
             ),
         )
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(),
         )
-        runner.vllm_config = SimpleNamespace(speculative_config=speculative_config)
+        runner.vllm_config.speculative_config = speculative_config
 
         lifecycle.load()
 
@@ -591,13 +642,14 @@ class TestModelLifecycle:
             method="mtp",
             draft_model_config=SimpleNamespace(
                 model="assistant",
+                revision=None,
                 hf_config=SimpleNamespace(model_type="gemma4_mtp"),
             ),
         )
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(),
         )
-        runner.vllm_config = SimpleNamespace(speculative_config=speculative_config)
+        runner.vllm_config.speculative_config = speculative_config
         runner._gemma4_mtp_assistant = object()
 
         with pytest.raises(RuntimeError, match="assistant load failed"):
@@ -633,6 +685,7 @@ class TestModelLifecycle:
             revision=None,
             draft_model_config=SimpleNamespace(
                 model="/assistant",
+                revision=None,
                 hf_config=SimpleNamespace(model_type="gemma4_mtp"),
             ),
         )
@@ -640,6 +693,7 @@ class TestModelLifecycle:
             "model_type": "gemma4_text",
             "vocab_size": 32000,
             "hidden_size": 4096,
+            "num_hidden_layers": 1,
             "num_kv_shared_layers": 0,
             "layer_types": ["full_attention"],
         }
@@ -650,12 +704,10 @@ class TestModelLifecycle:
 
         first = loader.load_if_needed(
             speculative_config=spec_config,
-            target_hf_config=None,
             target_model_args=target_args,
         )
         second = loader.load_if_needed(
             speculative_config=spec_config,
-            target_hf_config=None,
             target_model_args=target_args,
         )
         assert first is second
@@ -665,7 +717,6 @@ class TestModelLifecycle:
 
         third = loader.load_if_needed(
             speculative_config=spec_config,
-            target_hf_config=None,
             target_model_args=target_args,
         )
         assert third is not first
@@ -722,33 +773,6 @@ class TestModelLifecycle:
         )
         assert runner.model_args["model_type"] == "gemma4"
         assert runner.model_args["vocab_size"] == _TEXT_MODEL_ARGS["vocab_size"]
-
-    def test_load_extracts_vlm_text_config_with_inherited_slots(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        _stub_generation_model(
-            monkeypatch,
-            config=SimpleNamespace(
-                text_config=_SlotTextConfig(
-                    **_TEXT_MODEL_ARGS,
-                )
-            ),
-            is_vlm=True,
-        )
-        lifecycle, runner = _make_lifecycle(
-            model_config=_runner_model_config(
-                is_multimodal_model=True,
-            )
-        )
-
-        lifecycle.load()
-
-        assert runner._is_vlm is True
-        assert runner.model_args["vocab_size"] == 32000
-        assert runner.model_args["hidden_size"] == 4096
-        assert runner.num_layers == 32
-        assert runner.head_dim == 128
 
     def test_load_stt_model_loads_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake_model = SimpleNamespace(
@@ -854,11 +878,14 @@ class TestModelLifecycle:
             assert len(mlx_lm_load_calls) == 1
             # The generic path must NOT pass ``model_config`` (which is
             # reserved for the AWQ owner's normalized quant config kwargs).
-            assert "model_config" not in mlx_lm_load_calls[0]["kwargs"]
+            kwargs = mlx_lm_load_calls[0]["kwargs"]
+            assert isinstance(kwargs, dict)
+            assert "model_config" not in kwargs
 
     def test_load_routes_gguf_to_owner_on_quantization_detection(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
         """``quantization == "gguf"`` (set by the GGUF engine integration for a
         .gguf) delegates the whole load to ``GGUFModelLoader`` (lazily imported)
@@ -909,12 +936,16 @@ class TestModelLifecycle:
             SimpleNamespace(GGUFModelLoader=_StubGGUFLoader),
         )
         monkeypatch.setattr(model_lifecycle, "mlx_lm_load", _fake_mlx_lm_load)
+        config_dir = tmp_path / "config"
+        tokenizer_dir = tmp_path / "tokenizer"
+        config_dir.mkdir()
+        tokenizer_dir.mkdir()
 
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
-                model="config-dir",
+                model=str(config_dir),
                 quantization="gguf",
-                tokenizer="tokenizer-dir",
+                tokenizer=str(tokenizer_dir),
                 model_weights="stub-model.gguf",
             )
         )
@@ -929,8 +960,8 @@ class TestModelLifecycle:
         assert len(loader_calls) == 1
         call = loader_calls[0]
         assert call["gguf_path"] == "stub-model.gguf"
-        assert call["config_dir"] == "config-dir"
-        assert call["tokenizer_dir"] == "tokenizer-dir"
+        assert call["config_dir"] == str(config_dir)
+        assert call["tokenizer_dir"] == str(tokenizer_dir)
         assert call["target_dtype"] is not None, (
             "lifecycle must derive target_dtype from runner.model_config.dtype "
             "and thread it to the owner"

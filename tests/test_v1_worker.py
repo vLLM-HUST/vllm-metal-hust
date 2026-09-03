@@ -12,6 +12,7 @@ import pytest
 pytest.importorskip("vllm", reason="vllm not installed")
 
 from tests.stub_runner import make_stub_runner  # noqa: E402
+from vllm_metal.config import AUTO_MEMORY_FRACTION, MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
 from vllm_metal.v1.cache_policy import (  # noqa: E402
@@ -25,8 +26,12 @@ from vllm_metal.v1.worker import MetalWorker  # noqa: E402
 def _make_worker(model_runner: object, *, use_paged_attention: bool) -> MetalWorker:
     worker = MetalWorker.__new__(MetalWorker)
     worker.model_runner = model_runner  # type: ignore[assignment]
-    worker.metal_config = SimpleNamespace(use_paged_attention=use_paged_attention)
-    worker.cache_config = SimpleNamespace(block_size=16)
+    worker.metal_config = MetalConfig(
+        memory_fraction=AUTO_MEMORY_FRACTION,
+        mlx_device="gpu",
+        use_paged_attention=use_paged_attention,
+    )
+    worker.cache_config = SimpleNamespace(block_size=16, gpu_memory_utilization=0.92)
     worker.vllm_config = SimpleNamespace(cache_config=worker.cache_config)
     return worker
 
@@ -162,6 +167,39 @@ class TestOneSequenceKvBytes:
         linear_bytes = 3 * (conv_bytes + recurrent_bytes)
         assert result == sdpa_bytes + linear_bytes
 
+    def test_hybrid_uses_padded_mamba_page_size_when_set(self) -> None:
+        # vLLM checks admission against the reported MambaSpec, whose page
+        # size is padded to align with attention pages. The one-sequence
+        # estimate must count the padded pages, or admission of a max-length
+        # sequence falls short by the padding on every linear layer.
+        padded_page = 4096
+        model_runner = make_stub_runner(
+            model_args={"full_attention_interval": 2},
+            num_sdpa_layers=8,
+            num_kv_heads=4,
+            head_dim=256,
+            kv_cache_dtype=mx.float16,
+            linear_conv_kernel_dim=3,
+            linear_conv_dim=5,
+            linear_num_v_heads=2,
+            linear_value_head_dim=7,
+            linear_key_head_dim=11,
+            num_linear_layers=3,
+            cache_config=SimpleNamespace(mamba_page_size_padded=padded_page),
+        )
+        worker = _make_worker(model_runner, use_paged_attention=False)
+        worker.model_config = SimpleNamespace(max_model_len=2048)
+        worker.vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=16)
+        )
+
+        # Act
+        result = MetalWorker._one_sequence_kv_bytes(worker)
+
+        # Assert — SDPA bytes + padded linear pages (not raw state bytes)
+        sdpa_bytes = 2 * 8 * 2048 * 4 * 256 * 2
+        assert result == sdpa_bytes + 3 * padded_page
+
     def test_linear_cache_bytes_uses_float32_recurrent(self) -> None:
         runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
         runner.model_args = {"full_attention_interval": 2}
@@ -279,7 +317,6 @@ class TestPagedAttentionPlanDiagnostics:
     ) -> WorkerCachePlanner:
         worker = _make_worker(model_runner, use_paged_attention=True)
         worker.cache_config.block_size = block_size
-        worker.metal_config.is_auto_memory = False
         worker.metal_config.memory_fraction = memory_fraction
         worker.get_cache_block_size_bytes = MagicMock(return_value=per_block_bytes)
         return WorkerCachePlanner(worker)
@@ -293,10 +330,11 @@ class TestPagedAttentionPlanDiagnostics:
             profile_run=MagicMock(return_value=3_900_000_000),
             validate_paged_attention_support=MagicMock(),
             scheduler_config=SimpleNamespace(max_num_seqs=2),
+            cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         worker = _make_worker(runner, use_paged_attention=True)
-        worker.metal_config.is_auto_memory = False
         worker.metal_config.memory_fraction = 0.5
         worker.get_cache_block_size_bytes = MagicMock(return_value=1)
         monkeypatch.setattr(
@@ -332,7 +370,9 @@ class TestPagedAttentionPlanDiagnostics:
         runner = SimpleNamespace(
             is_hybrid=True,
             scheduler_config=SimpleNamespace(max_num_seqs=256),
+            cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(
             runner,
@@ -372,7 +412,9 @@ class TestPagedAttentionPlanDiagnostics:
         runner = SimpleNamespace(
             is_hybrid=True,
             scheduler_config=SimpleNamespace(max_num_seqs=1),
+            cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(
             runner,
@@ -396,8 +438,51 @@ class TestPagedAttentionPlanDiagnostics:
         assert plan.hybrid_gdn_reservation.total_bytes == 64_400_000
         assert plan.num_blocks == 34
 
+    def test_align_plan_budgets_one_old_physical_pool_for_growth(
+        self, monkeypatch
+    ) -> None:
+        runner = SimpleNamespace(
+            is_hybrid=True,
+            cache_config=SimpleNamespace(mamba_cache_mode="align"),
+            num_layers=24,
+            sdpa_layer_indices=list(range(6)),
+            # 18 logical GDN layers at 100 bytes per layer/slot. Striping
+            # produces six physical pools: 600 steady bytes per block plus
+            # one 100-byte old pool retained during growth.
+            linear_cache_bytes_per_slot=MagicMock(return_value=1_800),
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
+        )
+        planner = self._make_planner(
+            runner,
+            memory_fraction=1.0,
+            per_block_bytes=100,
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "_metal_limit_bytes",
+            lambda self: 10_000,
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "get_model_memory_usage",
+            lambda self: 1_000,
+        )
+
+        plan = planner._paged_attention_plan(
+            overhead=1_000,
+            require_min_blocks=False,
+        )
+
+        assert plan.per_block_bytes == 800
+        assert plan.hybrid_gdn_reservation.total_bytes == 0
+        assert plan.kv_budget == 8_000
+        assert plan.num_blocks == 10
+
     def test_non_hybrid_oom_error_omits_gdn_reservation(self, monkeypatch) -> None:
-        runner = SimpleNamespace(is_hybrid=False)
+        runner = SimpleNamespace(
+            is_hybrid=False,
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
+        )
         planner = self._make_planner(runner, memory_fraction=0.1)
         monkeypatch.setattr(
             WorkerCachePlanner,
@@ -418,3 +503,30 @@ class TestPagedAttentionPlanDiagnostics:
         assert "kv_budget_before_hybrid" not in message
         assert "--max-num-seqs" not in message
         assert "kv_budget=-1.10GB" in message
+
+    @pytest.mark.parametrize(
+        "is_auto, memory_fraction, gpu_mem_util, expected_fraction",
+        [
+            pytest.param(True, -1.0, 0.92, 0.92, id="auto_uses_vllm_default"),
+            pytest.param(True, -1.0, 0.5, 0.5, id="auto_uses_vllm_flag"),
+            pytest.param(False, 0.5, 0.7, 0.5, id="metal_env_wins"),
+        ],
+    )
+    def test_memory_fraction_precedence(
+        self,
+        is_auto: bool,
+        memory_fraction: float,
+        gpu_mem_util: float,
+        expected_fraction: float,
+    ) -> None:
+        worker = _make_worker(
+            SimpleNamespace(is_hybrid=False), use_paged_attention=True
+        )
+        worker.metal_config.memory_fraction = (
+            AUTO_MEMORY_FRACTION if is_auto else memory_fraction
+        )
+        worker.cache_config.gpu_memory_utilization = gpu_mem_util
+
+        fraction = WorkerCachePlanner(worker)._memory_fraction()
+
+        assert fraction == expected_fraction

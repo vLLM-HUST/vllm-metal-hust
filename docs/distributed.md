@@ -38,7 +38,7 @@ ray stop
 
 If a node isn't advertising the `mlx` resource, the engine can't place workers: the Ray executor logs `No available node types can fulfill resource request {'mlx': 1.0, ...}` and hangs while creating the placement group. (A separate `current platform cpu does not support ray` error instead means the Metal plugin isn't active or `ray_device_key` is unset — not a missing resource.)
 
-On a healthy boot, each worker logs `vllm_metal: patched Ray V2 worker get_node_and_gpu_ids on RayWorkerProc (Apple-GPU custom Ray resource)` — confirming the custom-resource override fired inside the Ray actor.
+On a healthy boot, each worker logs `vllm_metal: patched Ray V2 worker get_node_and_physical_gpu_ids on RayWorkerProc (Apple-GPU custom Ray resource)` — confirming the custom-resource override fired inside the Ray actor.
 
 ## Quick start (two Macs over Thunderbolt)
 
@@ -114,14 +114,14 @@ curl -s http://10.0.0.1:8000/v1/completions -H 'Content-Type: application/json' 
   -d '{"model":"Qwen/Qwen3-0.6B","prompt":"The capital of France is","max_tokens":16,"temperature":0}'
 ```
 
-Tear down with `ray stop` on **both** Macs, then revert the bridge: `sudo networksetup -setdhcp "Thunderbolt Bridge"`. Once the small model works end to end, try larger models across the two Macs (each stage still loads the full model first — see [Limitations](#limitations)).
+Tear down with `ray stop` on **both** Macs, then revert the bridge: `sudo networksetup -setdhcp "Thunderbolt Bridge"`. Once the small model works end to end, try larger models across the two Macs.
 
 `VLLM_HOST_IP` is the load-bearing piece: it makes vLLM's `get_ip()` return the Thunderbolt address, so the cross-stage hand-off forms over the cable.
 
 ## How it works
 
 - `MetalPlatform` sets `ray_device_key = "mlx"` and `device_control_env_var = "VLLM_METAL_VISIBLE_DEVICES"`, so vLLM's Ray executor takes its generic custom-resource placement path (the same one TPU uses) instead of the CUDA `num_gpus` path.
-- A compatibility shim overrides the Ray worker's `get_node_and_gpu_ids` to read the assigned `mlx` resource — Ray never lists custom resources in `get_accelerator_ids()` — installed in each worker via a Ray `worker_process_setup_hook`.
+- A compatibility shim overrides the Ray worker's `get_node_and_physical_gpu_ids` to read the assigned `mlx` resource — Ray never lists custom resources in `get_accelerator_ids()` — installed in each worker via a Ray `worker_process_setup_hook`.
 
 ## Pipeline parallelism
 
@@ -158,7 +158,7 @@ mlx.launch -n 2 --backend ring tools/pp_parity_check.py Qwen/Qwen3-0.6B
 
 ## Limitations
 
-- **Peak memory = full model per node.** Each stage loads the whole model before dropping its non-owned layers, so Phase 0 splits compute, not load-time memory — it can't serve a model too large for one Mac.
+- **Checkpoint loading.** PP lazily slices MLX-LM safetensors; AWQ and GGUF are rejected because their loaders materialize the full model before slicing.
 - **Co-located stages oversubscribe the KV budget.** Each stage applies `VLLM_METAL_MEMORY_FRACTION` to the whole device independently — neither knows the other exists — so two stages on one Mac claim roughly twice the fraction. Lower it when stacking. Separate Macs are unaffected.
 - **Synchronous scheduling required.** Run with `--no-async-scheduling` (the engine fails loud otherwise).
 - **TP=1 only.** PP+TP is rejected; tensor parallelism (`--tensor-parallel-size > 1`) is not implemented.
@@ -187,7 +187,7 @@ RAY_ADDRESS=auto VLLM_HOST_IP=10.0.0.1 VLLM_METAL_MEMORY_FRACTION=0.5 \
 - `--data-parallel-size-local 1`: one Apple GPU per Mac means one replica per node.
 - `--data-parallel-address <head-ip>`: pin the DP master to the Ray head's IP so placement finds it. The Ray DP backend otherwise follows `get_ip()` / `VLLM_HOST_IP`, so set it explicitly to avoid a mismatch.
 
-On a healthy boot each Mac logs `patched Ray V2 worker get_node_and_gpu_ids ...` and an `EngineCore` actor is placed on each node IP.
+On a healthy boot each Mac logs `patched Ray V2 worker get_node_and_physical_gpu_ids ...` and an `EngineCore` actor is placed on each node IP.
 
 **Design.** vLLM owns the whole DP control plane (replica placement, the DP coordinator, the request load balancer); `MetalPlatform` only relaxes admission to the supported shape. One Metal-specific detail: Ray honours a `worker_process_setup_hook` only from the **job** runtime_env (`ray.init`), and the DP engine manager connects to Ray without forwarding it — so vllm-metal registers the Apple-GPU worker patch at the job level itself before the engine connects (`MetalPlatform._register_dp_ray_worker_setup_hook`); otherwise the per-replica `RayWorkerProc` would `KeyError` on the custom `mlx` resource.
 

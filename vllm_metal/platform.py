@@ -2,12 +2,13 @@
 """Metal Platform implementation for vLLM."""
 
 import logging
+import os
 import platform as py_platform
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import psutil
 import torch
-from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
+from vllm.platforms.interface import Platform, PlatformEnum
 
 import vllm_metal.envs as envs
 from vllm_metal.config import get_config
@@ -21,6 +22,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Large command buffers cut per-step decode commit overhead but inflate the
+# transient profile peak that profile_run charges against the KV budget, so
+# the default applies only where its measured overhead stays a small share of
+# the usable budget, and never for #585's large-batch shape. Measurements in
+# PR #637.
+_MB_BUFFER_DEFAULT = "2000"
+_MB_BUFFER_MIN_USABLE_GIB = 90
+_MB_BUFFER_MAX_BATCHED_TOKENS = 4096
+# Only the local executors share this process's memory and inherit its
+# environment; Ray workers must not receive a driver-derived value.
+_MB_BUFFER_LOCAL_BACKENDS = ("uni", "mp")
+
+
+def _pick_mb_buffer_default(
+    *,
+    total_memory_bytes: int,
+    memory_fraction: float,
+    max_num_batched_tokens: int,
+    executor_backend: str | None,
+) -> str | None:
+    """Return the ``MLX_MAX_MB_PER_BUFFER`` default for this shape, or ``None``."""
+    if executor_backend not in _MB_BUFFER_LOCAL_BACKENDS:
+        return None
+    if max_num_batched_tokens > _MB_BUFFER_MAX_BATCHED_TOKENS:
+        return None
+    usable_gib = total_memory_bytes / (1 << 30) * memory_fraction
+    if usable_gib >= _MB_BUFFER_MIN_USABLE_GIB:
+        return _MB_BUFFER_DEFAULT
+    return None
+
+
 class MetalPlatform(Platform):
     """Platform implementation for Apple Silicon Metal/MLX.
 
@@ -32,6 +64,11 @@ class MetalPlatform(Platform):
     device_name: str = "cpu"  # PyTorch device name (use CPU for compatibility)
     device_type: str = "cpu"  # PyTorch device type (use CPU for compatibility)
     dispatch_key: str = "CPU"  # PyTorch dispatch key
+
+    # The MLX_MAX_MB_PER_BUFFER value this plugin installed, or ``None`` —
+    # distinguishes a plugin default from a user export so reconfiguration
+    # recomputes instead of sticking (#585 shape via a second engine).
+    _mb_default_installed: ClassVar[str | None] = None
 
     # --- Ray distributed executor support (Phase 1) ---
     # Advertise the Apple GPU as a custom Ray resource named "mlx".  Because this
@@ -132,21 +169,6 @@ class MetalPlatform(Platform):
             return False
 
     @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
-        """Get device compute capability.
-
-        Returns a fake capability for compatibility with CUDA-centric code.
-
-        Args:
-            device_id: Device index (ignored)
-
-        Returns:
-            DeviceCapability with (major, minor) version
-        """
-        # Return a reasonable value for compatibility
-        return DeviceCapability(major=8, minor=0)
-
-    @classmethod
     def get_device_count(cls) -> int:
         """Get number of available devices.
 
@@ -175,13 +197,12 @@ class MetalPlatform(Platform):
             raise ValueError(msg)
 
         config = get_config()
-        if config.use_mlx:
-            import mlx.core as mx
+        import mlx.core as mx
 
-            device_type = (
-                mx.DeviceType.gpu if config.mlx_device == "gpu" else mx.DeviceType.cpu
-            )
-            mx.set_default_device(mx.Device(device_type))
+        device_type = (
+            mx.DeviceType.gpu if config.mlx_device == "gpu" else mx.DeviceType.cpu
+        )
+        mx.set_default_device(mx.Device(device_type))
 
     @classmethod
     def current_device(cls) -> int:
@@ -219,6 +240,34 @@ class MetalPlatform(Platform):
         import mlx.core as mx
 
         mx.random.seed(seed)
+
+    @classmethod
+    def validate_request(cls, processed_inputs: object, params: object) -> None:
+        """Reject request options that Metal cannot apply correctly."""
+        # Keep this import out of module scope: platform discovery imports this
+        # module before vLLM finishes selecting the active platform.
+        from vllm.exceptions import VLLMValidationError
+        from vllm.sampling_params import SamplingParams
+
+        if not isinstance(params, SamplingParams):
+            return
+
+        unsupported_controls = [
+            name
+            for name, enabled in (
+                ("min_p", params.min_p > 0.0),
+                ("logit_bias", bool(params.logit_bias)),
+                ("min_tokens", params.min_tokens > 0),
+            )
+            if enabled
+        ]
+        if unsupported_controls:
+            controls = ", ".join(unsupported_controls)
+            raise VLLMValidationError(
+                "vllm-metal does not support sampling controls backed by "
+                f"vLLM logits processors ({controls}).",
+                parameter=unsupported_controls[0],
+            )
 
     @classmethod
     def get_torch_device(cls, device_id: int = 0) -> torch.device:
@@ -274,8 +323,9 @@ class MetalPlatform(Platform):
         manager connects to Ray without forwarding ``parallel_config.ray_runtime_env``
         to ``ray.init`` (see ``vllm/v1/engine/utils.py``), so the hook wired into
         ``ray_runtime_env`` for the single-stage Ray executor never reaches the
-        per-replica ``RayWorkerProc`` workers, and ``get_node_and_gpu_ids`` would
-        ``KeyError`` on the custom "mlx" resource. We initialize Ray ourselves with
+        per-replica ``RayWorkerProc`` workers, and
+        ``get_node_and_physical_gpu_ids`` would ``KeyError`` on the custom "mlx"
+        resource. We initialize Ray ourselves with
         the hook in the job runtime_env before the engine connects; the engine's
         later ``ray.init`` reuses this session.
 
@@ -331,14 +381,19 @@ class MetalPlatform(Platform):
         Args:
             vllm_config: vLLM configuration object
         """
+        from vllm_metal.compat import ensure_vllm_bytelevel_tokenizer_patch
+
+        # Retry after vLLM is fully imported, before serving tokenizers are built.
+        ensure_vllm_bytelevel_tokenizer_patch()
+
         config = get_config()
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
 
         # Apply TurboQuant config from --additional-config
         # Example: --additional-config '{"turboquant": true, "k_quant": "q4_0"}'
-        add = getattr(vllm_config, "additional_config", None) or {}
-        if add.get("turboquant"):
+        add = vllm_config.additional_config
+        if isinstance(add, dict) and add.get("turboquant"):
             config.turboquant = True
             config.k_quant = add.get("k_quant", "q8_0")
             config.v_quant = add.get("v_quant", "q3_0")
@@ -348,8 +403,7 @@ class MetalPlatform(Platform):
                 f"k_quant={config.k_quant}, v_quant={config.v_quant}"
             )
 
-        if config.debug:
-            logger.info(f"Metal config: {config}")
+        logger.debug("Metal config: %s", config)
 
         # Set worker class for Metal
         if parallel_config.worker_cls == "auto":
@@ -382,7 +436,7 @@ class MetalPlatform(Platform):
             )
         elif parallel_config.distributed_executor_backend == "ray":
             # Apple GPUs are not a Ray accelerator family, so the Ray worker
-            # actor's get_node_and_gpu_ids would KeyError on
+            # actor's get_node_and_physical_gpu_ids would KeyError on
             # get_accelerator_ids()[ray_device_key].  Install our override (see
             # vllm_metal.compat._patch_ray_distributed) in every Ray worker via a
             # worker_process_setup_hook, which runs at worker startup before the
@@ -396,6 +450,102 @@ class MetalPlatform(Platform):
 
         # Disable features not supported on Metal
         parallel_config.disable_custom_all_reduce = True
+
+        # Upstream aligns block sizes across heterogeneous KV dtypes inside
+        # update_block_size_for_backend, which would rewrite the block size behind
+        # Metal's own TurboQuant sizing. Reject at config time rather than fail
+        # inside a spawned worker. Metal's TurboQuant runs off --additional-config,
+        # which leaves this empty.
+        if vllm_config.cache_config.kv_cache_dtype_skip_layers:
+            raise NotImplementedError(
+                "vllm-metal does not support heterogeneous KV cache dtypes "
+                "(--kv-cache-dtype-skip-layers, or --kv-cache-dtype turboquant_*, "
+                "which populates skip layers upstream). Enable TurboQuant with "
+                "--additional-config '{\"turboquant\": true}' instead."
+            )
+
+        # Upstream skips verify_equal_vocab_size_if_draft_model() when this is set,
+        # so a draft model with a different vocabulary reaches the proposer, which
+        # verifies draft ids against the target vocabulary with no mapping.
+        speculative_config = vllm_config.speculative_config
+        if (
+            speculative_config is not None
+            and speculative_config.use_heterogeneous_vocab
+        ):
+            raise NotImplementedError(
+                "vllm-metal does not support speculative decoding with a "
+                "heterogeneous draft vocabulary (use_heterogeneous_vocab). Use a "
+                "draft model that shares the target vocabulary."
+            )
+
+        # Upstream's scheduler pads a newly admitted decode request to the uniform
+        # speculative width, then still clips it to long_prefill_token_threshold,
+        # leaving num_speculative_tokens placeholder drafts against fewer scheduled
+        # tokens; its own num_computed_tokens accounting drifts on that handoff.
+        if (
+            speculative_config is not None
+            and 0
+            < vllm_config.scheduler_config.long_prefill_token_threshold
+            < 1 + speculative_config.num_speculative_tokens
+        ):
+            raise NotImplementedError(
+                "vllm-metal does not support speculative decoding with "
+                "--long-prefill-token-threshold below the speculative width: the "
+                "scheduler clips a padded decode request below its placeholder "
+                "draft count. Raise the threshold to at least "
+                "1 + num_speculative_tokens, or leave it unset."
+            )
+
+        # All three Metal proposers (draft-model, MTP, n-gram) hand drafts back
+        # to the scheduler synchronously via take_draft_token_ids(), so async
+        # scheduling cannot serve speculative decoding. vLLM 0.28.0 auto-enables
+        # async scheduling for draft-model SD (vllm#48341); restore the working
+        # default, the same downgrade shape as the STT scheduler policy.
+        if (
+            speculative_config is not None
+            and vllm_config.scheduler_config.async_scheduling
+        ):
+            vllm_config.scheduler_config.async_scheduling = False
+            logger.warning(
+                "Speculative decoding on Metal requires synchronous "
+                "scheduling; disabled async_scheduling."
+            )
+
+        if model_config is not None and model_config.is_hybrid:
+            cache_config = vllm_config.cache_config
+            if cache_config.mamba_ssm_cache_dtype == "auto":
+                cache_config.mamba_ssm_cache_dtype = "float32"
+            elif cache_config.mamba_ssm_cache_dtype != "float32":
+                raise NotImplementedError(
+                    "Hybrid GDN models on Metal require "
+                    "--mamba-ssm-cache-dtype float32 because recurrent state is "
+                    "stored in fp32."
+                )
+            if cache_config.mamba_cache_mode == "all":
+                # Before the downgrades below, which overwrite the mode: an
+                # explicit --mamba-cache-mode all must fail fast on every path.
+                raise NotImplementedError(
+                    "mamba_cache_mode='all' is not supported for hybrid GDN "
+                    "models on Metal (nor upstream, which falls back to "
+                    "'align' for models without SupportsMambaPrefixCaching). "
+                    "Use align mode: --enable-prefix-caching resolves to it."
+                )
+            if cache_config.enable_prefix_caching and not config.use_paged_attention:
+                cls._disable_hybrid_prefix_caching(
+                    vllm_config,
+                    "the non-paged MLX path (VLLM_METAL_USE_PAGED_ATTENTION=0) "
+                    "has no block-indexed state to restore from",
+                )
+            if (
+                cache_config.enable_prefix_caching
+                and vllm_config.speculative_config is not None
+            ):
+                cls._disable_hybrid_prefix_caching(
+                    vllm_config,
+                    "draft-state rollback across mamba state blocks "
+                    "(num_speculative_blocks) is not implemented for "
+                    "speculative decoding",
+                )
 
         # Pipeline parallelism is supported on Metal/MLX: each stage runs in its
         # own worker process and the inter-stage activations cross the
@@ -441,7 +591,7 @@ class MetalPlatform(Platform):
         # installed above covers it unchanged. We only relax admission: allow that
         # validated dense-DP-over-Ray shape and fail fast on every other DP
         # combination this reachability newly admits (guard-widening audit).
-        if getattr(parallel_config, "data_parallel_size", 1) > 1:
+        if parallel_config.data_parallel_size > 1:
             # MoE DP routes to DPMoEEngineCoreActor + an expert-parallel all-to-all
             # that mx.distributed has no equivalent for; only dense DP is validated.
             if model_config is not None and model_config.is_moe:
@@ -560,7 +710,7 @@ class MetalPlatform(Platform):
                 "remove --enable-lora or run with pipeline_parallel_size=1."
             )
 
-        if getattr(scheduler_config, "enable_chunked_prefill", False):
+        if scheduler_config.enable_chunked_prefill:
             if config.use_paged_attention:
                 # The paged path uses a unified varlen Metal kernel that
                 # handles mixed prefill + decode in a single forward pass,
@@ -613,7 +763,7 @@ class MetalPlatform(Platform):
             # model served on the text-only backbone (multimodal_config cleared by
             # the adapter) is not wrongly rejected — only a genuine multimodal model.
             if (
-                getattr(parallel_config, "data_parallel_size", 1) > 1
+                parallel_config.data_parallel_size > 1
                 and model_config.multimodal_config is not None
             ):
                 raise NotImplementedError(
@@ -642,7 +792,7 @@ class MetalPlatform(Platform):
                     "Pipeline parallelism (pipeline_parallel_size > 1) is not "
                     "supported for speech-to-text models."
                 )
-            if getattr(parallel_config, "data_parallel_size", 1) > 1:
+            if parallel_config.data_parallel_size > 1:
                 raise NotImplementedError(
                     "Data parallelism (data_parallel_size > 1) is not "
                     "supported for speech-to-text models."
@@ -653,13 +803,33 @@ class MetalPlatform(Platform):
                 logger.info("STT: disabled async_scheduling")
             logger.info("STT model detected")
 
+        # The text AWQ and GGUF loaders materialize the full checkpoint before
+        # stage slicing. Multimodal and STT models take different loader paths.
+        if (
+            parallel_config.pipeline_parallel_size > 1
+            and model_config is not None
+            and model_config.multimodal_config is None
+            and model_config.quantization in ("auto_awq", "gguf")
+        ):
+            raise NotImplementedError(
+                "Pipeline parallelism does not support AWQ or GGUF checkpoints "
+                "because their loaders materialize the complete model on every "
+                "stage before stage slicing. Use "
+                "pipeline_parallel_size=1 or an MLX-LM safetensors checkpoint."
+            )
+
         # Data parallelism passed every admission guard above (including the
         # multimodal and STT rejections). Only now — after all fail-fasts, before
         # the engine connects — register the Apple-GPU worker patch at the Ray job
         # level so it reaches the per-replica RayWorkerProc workers (the
         # executor-level ray_runtime_env hook does not propagate on the DP path).
-        if getattr(parallel_config, "data_parallel_size", 1) > 1:
+        if parallel_config.data_parallel_size > 1:
             cls._register_dp_ray_worker_setup_hook(parallel_config.ray_runtime_env)
+
+        # Last, after every fail-fast: default the MLX command-buffer memory
+        # limit where the memory trade is safe (policy on the class constants
+        # above; spawned engine workers inherit the environment).
+        cls._default_mb_per_buffer(vllm_config)
 
         # Log memory configuration
         total_mem = cls.get_device_total_memory()
@@ -668,6 +838,43 @@ class MetalPlatform(Platform):
             f"Metal memory: {total_mem / 1e9:.1f}GB total, "
             f"{available_mem / 1e9:.1f}GB available"
         )
+
+    @staticmethod
+    def _disable_hybrid_prefix_caching(vllm_config: "VllmConfig", reason: str) -> None:
+        """Downgrade default-on prefix caching for a hybrid GDN model.
+
+        vLLM 0.28.0 enables prefix caching by default for hybrid models
+        (vllm#50991) and resolves ``mamba_cache_mode``/``mamba_block_size``
+        for the APC-on case before this platform hook runs. For hybrid
+        combinations Metal cannot serve, restore the APC-off resolution
+        (``mamba_cache_mode='none'``, ``mamba_block_size=max_model_len``)
+        the way upstream's ``MambaModelConfig.verify_and_update_config``
+        else-branch would have, instead of failing a default launch.
+        """
+        cache_config = vllm_config.cache_config
+        if cache_config.user_specified_mamba_block_size:
+            # --mamba-block-size requires prefix caching (upstream's
+            # validate_mamba_block_size rejects it once APC is off), so the
+            # user's two explicit choices conflict; fail with the Metal
+            # constraint before upstream's misleading error fires.
+            raise NotImplementedError(
+                "Prefix caching for hybrid GDN models on Metal cannot serve "
+                f"this configuration ({reason}), and --mamba-block-size "
+                "requires prefix caching. Drop --mamba-block-size or the "
+                "conflicting option."
+            )
+        logger.warning(
+            "Disabling prefix caching for this hybrid GDN model: %s. "
+            "(vLLM enables prefix caching by default for hybrid models; "
+            "pass --no-enable-prefix-caching to make this explicit.)",
+            reason,
+        )
+        cache_config.enable_prefix_caching = False
+        cache_config.mamba_cache_mode = "none"
+        # Restore upstream's APC-off resolution; validate_mamba_block_size
+        # (a pydantic after-validator, so it runs after this hook) rejects
+        # any other value once prefix caching is off.
+        cache_config.mamba_block_size = vllm_config.model_config.max_model_len
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
@@ -691,6 +898,43 @@ class MetalPlatform(Platform):
         return MetalBackend
 
     @classmethod
+    def _default_mb_per_buffer(cls, vllm_config: "VllmConfig") -> None:
+        """Install or remove the plugin's MB-per-buffer default.
+
+        A manual export always wins. The plugin's own previously installed
+        default is recomputed for the new config and removed when the new
+        shape does not qualify, so a later engine cannot inherit a stale
+        value (#585 shape). Known limit: a process whose MLX is already
+        initialized (in-process engines) keeps MLX's earlier setting.
+        """
+        current = os.environ.get("MLX_MAX_MB_PER_BUFFER")
+        if current is not None and current != cls._mb_default_installed:
+            return
+        desired = _pick_mb_buffer_default(
+            total_memory_bytes=psutil.virtual_memory().total,
+            memory_fraction=get_config().effective_memory_fraction(
+                vllm_config.cache_config.gpu_memory_utilization
+            ),
+            max_num_batched_tokens=(
+                vllm_config.scheduler_config.max_num_batched_tokens
+            ),
+            executor_backend=(vllm_config.parallel_config.distributed_executor_backend),
+        )
+        if desired is None:
+            if current is not None:
+                del os.environ["MLX_MAX_MB_PER_BUFFER"]
+            cls._mb_default_installed = None
+            return
+        if desired != current:
+            os.environ["MLX_MAX_MB_PER_BUFFER"] = desired
+            logger.info(
+                "Metal: defaulting MLX_MAX_MB_PER_BUFFER=%s "
+                "(export it explicitly to override).",
+                desired,
+            )
+        cls._mb_default_installed = desired
+
+    @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
         """Update block_size for Metal platform.
 
@@ -700,7 +944,13 @@ class MetalPlatform(Platform):
         a hybrid model, explaining the cache-block-size translation mechanism
         (PR #235).
         """
+        from vllm_metal.compat import ensure_vllm_auto_fit_null_block_patch
         from vllm_metal.config import get_config
+
+        # Runs in the engine process after vLLM is fully imported, right before
+        # KV sizing: the reliable spot to (re-)install the auto-fit null-block
+        # patch that plugin activation may have skipped mid-import.
+        ensure_vllm_auto_fit_null_block_patch()
 
         metal_config = get_config()
         model_config = vllm_config.model_config
@@ -747,7 +997,117 @@ class MetalPlatform(Platform):
         # (``_align_hybrid_block_size``) handles hybrid alignment. The kernel
         # layer (``_pick_kernel_block_size``) validates the final
         # ``block_size`` at request time.
+        cache_config = vllm_config.cache_config
+        user_block_size = (
+            cache_config.block_size if cache_config.user_specified_block_size else None
+        )
+        hash_block_size = cache_config.prefix_match_unit
         super().update_block_size_for_backend(vllm_config)
+
+        cls._realign_hybrid_block_size_for_turboquant(
+            vllm_config,
+            user_block_size=user_block_size,
+            hash_block_size=hash_block_size,
+        )
+
+    @classmethod
+    def _realign_hybrid_block_size_for_turboquant(
+        cls,
+        vllm_config: "VllmConfig",
+        *,
+        user_block_size: int | None,
+        hash_block_size: int | None,
+    ) -> None:
+        """Redo hybrid alignment with TurboQuant's packed SDPA page size."""
+        metal_config = get_config()
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+
+        turboquant = metal_config.turboquant
+        k_quant = metal_config.k_quant
+        v_quant = metal_config.v_quant
+
+        if (
+            not turboquant
+            or not metal_config.use_paged_attention
+            or not model_config
+            or not model_config.is_hybrid
+        ):
+            return
+
+        from math import lcm
+
+        from vllm.model_executor.models import ModelRegistry
+        from vllm.utils.math_utils import cdiv
+        from vllm.v1.attention.backend import MultipleOf
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        from vllm_metal.v1.cache_policy import turboquant_page_size_bytes
+
+        model_cls, _ = ModelRegistry.resolve_model_cls(
+            model_config.architecture,
+            model_config=model_config,
+        )
+        mamba_page_size = MambaSpec(
+            shapes=model_cls.get_mamba_state_shape_from_config(vllm_config),
+            dtypes=model_cls.get_mamba_state_dtype_from_config(vllm_config),
+            block_size=-1,
+        ).page_size_bytes
+        if mamba_page_size == 0:
+            return
+
+        tq_page_size_1_token = turboquant_page_size_bytes(
+            block_size=1,
+            num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
+            head_dim=model_config.get_head_size(),
+            k_quant=k_quant,
+            v_quant=v_quant,
+        )
+
+        backend_cls = cls._find_non_ssm_backend(vllm_config)
+        assert backend_cls is not None
+        backend_block_alignment_size = min(
+            s.base if isinstance(s, MultipleOf) else s
+            for s in backend_cls.get_supported_kernel_block_sizes()
+        )
+        kernel_block_alignment_size = lcm(
+            backend_block_alignment_size,
+            user_block_size or 1,
+            hash_block_size or 1,
+        )
+
+        attn_block_size = kernel_block_alignment_size * cdiv(
+            mamba_page_size,
+            kernel_block_alignment_size * tq_page_size_1_token,
+        )
+
+        if cache_config.block_size < attn_block_size:
+            logger.info(
+                "TurboQuant hybrid alignment: attention block size %s -> %d "
+                "tokens so the packed attention page (%d B/token) still "
+                "covers the mamba page (%d B).",
+                cache_config.block_size,
+                attn_block_size,
+                tq_page_size_1_token,
+                mamba_page_size,
+            )
+            cache_config.block_size = attn_block_size
+
+        # vLLM pins mamba_block_size = block_size under align mode before this
+        # hook runs; re-sync it after the TurboQuant realign grows the block
+        # size, or the hybrid KV coordinator's divisibility asserts fail at
+        # startup (mirrors upstream's own re-sync in
+        # Platform.update_block_size_for_backend).
+        if cache_config.mamba_cache_mode == "align":
+            cache_config.mamba_block_size = cache_config.block_size
+
+        # Pad mamba page size to exactly match the packed attention page.
+        attn_page_size = cache_config.block_size * tq_page_size_1_token
+        assert attn_page_size >= mamba_page_size
+        if attn_page_size == mamba_page_size:
+            cache_config.mamba_page_size_padded = None
+            return
+        cache_config.mamba_page_size_padded = attn_page_size
 
     @classmethod
     def get_attn_backend_cls(
@@ -770,21 +1130,6 @@ class MetalPlatform(Platform):
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on Metal/MLX.")
         return AttentionBackendEnum.CPU_ATTN.get_path()
-
-    @classmethod
-    def verify_quantization(cls, quant: str) -> None:
-        """Verify that quantization method is supported.
-
-        Args:
-            quant: Quantization method name
-
-        Raises:
-            ValueError: If quantization is not supported
-        """
-        # Allow all quantization methods to pass through - actual support
-        # depends on the model implementation. This avoids blocking models
-        # that use quantization formats we may be able to handle.
-        pass
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:

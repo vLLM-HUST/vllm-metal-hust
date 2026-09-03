@@ -23,8 +23,6 @@ from vllm.v1.outputs import DraftTokenIds
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
-    from vllm.v1.sample.logits_processor import LogitsProcessors
-
     from vllm_metal.v1.model_runner import (
         MetalModelRunner,
         PrefillRequest,
@@ -53,15 +51,16 @@ class ProposeContext:
     cu_seqlens: Sequence[int]
     num_decode_segments: int
     num_speculative_tokens: int
-    logitsprocs: LogitsProcessors | None
+    # Request ids the scheduler finished this step. vLLM can hand a finished
+    # id straight back out to a new request in the same step, so a proposer
+    # that keeps its own per-request state must clear against this, not
+    # against absence from request_states (which the new request repopulates
+    # under the same id).
+    finished_req_ids: set[str]
 
 
 class MetalProposer(Protocol):
-    """Uniform drafting seam.
-
-    Implementations: :class:`Gemma4MTPProposer`, and (draft-model SD) a
-    ``DraftModelProposer``.
-    """
+    """Uniform drafting seam."""
 
     def needs_target_hidden_states(
         self,
@@ -74,6 +73,16 @@ class MetalProposer(Protocol):
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         """Return per-request draft tokens for the next step, or ``None``."""
+        ...
+
+    def release_requests(self, req_ids: set[str]) -> None:
+        """Release any per-request drafter state for these evicted/preempted ids.
+
+        Called from the runner's lifecycle reconcile on eviction, preemption, and
+        resume. A proposer that pins a bounded per-request resource (draft cache
+        blocks) must release it here rather than hold it while the request waits;
+        a stateless proposer is a no-op.
+        """
         ...
 
 
@@ -95,14 +104,15 @@ class Gemma4MTPProposer:
         *,
         has_final_prefill: bool,
     ) -> bool:
-        # Delegate to the controller (single source of truth, method-keyed):
-        # the assistant consumes the previous target step's hidden states.
-        runner = self._runner
-        return runner._spec_decode_controller.needs_target_hidden_states(
-            decode_segments,
-            has_final_prefill=has_final_prefill,
-            speculative_config=runner.vllm_config.speculative_config,
-        )
+        # The assistant consumes the previous target step's hidden states for
+        # decode and final-prefill rows; intermediate prefill chunks never
+        # sample, so they cannot seed a draft.
+        return bool(decode_segments) or has_final_prefill
+
+    def release_requests(self, req_ids: set[str]) -> None:
+        # The assistant reads the target's paged KV (released by the runtime);
+        # the proposer holds no per-request state of its own.
+        del req_ids
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         if ctx.num_speculative_tokens <= 0:
@@ -127,17 +137,18 @@ class Gemma4MTPProposer:
             request_states=ctx.request_states,
             cu_seqlens=ctx.cu_seqlens,
             num_decode_segments=ctx.num_decode_segments,
-            logitsprocs=ctx.logitsprocs,
         )
         if not seeds:
             return None
 
-        input_ids = mx.array([[seed.token_id for seed in seeds]], dtype=mx.int32)
-        target_input_embeddings = runner._target_input_embeddings(input_ids)
         draft_token_ids = assistant.propose_draft_token_ids(
             seeds=seeds,
             target_hidden_states=ctx.target_hidden_states,
-            target_input_embeddings=target_input_embeddings,
+            # Each recurrence step embeds its own drafted token, so the
+            # runtime needs the target's backbone-width table, not one
+            # pre-computed row block.
+            embed_target_tokens=runner._target_input_embeddings,
+            num_speculative_tokens=ctx.num_speculative_tokens,
         )
         if not draft_token_ids:
             return None

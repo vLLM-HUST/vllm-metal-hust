@@ -170,13 +170,6 @@ def test_can_wrap_qlora_rejects_non_unary_quantized_projection() -> None:
 # MLXQuantizedLinearWithLoRA wrapper
 
 
-def test_qlora_wrapper_infers_dims_from_quantized_linear() -> None:
-    ql = _make_quantized_linear(128, 64)
-    w = MLXQuantizedLinearWithLoRA(ql, max_loras=2, max_lora_rank=4, dtype=mx.float32)
-    assert w.input_size == 128
-    assert w.output_size == 64
-
-
 def test_qlora_wrapper_preserves_quantized_projection_surface() -> None:
     ql = _make_quantized_linear(128, 64, bias=True)
     w = MLXQuantizedLinearWithLoRA(ql, max_loras=2, max_lora_rank=4, dtype=mx.float32)
@@ -197,24 +190,12 @@ def test_qlora_wrapper_preserves_quantized_projection_surface() -> None:
     assert "bias" not in wrapped_param_names
 
 
-@pytest.mark.parametrize(
-    "lora_a_shape,lora_b_shape,err_match",
-    [
-        ((2, 99), (64, 2), "QLoRA weight shape mismatch"),  # in_dim mismatch
-        ((5, 128), (64, 5), "exceeds max_lora_rank"),  # rank > max
-        ((2, 3, 1), (64, 2), "must be 2-D"),  # A not 2-D
-        ((2, 128), (64, 2, 1), "must be 2-D"),  # B not 2-D
-        ((2, 128), (64, 3), "does not match B rank"),  # A rank != B rank
-    ],
-)
-def test_qlora_wrapper_rejects_bad_weights(
-    lora_a_shape, lora_b_shape, err_match
-) -> None:
+def test_qlora_wrapper_uses_shared_weight_validation_label() -> None:
     ql = _make_quantized_linear(128, 64)
     w = MLXQuantizedLinearWithLoRA(ql, max_loras=1, max_lora_rank=4, dtype=mx.float32)
-    a = mx.array(np.ones(lora_a_shape, dtype=np.float32))
-    b = mx.array(np.ones(lora_b_shape, dtype=np.float32))
-    with pytest.raises(ValueError, match=err_match):
+    a = mx.array(np.ones((2, 99), dtype=np.float32))
+    b = mx.array(np.ones((64, 2), dtype=np.float32))
+    with pytest.raises(ValueError, match="QLoRA weight shape mismatch"):
         w.set_lora(0, a, b)
 
 
@@ -280,7 +261,7 @@ def test_qlora_wrapper_no_lora_passthrough_with_punica() -> None:
     punica = PunicaWrapperMLX(max_num_batched_tokens=2, max_batches=1, max_loras=1)
     w.set_mapping(punica)
 
-    # no_lora=True (null mapping, all slots empty)
+    # no_lora=True because no adapter id maps to a resident slot.
     mapping = LoRAMapping(index_mapping=(0, 0), prompt_mapping=(0,))
     punica.update_metadata(mapping, lora_index_to_id=[None])
 
@@ -342,7 +323,7 @@ def test_qlora_mixed_batch_base_model_tokens_unaffected() -> None:
     b0 = rng.standard_normal((32, 1)).astype(np.float32)
     w.set_lora(0, mx.array(a0), mx.array(b0))
 
-    # Token 0 -> no-LoRA (null slot), tokens 1/2 -> adapter 55
+    # Token 0 -> no-LoRA, tokens 1/2 -> adapter 55.
     mapping = LoRAMapping(index_mapping=(0, 55, 55), prompt_mapping=(0, 55))
     punica.update_metadata(mapping, lora_index_to_id=[55])
 

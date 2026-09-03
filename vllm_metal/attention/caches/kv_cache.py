@@ -17,9 +17,12 @@ Block allocation is managed externally by the scheduler's KV cache manager.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import mlx.core as mx
 from vllm.logger import init_logger
 
+from vllm_metal.attention.caches.mha_layout import MHAKVCacheLayout
 from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE,
     FWHT_SUPPORTED_HEAD_DIMS,
@@ -56,6 +59,7 @@ class MetalPagedKVCache:
         kv_heads_per_layer: list[int] | None = None,
         head_dim_per_layer: list[int] | None = None,
         sliding_window_per_layer: list[int] | None = None,
+        layout: MHAKVCacheLayout | None = None,
     ) -> None:
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -66,6 +70,10 @@ class MetalPagedKVCache:
         self.turboquant = turboquant
         self.k_quant = k_quant
         self.v_quant = v_quant
+        self._layout = layout
+
+        if layout is not None and turboquant:
+            raise ValueError("layout-backed KV caches do not support TurboQuant")
 
         if turboquant:
             if k_quant is None or k_quant not in QUANT_PARAMS:
@@ -142,32 +150,15 @@ class MetalPagedKVCache:
         self.key_scale_caches: list[mx.array] = []
         self.value_scale_caches: list[mx.array] = []
         self.key_zero_caches: list[mx.array] = []  # asymmetric K zero_point
+        self._key_slots: list[mx.array] = []
+        self._value_slots: list[mx.array] = []
         if not turboquant:
-            for i in range(num_layers):
-                shape = (
-                    num_blocks,
-                    block_size,
-                    self.kv_heads_per_layer[i],
-                    self.head_dim_per_layer[i],
-                )
-                self.key_caches.append(mx.zeros(shape, dtype=dtype))
-                self.value_caches.append(mx.zeros(shape, dtype=dtype))
-            mx.eval(*self.key_caches, *self.value_caches)
-
-            # Log KV cache memory usage
-            kv_bytes = (
-                num_layers
-                * num_blocks
-                * block_size
-                * num_kv_heads
-                * head_dim
-                * 2
-                * self._dtype_size(dtype)
-            )
-            logger.info(
-                f"KV cache: {kv_bytes / 1e6:.1f} MB "
-                f"({num_layers} layers, {num_blocks} blocks, {block_size} tokens/block)"
-            )
+            if layout is None:
+                self._allocate_dense_caches(dtype)
+                self._log_dense_cache()
+            else:
+                self._allocate_layout_caches(layout, dtype)
+                self._log_layout_cache(layout)
         else:
             for _ in range(num_layers):
                 self.key_caches.append(
@@ -209,10 +200,9 @@ class MetalPagedKVCache:
             )
 
             # Log TurboQuant KV cache memory usage with comparison.
-            # Single source of truth: _turboquant_page_size_bytes in cache_policy.
-            from vllm_metal.v1.cache_policy import _turboquant_page_size_bytes
+            from vllm_metal.v1.cache_policy import turboquant_page_size_bytes
 
-            per_block_bytes = _turboquant_page_size_bytes(
+            per_block_bytes = turboquant_page_size_bytes(
                 block_size=block_size,
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
@@ -229,6 +219,139 @@ class MetalPagedKVCache:
                 f"(K: {self.k_bits}b->{self.k_packed_dim}d, V: {self.v_bits}b->{self.v_packed_dim}d, "
                 f"vs {fp16_equivalent / 1e6:.1f} MB fp16, {compression:.2f}x compression)"
             )
+
+    def _allocate_dense_caches(self, dtype: mx.Dtype) -> None:
+        """Allocate one independent K/V pair for each logical layer."""
+        for i in range(self.num_layers):
+            shape = (
+                self.num_blocks,
+                self.block_size,
+                self.kv_heads_per_layer[i],
+                self.head_dim_per_layer[i],
+            )
+            self.key_caches.append(mx.zeros(shape, dtype=dtype))
+            self.value_caches.append(mx.zeros(shape, dtype=dtype))
+        mx.eval(*self.key_caches, *self.value_caches)
+
+    def _allocate_layout_caches(
+        self, layout: MHAKVCacheLayout, dtype: mx.Dtype
+    ) -> None:
+        """Allocate shared physical K/V slots and per-layer logical views."""
+        for slot_layers in layout.slot_layers:
+            shape = layout.layers[slot_layers[0]].cache_shape(self.num_blocks)
+            self._key_slots.append(mx.zeros(shape, dtype=dtype))
+            self._value_slots.append(mx.zeros(shape, dtype=dtype))
+        mx.eval(*self._key_slots, *self._value_slots)
+
+        for layer in layout.layers:
+            self.key_caches.append(
+                self._key_slots[layer.tensor_index].reshape(
+                    layer.cache_shape(self.num_blocks)
+                )
+            )
+            self.value_caches.append(
+                self._value_slots[layer.tensor_index].reshape(
+                    layer.cache_shape(self.num_blocks)
+                )
+            )
+
+    def _log_dense_cache(self) -> None:
+        # Sum the allocated arrays instead of multiplying the scalar
+        # ``num_kv_heads``/``head_dim``: heterogeneous layers are sized from
+        # ``kv_heads_per_layer``/``head_dim_per_layer`` while the scalars carry
+        # the widened dispatch shape, so the product over-bills narrow layers.
+        kv_bytes = sum(cache.nbytes for cache in self.key_caches) + sum(
+            cache.nbytes for cache in self.value_caches
+        )
+        logger.info(
+            f"KV cache: {kv_bytes / 1e6:.1f} MB "
+            f"({self.num_layers} layers, {self.num_blocks} blocks, "
+            f"{self.block_size} tokens/block)"
+        )
+
+    def _log_layout_cache(self, layout: MHAKVCacheLayout) -> None:
+        logger.info(
+            f"KV cache: {layout.total_bytes / 1e6:.1f} MB "
+            f"({len(layout.slot_layers)} physical slots across "
+            f"{len(layout.group_block_sizes)} groups, {self.num_blocks} blocks)"
+        )
+
+    @classmethod
+    def from_layout(
+        cls, layout: MHAKVCacheLayout, dtype: mx.Dtype
+    ) -> MetalPagedKVCache:
+        """Allocate one physical K/V pair for every upstream tensor slot."""
+        first_layer = layout.layers[0]
+        return cls(
+            num_layers=len(layout.layers),
+            num_kv_heads=first_layer.num_kv_heads,
+            head_dim=first_layer.head_dim,
+            num_blocks=layout.num_blocks,
+            block_size=first_layer.block_size,
+            dtype=dtype,
+            kv_heads_per_layer=[layer.num_kv_heads for layer in layout.layers],
+            head_dim_per_layer=[layer.head_dim for layer in layout.layers],
+            sliding_window_per_layer=[layer.sliding_window for layer in layout.layers],
+            layout=layout,
+        )
+
+    def group_index_for_layer(self, layer_idx: int) -> int:
+        """Return the vLLM cache-group index for ``layer_idx``."""
+        return 0 if self._layout is None else self._layout.layers[layer_idx].group_index
+
+    def block_size_for_layer(self, layer_idx: int) -> int:
+        """Return the vLLM page size for ``layer_idx``."""
+        return (
+            self.block_size
+            if self._layout is None
+            else self._layout.layers[layer_idx].block_size
+        )
+
+    def replace_layer_cache(
+        self, layer_idx: int, key_cache: mx.array, value_cache: mx.array
+    ) -> None:
+        """Rebind a native primitive result and every layer sharing its slot."""
+        if self._layout is None:
+            self.key_caches[layer_idx] = key_cache
+            self.value_caches[layer_idx] = value_cache
+            return
+
+        slot = self._layout.layers[layer_idx].tensor_index
+        self._key_slots[slot] = key_cache
+        self._value_slots[slot] = value_cache
+        for shared_layer in self._layout.slot_layers[slot]:
+            shape = self._layout.layers[shared_layer].cache_shape(self.num_blocks)
+            self.key_caches[shared_layer] = key_cache.reshape(shape)
+            self.value_caches[shared_layer] = value_cache.reshape(shape)
+
+    def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
+        """Apply scheduler copy-on-write operations to physical KV blocks."""
+        if not block_copies:
+            return
+
+        src_ids, dst_ids = zip(*block_copies, strict=True)
+        if any(
+            block_id < 0 or block_id >= self.num_blocks
+            for block_id in (*src_ids, *dst_ids)
+        ):
+            raise RuntimeError("paged KV block copy contains an out-of-range block id")
+
+        src = mx.array(src_ids, dtype=mx.int32)
+        dst = mx.array(dst_ids, dtype=mx.int32)
+        if self._layout is None:
+            arrays = [*self.key_caches, *self.value_caches]
+            if self.turboquant:
+                arrays.extend(self.key_scale_caches)
+                arrays.extend(self.value_scale_caches)
+                arrays.extend(self.key_zero_caches)
+        else:
+            # Logical layer views can share one upstream tensor slot. Copy the
+            # physical arrays once instead of repeating the same write through
+            # every alias.
+            arrays = [*self._key_slots, *self._value_slots]
+
+        for array in arrays:
+            array[dst] = array[src]
 
     _DTYPE_SIZES = {
         mx.float16: 2,
