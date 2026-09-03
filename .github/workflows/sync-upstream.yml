@@ -74,6 +74,11 @@ jobs:
           before="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TARGET_BRANCH}" --jq '.sha')"
           upstream="$(gh api "repos/${UPSTREAM_REPOSITORY}/commits/${UPSTREAM_BRANCH}" --jq '.sha')"
           printf 'Target before: `%s`\nUpstream observed: `%s`\n' "$before" "$upstream" >> "$GITHUB_STEP_SUMMARY"
+          relation="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${upstream}...${before}" --jq '.status')"
+          if [[ "$relation" == ahead || "$relation" == identical ]]; then
+            printf '\nNo-op: target `%s` already contains the observed upstream commit; no write requested.\n' "$before" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           response="$(mktemp)"
           failure="$(mktemp)"
           trap 'rm -f "$response" "$failure"' EXIT
@@ -98,18 +103,36 @@ jobs:
           fi
           if [[ -s "$response" ]]; then
             jq -r '.commit.message' "$response" >> "$GITHUB_STEP_SUMMARY"
+            merged="$(jq -er '.sha' "$response")"
           else
             echo "Already contains the observed upstream commit (HTTP 204)." >> "$GITHUB_STEP_SUMMARY"
+            merged="$before"
           fi
-          after="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TARGET_BRANCH}" --jq '.sha')"
-          for ancestor in "$before" "$upstream"; do
-            status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${ancestor}...${after}" --jq '.status')"
-            if [[ "$status" != ahead && "$status" != identical ]]; then
-              echo "failure-kind=ancestry-verification" >> "$GITHUB_OUTPUT"
-              echo "::error::Post-merge ancestry verification failed for $ancestor ($status)."
-              exit 1
+          printf '\nMerge response SHA: `%s`\n' "$merged" >> "$GITHUB_STEP_SUMMARY"
+          # Branch reads can briefly lag a successful merge. Retry reads, never
+          # the mutation, and still fail closed if ancestry does not converge.
+          verified=false
+          for attempt in 1 2 3 4 5; do
+            after="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TARGET_BRANCH}" -H 'Cache-Control: no-cache' --jq '.sha')"
+            verified=true
+            for ancestor in "$before" "$upstream" "$merged"; do
+              status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${ancestor}...${after}" -H 'Cache-Control: no-cache' --jq '.status')"
+              if [[ "$status" != ahead && "$status" != identical ]]; then
+                verified=false
+                break
+              fi
+            done
+            [[ "$verified" == true ]] && break
+            if [[ "$attempt" != 5 ]]; then
+              echo "Waiting for branch/compare consistency ($attempt/5); merge SHA $merged."
+              sleep 2
             fi
           done
+          if [[ "$verified" != true ]]; then
+            echo "failure-kind=ancestry-verification" >> "$GITHUB_OUTPUT"
+            echo "::error::Post-merge ancestry verification failed for $ancestor ($status); branch $after, merge $merged."
+            exit 1
+          fi
           printf '\nTarget after: `%s`\nBoth previous fork HEAD and observed upstream HEAD are ancestors.\n' "$after" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create or update failure issue
