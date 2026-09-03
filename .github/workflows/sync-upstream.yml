@@ -1,8 +1,9 @@
+# Managed template: vLLM-HUST/.github, workflow-templates/hust-upstream-sync.yml.
+# Preserve each caller's staggered schedule when copying this file.
 name: Daily upstream sync
 
 on:
   schedule:
-    # 02:29 Asia/Shanghai (18:29 UTC on the previous day).
     - cron: "29 18 * * *"
   workflow_dispatch:
 
@@ -20,33 +21,96 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Resolve fork metadata
+      - name: Resolve fork metadata and validate target
         id: upstream
         env:
           GH_TOKEN: ${{ github.token }}
+          APP_CLIENT_ID: ${{ vars.UPSTREAM_SYNC_APP_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.UPSTREAM_SYNC_APP_PRIVATE_KEY }}
         shell: bash
         run: |
           set -euo pipefail
-          upstream_repo="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.full_name // empty')"
-          if [[ -z "${upstream_repo}" ]]; then
-            echo "${GITHUB_REPOSITORY} is not a GitHub fork." >&2
+          if [[ -n "$APP_CLIENT_ID" && -z "$APP_PRIVATE_KEY" || -z "$APP_CLIENT_ID" && -n "$APP_PRIVATE_KEY" ]]; then
+            echo "::error::Configure both UPSTREAM_SYNC_APP_CLIENT_ID and UPSTREAM_SYNC_APP_PRIVATE_KEY."
+            exit 1
+          fi
+          metadata="$(gh api "repos/${GITHUB_REPOSITORY}")"
+          branch="$(jq -r '.default_branch' <<< "$metadata")"
+          upstream_repo="$(jq -r '.parent.full_name // empty' <<< "$metadata")"
+          if [[ -z "$upstream_repo" || "$GITHUB_REF_NAME" != "$branch" ]]; then
+            echo "::error::Synchronization requires a fork and its default branch; refusing another target."
             exit 1
           fi
           upstream_branch="$(gh api "repos/${upstream_repo}" --jq '.default_branch')"
-          echo "repository=${upstream_repo}" >> "${GITHUB_OUTPUT}"
-          echo "branch=${upstream_branch}" >> "${GITHUB_OUTPUT}"
+          echo "repository=$upstream_repo" >> "$GITHUB_OUTPUT"
+          echo "branch=$upstream_branch" >> "$GITHUB_OUTPUT"
+          echo "target=$branch" >> "$GITHUB_OUTPUT"
 
-      - name: Merge official upstream
+      - name: Create repository-scoped sync token
+        id: app-token
+        if: vars.UPSTREAM_SYNC_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ vars.UPSTREAM_SYNC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.UPSTREAM_SYNC_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-workflows: write
+
+      - name: Merge official upstream and verify ancestry
+        id: merge
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+          HAS_SYNC_CREDENTIAL: ${{ steps.app-token.outputs.token != '' || secrets.UPSTREAM_SYNC_TOKEN != '' }}
+          UPSTREAM_REPOSITORY: ${{ steps.upstream.outputs.repository }}
+          UPSTREAM_BRANCH: ${{ steps.upstream.outputs.branch }}
+          TARGET_BRANCH: ${{ steps.upstream.outputs.target }}
         shell: bash
         run: |
           set -euo pipefail
-          gh api \
-            --method POST \
-            "repos/${GITHUB_REPOSITORY}/merge-upstream" \
-            -f branch="${GITHUB_REF_NAME}" \
-            --jq '.message' | tee -a "${GITHUB_STEP_SUMMARY}"
+          echo "has-sync-credential=$HAS_SYNC_CREDENTIAL" >> "$GITHUB_OUTPUT"
+          if [[ "$HAS_SYNC_CREDENTIAL" != "true" ]]; then
+            echo "::warning::GITHUB_TOKEN cannot synchronize changed workflow files. Configure the dedicated sync App or UPSTREAM_SYNC_TOKEN; a no-op success does not prove that permission."
+          fi
+          before="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TARGET_BRANCH}" --jq '.sha')"
+          upstream="$(gh api "repos/${UPSTREAM_REPOSITORY}/commits/${UPSTREAM_BRANCH}" --jq '.sha')"
+          printf 'Target before: `%s`\nUpstream observed: `%s`\n' "$before" "$upstream" >> "$GITHUB_STEP_SUMMARY"
+          response="$(mktemp)"
+          failure="$(mktemp)"
+          trap 'rm -f "$response" "$failure"' EXIT
+          # Pin the observed upstream SHA; preserve the old GITHUB_TOKEN behavior
+          # of not launching imported hardware/release CI from a synchronization.
+          if ! gh api --method POST "repos/${GITHUB_REPOSITORY}/merges" \
+            -f base="$TARGET_BRANCH" -f head="$upstream" \
+            -f commit_message="chore: sync ${UPSTREAM_REPOSITORY}@${upstream} [skip ci]" \
+            > "$response" 2> "$failure"; then
+            reason="$(<"$failure")"
+            case "$reason" in
+              *"HTTP 409"*) kind=merge-conflict; hint="Resolve the conflict in an isolated checkout, preserving fork-only commits. Never force-sync." ;;
+              *"HTTP 422"*workflow*|*workflow*"HTTP 422"*) kind=workflow-permission; hint="The merge token must have Contents and Workflows write permissions. GITHUB_TOKEN contents:write alone is insufficient." ;;
+              *"HTTP 401"*|*"HTTP 403"*) kind=authentication; hint="Check sync credential expiry, installation scope, SSO and repository rules." ;;
+              *) kind=api-error; hint="Inspect the API error and retry only after distinguishing a transient failure from a conflict." ;;
+            esac
+            echo "failure-kind=$kind" >> "$GITHUB_OUTPUT"
+            printf '::error::Upstream sync failed (%s). %s\n' "$kind" "$hint"
+            printf '%s\n' "$reason" >&2
+            printf '\nFailure: **%s**. %s\n' "$kind" "$hint" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [[ -s "$response" ]]; then
+            jq -r '.commit.message' "$response" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Already contains the observed upstream commit (HTTP 204)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          after="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TARGET_BRANCH}" --jq '.sha')"
+          for ancestor in "$before" "$upstream"; do
+            status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${ancestor}...${after}" --jq '.status')"
+            if [[ "$status" != ahead && "$status" != identical ]]; then
+              echo "failure-kind=ancestry-verification" >> "$GITHUB_OUTPUT"
+              echo "::error::Post-merge ancestry verification failed for $ancestor ($status)."
+              exit 1
+            fi
+          done
+          printf '\nTarget after: `%s`\nBoth previous fork HEAD and observed upstream HEAD are ancestors.\n' "$after" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create or update failure issue
         if: failure()
@@ -54,74 +118,58 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           UPSTREAM_REPOSITORY: ${{ steps.upstream.outputs.repository }}
           UPSTREAM_BRANCH: ${{ steps.upstream.outputs.branch }}
+          FAILURE_KIND: ${{ steps.merge.outputs.failure-kind || 'configuration-or-api' }}
         shell: bash
         run: |
           set -euo pipefail
           title="[Automation] Daily upstream sync failed"
           run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          issue_number="$(
-            gh issue list \
-              --repo "${GITHUB_REPOSITORY}" \
-              --state open \
-              --search "${title} in:title" \
-              --json number \
-              --jq '.[0].number // empty'
-          )"
-          body="Daily synchronization from \`${UPSTREAM_REPOSITORY:-unknown}:${UPSTREAM_BRANCH:-unknown}\` into \`${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}\` failed.
-
-          Run: ${run_url}
-
-          Check for merge conflicts, repository permissions, fork metadata changes, or GitHub API failures. Successful daily runs remain silent."
-          if [[ -n "${issue_number}" ]]; then
-            gh issue comment "${issue_number}" --repo "${GITHUB_REPOSITORY}" --body "${body}"
+          issue_number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "$title in:title" --json number,title \
+            --jq '.[] | select(.title == "[Automation] Daily upstream sync failed") | .number' | head -n 1)"
+          body="$(mktemp)"
+          stored="$(mktemp)"
+          trap 'rm -f "$body" "$stored"' EXIT
+          printf 'Daily synchronization from `%s:%s` into `%s:%s` failed.\n\nFailure class: **%s**\n\nRun: %s\n\nSee the run summary for exact source SHAs and diagnosis. Workflow updates require a dedicated App/Token with Contents and Workflows write access. Conflicts must be resolved without discarding fork-only commits.\n' \
+            "${UPSTREAM_REPOSITORY:-unknown}" "${UPSTREAM_BRANCH:-unknown}" \
+            "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$FAILURE_KIND" "$run_url" > "$body"
+          if [[ -n "$issue_number" ]]; then
+            url="$(gh issue comment "$issue_number" --repo "$GITHUB_REPOSITORY" --body-file "$body")"
+            gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${url##*issuecomment-}" | jq -j '.body' > "$stored"
           else
-            gh issue create \
-              --repo "${GITHUB_REPOSITORY}" \
-              --title "${title}" \
-              --body "${body}" \
-              --assignee "ShuhaoZhangTony"
+            url="$(gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$body" --assignee ShuhaoZhangTony)"
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${url##*/}" | jq -j '.body' > "$stored"
           fi
+          cmp "$body" "$stored"
 
-      - name: Send Slack failure notification
+      - name: Send optional Slack failure notification
         if: failure()
+        continue-on-error: true
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          UPSTREAM_REPOSITORY: ${{ steps.upstream.outputs.repository }}
-          UPSTREAM_BRANCH: ${{ steps.upstream.outputs.branch }}
+          FAILURE_KIND: ${{ steps.merge.outputs.failure-kind || 'configuration-or-api' }}
         shell: bash
         run: |
           set -euo pipefail
           if [[ -z "${SLACK_WEBHOOK_URL:-}" ]]; then
-            echo "SLACK_WEBHOOK_URL is not configured." >&2
-            exit 1
+            echo "No Slack webhook configured; the original failure remains in the run and GitHub issue."
+            exit 0
           fi
-          run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          jq -n \
-            --arg text "Upstream sync failed: ${UPSTREAM_REPOSITORY:-unknown}:${UPSTREAM_BRANCH:-unknown} -> ${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}. ${run_url}" \
-            '{text: $text}' |
-            curl --fail --silent --show-error \
-              --header "Content-Type: application/json" \
-              --data @- \
-              "${SLACK_WEBHOOK_URL}"
+          jq -n --arg text "Upstream sync failed ($FAILURE_KIND): $GITHUB_REPOSITORY. https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" '{text: $text}' |
+            curl --fail --silent --show-error --max-time 20 --header "Content-Type: application/json" --data @- "$SLACK_WEBHOOK_URL"
 
       - name: Close recovered failure issue
-        if: success()
+        if: success() && steps.merge.outputs.has-sync-credential == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           title="[Automation] Daily upstream sync failed"
-          issue_number="$(
-            gh issue list \
-              --repo "${GITHUB_REPOSITORY}" \
-              --state open \
-              --search "${title} in:title" \
-              --json number \
-              --jq '.[0].number // empty'
-          )"
-          if [[ -n "${issue_number}" ]]; then
-            gh issue close "${issue_number}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --comment "Daily upstream synchronization recovered in run https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+          issue_number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "$title in:title" --json number,title \
+            --jq '.[] | select(.title == "[Automation] Daily upstream sync failed") | .number' | head -n 1)"
+          if [[ -n "$issue_number" ]]; then
+            # No-op runs using GITHUB_TOKEN must not falsely close a missing-credential incident.
+            gh issue close "$issue_number" --repo "$GITHUB_REPOSITORY"
           fi
