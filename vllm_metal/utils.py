@@ -2,7 +2,6 @@
 """Metal utility functions for vLLM Metal plugin."""
 
 import logging
-import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -30,7 +29,11 @@ def get_model_download_path(model_repo_name: str) -> str:
     if Path(model_repo_name).exists():
         return model_repo_name
 
-    if os.environ.get("VLLM_USE_MODELSCOPE", "False").lower() == "true":
+    # Reuse vLLM core's own env parsing (accepts "1"/"true") so the plugin
+    # and core cannot drift apart on which spellings enable ModelScope.
+    from vllm.envs import VLLM_USE_MODELSCOPE
+
+    if VLLM_USE_MODELSCOPE:
         try:
             from modelscope.hub.snapshot_download import snapshot_download
 

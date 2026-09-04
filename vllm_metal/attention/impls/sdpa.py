@@ -181,6 +181,7 @@ class _KernelMetadata:
     cu_seqlens_q: mx.array
     block_tables: mx.array
     block_size: int
+    max_seq_len: int
 
 
 def _kernel_metadata(
@@ -211,6 +212,7 @@ def _kernel_metadata(
             cu_seqlens_q=mx.array(ctx.cu_seqlens, dtype=mx.int32),
             block_tables=block_tables,
             block_size=kernel_block_size,
+            max_seq_len=max(ctx.context_lens),
         )
         ctx.kernel_metadata_cache[key] = meta
     return meta
@@ -624,8 +626,9 @@ def sdpa_forward(
     seq_lens = meta.seq_lens
     cu_seqlens_q = meta.cu_seqlens_q
     block_tables, kernel_block_size = meta.block_tables, meta.block_size
-    max_seq_len = max(ctx.context_lens)
+    max_seq_len = meta.max_seq_len
 
+    v_centroids: mx.array | None = None
     if shared_kv is not None or read_existing_kv:
         # YOCO shared layer / MTP read-existing layer: the authoritative K/V
         # already lives in the paged cache.  Skip writes to avoid redundant
@@ -743,10 +746,12 @@ def sdpa_forward(
             kernel_key_zero = new_key_zero_cache.reshape(
                 -1, kernel_block_size, cache_kv_heads, sg
             )
-        # Get Lloyd-Max centroids for V quantization (lazily computed, cached)
-        from vllm_metal.attention.caches.turboquant import get_v_centroids
+        # Get Lloyd-Max centroids for V quantization (lazily computed, cached).
+        # Resolved once per layer and shared by tq_encode + paged_attention.
+        if v_centroids is None:
+            from vllm_metal.attention.caches.turboquant import get_v_centroids
 
-        v_centroids = get_v_centroids(kv_cache.v_bits)
+            v_centroids = get_v_centroids(kv_cache.v_bits)
         ops.paged_attention_primitive(
             q_3d,
             kernel_k_cache,
