@@ -513,14 +513,6 @@ class MetalPlatform(Platform):
 
         if model_config is not None and model_config.is_hybrid:
             cache_config = vllm_config.cache_config
-            if cache_config.mamba_ssm_cache_dtype == "auto":
-                cache_config.mamba_ssm_cache_dtype = "float32"
-            elif cache_config.mamba_ssm_cache_dtype != "float32":
-                raise NotImplementedError(
-                    "Hybrid models on Metal require "
-                    "--mamba-ssm-cache-dtype float32 because recurrent state is "
-                    "stored in fp32."
-                )
             if cache_config.mamba_cache_mode == "all":
                 # Before the downgrades below, which overwrite the mode: an
                 # explicit --mamba-cache-mode all must fail fast on every path.
@@ -530,6 +522,24 @@ class MetalPlatform(Platform):
                     "'align' for models without SupportsMambaPrefixCaching). "
                     "Use align mode: --enable-prefix-caching resolves to it."
                 )
+            if cache_config.enable_prefix_caching and config.use_paged_attention:
+                from vllm_metal.attention.runtime.factory import (
+                    state_family_for_model_type,
+                )
+
+                state_family = state_family_for_model_type(
+                    model_config.hf_text_config.model_type
+                )
+                if (
+                    cache_config.mamba_cache_mode
+                    not in state_family.supported_cache_modes
+                ):
+                    cls._disable_hybrid_prefix_caching(
+                        vllm_config,
+                        f"the {state_family.label!r} state family supports "
+                        f"mamba_cache_mode {state_family.supported_cache_modes}, "
+                        f"not {cache_config.mamba_cache_mode!r}",
+                    )
             if cache_config.enable_prefix_caching and not config.use_paged_attention:
                 cls._disable_hybrid_prefix_caching(
                     vllm_config,

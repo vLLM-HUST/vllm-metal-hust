@@ -852,7 +852,7 @@ class TestV1SamplingBatch:
             ),
         )
 
-        output = MetalModelRunner._build_output(batch)
+        output = batch.to_model_runner_output()
 
         assert output.logprobs is not None
         assert output.logprobs.logprob_token_ids.shape == (2, 3)

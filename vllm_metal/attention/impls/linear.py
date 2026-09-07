@@ -29,12 +29,14 @@ _EXPANDED_RECURRENT_DECODE_THREADGROUP_DV = 8
 
 
 def is_linear_attention(module: nn.Module) -> bool:
-    """Return True if *module* is a linear attention layer (e.g. GatedDeltaNet).
+    """Return True for an mlx_lm GatedDeltaNet module (Qwen3.5 family, Qwen3-Next).
 
-    Checks for ``conv1d`` (present in all known GatedDeltaNet variants) and
-    the absence of ``q_proj`` (which would indicate SDPA).
+    Matches the projection layout the wrapper dispatches on, so Mamba-2 mixers
+    (``in_proj`` + ``conv1d``) are not mistaken for GDN.
     """
-    return hasattr(module, "conv1d") and not hasattr(module, "q_proj")
+    return hasattr(module, "conv1d") and (
+        hasattr(module, "in_proj_qkv") or hasattr(module, "in_proj_qkvz")
+    )
 
 
 @dataclass(frozen=True)
@@ -159,18 +161,9 @@ class GDNPagedAttentionWrapper(nn.Module):
             raise RuntimeError("GDN wrapper requires cu_seqlens in context")
 
         num_requests = len(cu_seqlens) - 1
-        if ctx.gdn_group_slot_mappings is not None:
-            ordinal = self._gdn_state_cache.layer_group_ordinal(self._gdn_cache_idx)
-            slot_ids = ctx.gdn_group_slot_mappings[ordinal]
-        elif ctx.gdn_slot_mapping is not None:
-            slot_ids = ctx.gdn_slot_mapping
-        else:
-            raise RuntimeError("GDN wrapper requires gdn_slot_mapping in context")
-        if len(slot_ids) != num_requests:
-            raise RuntimeError("GDN wrapper requires one slot per request")
-        if len(set(slot_ids)) != len(slot_ids):
-            raise RuntimeError("GDN wrapper requires unique slots per request")
-        self._gdn_state_cache.require_allocated_slots(slot_ids)
+        slot_ids = self._gdn_state_cache.step_slot_ids(
+            ctx, self._gdn_cache_idx, num_requests
+        )
 
         return _GDNForwardState(
             x=x,
@@ -264,7 +257,9 @@ class GDNPagedAttentionWrapper(nn.Module):
 
         if defer_conv_state:
             state_cache.set_pending_conv_state(
-                cache_idx, slot_ids, mx.concatenate(conv_updates, axis=0)
+                cache_idx,
+                slot_ids,
+                mx.concatenate(conv_updates, axis=0).astype(state_cache.dtype),
             )
 
         return mx.concatenate(conv_outputs, axis=1)
@@ -418,9 +413,17 @@ class GDNPagedAttentionWrapper(nn.Module):
         d_v = inner.head_v_dim
 
         # Flatten for kernel: remove batch dim.
-        # Use float32 for kernel dispatch to avoid float16 overflow in
-        # recurrent state accumulation.  Output is cast back after.
-        kernel_dtype = mx.float32
+        # The native kernel uses one buffer dtype and accumulates in float32.
+        # Promote only as needed to preserve input, state, and output precision.
+        recurrent_pool = self._gdn_state_cache.recurrent_states[self._gdn_cache_idx]
+        kernel_dtype = mx.result_type(q, k, v, g, beta, recurrent_pool, state.x)
+        if recurrent_pool.dtype != kernel_dtype:
+            raise RuntimeError(
+                f"GDN fallback does not support {recurrent_pool.dtype} recurrent "
+                f"state with {kernel_dtype} kernel buffers. Set "
+                f"--mamba-ssm-cache-dtype {str(kernel_dtype).removeprefix('mlx.core.')} "
+                "to enable in-place state updates."
+            )
         q_flat = mx.contiguous(q.reshape(total_tokens, n_hk, d_k).astype(kernel_dtype))
         k_flat = mx.contiguous(k.reshape(total_tokens, n_hk, d_k).astype(kernel_dtype))
         v_flat = mx.contiguous(v.reshape(total_tokens, n_hv, d_v).astype(kernel_dtype))
@@ -432,7 +435,6 @@ class GDNPagedAttentionWrapper(nn.Module):
         slot_mapping = mx.array(state.slot_ids, dtype=mx.int32)
 
         y_flat = mx.zeros((total_tokens, n_hv, d_v), dtype=kernel_dtype)
-        recurrent_pool = self._gdn_state_cache.recurrent_states[self._gdn_cache_idx]
 
         mx.eval(
             q_flat,

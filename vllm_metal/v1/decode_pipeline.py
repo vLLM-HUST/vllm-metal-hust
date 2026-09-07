@@ -60,6 +60,7 @@ class RunnerCapabilities:
     is_pooling: bool
     pp_active: bool
     hybrid_without_lazy_gdn: bool
+    state_family_pipelined: bool
     spec_decode_configured: bool
     uniproc_executor: bool
 
@@ -71,6 +72,10 @@ class RunnerCapabilities:
             (not self.paged_runtime_active, "non-paged path"),
             (self.is_pooling, "pooling model"),
             (self.pp_active, "pipeline parallelism"),
+            (
+                not self.state_family_pipelined,
+                "state family without decode pipeline support",
+            ),
             (
                 self.hybrid_without_lazy_gdn,
                 "hybrid model without lazy GDN kernels",
@@ -128,20 +133,17 @@ class SamplingShape:
 
     native_greedy: bool
     native_random: bool
-    has_prompt_logprobs: bool
 
     def block_reason(self) -> str | None:
         """First sampling fact that rules the pipeline out, or ``None``.
 
-        Checked in order: native sampling mode first, then prompt logprobs.
         Either native mode (greedy argmax or eligible random sampling with
-        ``VLLM_METAL_NATIVE_SAMPLING``) keeps the step deferrable.
+        ``VLLM_METAL_NATIVE_SAMPLING``) keeps the step deferrable.  Prompt
+        logprobs are gathered on the completing prefill step before decode
+        rows enter ``decode_req_ids``, so they never reach this gate.
         """
         if not (self.native_greedy or self.native_random):
             return "non-native sampling"
-        # Prompt logprobs need eager logits on the sampling step.
-        if self.has_prompt_logprobs:
-            return "prompt logprobs requested"
         return None
 
 

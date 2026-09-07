@@ -28,8 +28,12 @@ from __future__ import annotations
 import functools
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import mlx.core as mx
+
+if TYPE_CHECKING:
+    from vllm_metal.attention.context import PagedAttentionContext
 
 
 @functools.cache
@@ -65,6 +69,7 @@ class GDNPagedStateCache:
         key_head_dim: int,
         initial_seqs: int | None = None,
         dtype: mx.Dtype = mx.float16,
+        recurrent_dtype: mx.Dtype = mx.float32,
     ) -> None:
         if dtype not in (mx.float16, mx.bfloat16, mx.float32):
             raise ValueError(f"Unsupported dtype for GDN state cache: {dtype}")
@@ -87,14 +92,14 @@ class GDNPagedStateCache:
         self.value_head_dim = value_head_dim
         self.key_head_dim = key_head_dim
         self.dtype = dtype
+        self.recurrent_dtype = recurrent_dtype
 
         self.conv_states: list[mx.array] = [
             mx.zeros(self._conv_shape(initial_seqs), dtype=dtype)
             for _ in range(num_layers)
         ]
-        # Recurrent state uses float32 to avoid overflow in kernel accumulation.
         self.recurrent_states: list[mx.array] = [
-            mx.zeros(self._recurrent_shape(initial_seqs), dtype=mx.float32)
+            mx.zeros(self._recurrent_shape(initial_seqs), dtype=recurrent_dtype)
             for _ in range(num_layers)
         ]
         self.pending_conv_states: list[mx.array | None] = [
@@ -173,7 +178,9 @@ class GDNPagedStateCache:
                 conv[:old_allocated] = old_conv
 
             old_recurrent = self.recurrent_states[layer_idx]
-            recurrent = mx.zeros(self._recurrent_shape(num_seqs), dtype=mx.float32)
+            recurrent = mx.zeros(
+                self._recurrent_shape(num_seqs), dtype=self.recurrent_dtype
+            )
             if old_allocated:
                 recurrent[:old_allocated] = old_recurrent
 
@@ -185,13 +192,41 @@ class GDNPagedStateCache:
 
         self.allocated_seqs = num_seqs
 
+    def require_mixer_dtype(self, mixer_dtype: mx.Dtype, *, layer_idx: int) -> None:
+        """Reject a conv pool whose dtype differs from the mixer feeding it."""
+        if mixer_dtype != self.dtype:
+            raise ValueError(
+                f"state pool dtype {self.dtype} does not match the layer "
+                f"{layer_idx} mixer dtype {mixer_dtype}; pass --dtype matching "
+                "the checkpoint so state and activations keep one dtype."
+            )
+
+    def step_slot_ids(
+        self, ctx: PagedAttentionContext, cache_idx: int, num_requests: int
+    ) -> list[int]:
+        """Return this step's state slot per request for ``cache_idx``."""
+        if ctx.state_group_slot_mappings is not None:
+            slot_ids = ctx.state_group_slot_mappings[
+                self.layer_group_ordinal(cache_idx)
+            ]
+        elif ctx.state_slot_mapping is not None:
+            slot_ids = ctx.state_slot_mapping
+        else:
+            raise RuntimeError("state cache requires state_slot_mapping in context")
+        if len(slot_ids) != num_requests:
+            raise RuntimeError("state cache requires one slot per request")
+        if len(set(slot_ids)) != len(slot_ids):
+            raise RuntimeError("state cache requires unique slots per request")
+        self.require_allocated_slots(slot_ids)
+        return slot_ids
+
     def require_allocated_slots(self, slot_ids: list[int]) -> None:
         """Validate slots against both the scheduler cap and allocated rows."""
         if any(slot < 0 or slot >= self.max_seqs for slot in slot_ids):
-            raise RuntimeError("GDN wrapper received out-of-range slot mapping")
+            raise RuntimeError("state cache received out-of-range slot mapping")
         if any(slot >= self.allocated_seqs for slot in slot_ids):
             raise RuntimeError(
-                "GDN wrapper received slot mapping beyond allocated state cache"
+                "state cache received slot mapping beyond allocated state cache"
             )
 
     def reset_slot(self, slot: int) -> None:

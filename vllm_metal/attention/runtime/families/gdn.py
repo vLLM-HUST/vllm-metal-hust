@@ -7,9 +7,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+import mlx.core as mx
 import torch
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.impls.linear import (
     GDNPagedAttentionWrapper,
     is_linear_attention,
@@ -22,6 +24,7 @@ from vllm_metal.attention.runtime.hybrid_plan import (
     LayerRole,
     RecurrentStateGeometry,
     StateFamilySpec,
+    StateGeometry,
 )
 
 
@@ -96,30 +99,59 @@ class GDNHybridConfig:
         )
 
 
-_GDN_FAMILY = StateFamilySpec(
+def create_gdn_state_cache(
+    *,
+    geometry: StateGeometry,
+    num_layers: int,
+    max_seqs: int,
+    initial_seqs: int,
+    dtypes: tuple[mx.Dtype, ...],
+) -> GDNPagedStateCache:
+    if not isinstance(geometry, RecurrentStateGeometry):
+        raise TypeError("GDN state cache requires recurrent state geometry")
+    return GDNPagedStateCache(
+        num_layers=num_layers,
+        max_seqs=max_seqs,
+        conv_kernel_dim=geometry.conv_kernel_dim,
+        conv_dim=geometry.conv_dim,
+        num_v_heads=geometry.num_v_heads,
+        value_head_dim=geometry.value_head_dim,
+        key_head_dim=geometry.key_head_dim,
+        initial_seqs=initial_seqs,
+        dtype=dtypes[0],
+        recurrent_dtype=dtypes[1],
+    )
+
+
+# mlx-lm names the text-only loads by the outer config; mlx-vlm flattens the
+# nested text config, so the same family also arrives as the ``_text`` types.
+GDN_MODEL_TYPES = frozenset(
+    {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next"}
+)
+
+GDN_FAMILY = StateFamilySpec(
     label="gdn",
     wrapper_cls=GDNPagedAttentionWrapper,
     is_state_module=is_linear_attention,
     mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
-    # Match the fp32 recurrent pool used for kernel accumulation.
-    recurrent_dtype=torch.float32,
     # Scheduler-side mamba caching strategies the GDN state path implements.
     supported_cache_modes=("none", "align"),
+    supports_decode_pipeline=True,
+    layer_name="linear_attn",
+    create_state_cache=create_gdn_state_cache,
 )
 
 
-def supports_gdn_hybrid(model_args: Mapping[str, Any]) -> bool:
-    """Whether these model args describe a GDN linear-attention hybrid."""
-    return "full_attention_interval" in model_args
-
-
 def build_gdn_hybrid_plan(
-    model_args: Mapping[str, Any], num_layers: int
+    model_args: Mapping[str, Any],
+    num_layers: int,
+    state_dtypes: tuple[torch.dtype, ...],
 ) -> HybridRuntimePlan:
     """Resolve GDN layer topology and recurrent geometry from model args."""
     gdn_config = GDNHybridConfig.from_model_args(model_args)
     return HybridRuntimePlan(
         layers=HybridLayerPlan(layer_roles=gdn_config.layer_roles(num_layers)),
-        family=_GDN_FAMILY,
+        family=GDN_FAMILY,
         geometry=gdn_config.state_geometry(),
+        state_dtypes=state_dtypes,
     )

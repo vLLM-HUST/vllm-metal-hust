@@ -1098,6 +1098,8 @@ class TestMetalPlatform:
         self,
         cache_config: SimpleNamespace,
         speculative_config: SimpleNamespace | None = None,
+        model_type: str = "qwen3_5",
+        text_model_type: str | None = None,
     ) -> VllmConfig:
         return self._platform_config(
             speculative_config=speculative_config,
@@ -1116,7 +1118,10 @@ class TestMetalPlatform:
                 tokenizer=None,
                 max_model_len=32768,
                 multimodal_config=None,
-                hf_config=SimpleNamespace(model_type="qwen3"),
+                hf_config=SimpleNamespace(model_type=model_type),
+                hf_text_config=SimpleNamespace(
+                    model_type=text_model_type or model_type
+                ),
                 is_hybrid=True,
             ),
             scheduler_config=SimpleNamespace(
@@ -1258,6 +1263,105 @@ class TestMetalPlatform:
         finally:
             reset_config()
 
+    def test_check_and_update_config_downgrades_prefix_caching_for_slot_keyed_families(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                model_type="nemotron_h",
+            )
+            vllm_config.cache_config.mamba_block_size = 16
+            MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+        cache_config = vllm_config.cache_config
+        assert cache_config.enable_prefix_caching is False
+        assert cache_config.mamba_cache_mode == "none"
+        assert cache_config.mamba_block_size == 32768
+
+    def test_non_paged_hybrid_without_a_family_still_downgrades(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                model_type="falcon_h1",
+            )
+            vllm_config.cache_config.mamba_block_size = 16
+            MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+        assert vllm_config.cache_config.enable_prefix_caching is False
+
+    def test_hybrid_family_lookup_uses_the_text_model_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                model_type="falcon_h1",
+                text_model_type="nemotron_h",
+            )
+            vllm_config.cache_config.mamba_block_size = 16
+            MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+        assert vllm_config.cache_config.enable_prefix_caching is False
+        assert vllm_config.cache_config.mamba_cache_mode == "none"
+
+    def test_check_and_update_config_rejects_paged_hybrid_without_a_family(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                model_type="falcon_h1",
+            )
+            with pytest.raises(NotImplementedError, match="model_type='falcon_h1'"):
+                MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
     def test_check_and_update_config_accepts_hybrid_align_prefix_caching(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1279,25 +1383,22 @@ class TestMetalPlatform:
         finally:
             reset_config()
 
-    @pytest.mark.parametrize(
-        ("dtype", "reject"),
-        [("auto", False), ("float16", True), ("bfloat16", True)],
-    )
-    def test_check_and_update_config_hybrid_gdn_state_dtype(
-        self, dtype: str, reject: bool, monkeypatch: pytest.MonkeyPatch
+        cache_config = vllm_config.cache_config
+        assert cache_config.enable_prefix_caching is True
+        assert cache_config.mamba_cache_mode == "align"
+
+    @pytest.mark.parametrize("dtype", ["auto", "float16", "bfloat16", "float32"])
+    def test_check_and_update_config_preserves_upstream_state_dtype(
+        self, dtype: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         cache_config = CacheConfig(
             enable_prefix_caching=False, mamba_ssm_cache_dtype=dtype
         )
         vllm_config = self._hybrid_vllm_config(cache_config)
 
-        if reject:
-            with pytest.raises(NotImplementedError, match="require.*float32"):
-                MetalPlatform.check_and_update_config(vllm_config)
-        else:
-            self._patch_stt_resolution(monkeypatch, is_stt=False)
-            MetalPlatform.check_and_update_config(vllm_config)
-            assert cache_config.mamba_ssm_cache_dtype == "float32"
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        MetalPlatform.check_and_update_config(vllm_config)
+        assert cache_config.mamba_ssm_cache_dtype == dtype
 
     def test_check_and_update_config_increases_max_num_scheduled_tokens_below_max_model_len(
         self, monkeypatch: pytest.MonkeyPatch

@@ -32,6 +32,7 @@ _CAPABLE_KWARGS = {
     "is_pooling": False,
     "pp_active": False,
     "hybrid_without_lazy_gdn": False,
+    "state_family_pipelined": True,
     "spec_decode_configured": False,
     "uniproc_executor": True,
 }
@@ -51,7 +52,6 @@ _CLEAN_STEP_KWARGS = {
 _GREEDY_SAMPLING_KWARGS = {
     "native_greedy": True,
     "native_random": False,
-    "has_prompt_logprobs": False,
 }
 
 
@@ -188,6 +188,11 @@ class TestGate:
                 True,
                 "hybrid model without lazy GDN kernels",
             ),
+            (
+                "state_family_pipelined",
+                False,
+                "state family without decode pipeline support",
+            ),
             ("spec_decode_configured", True, "speculative decode"),
             ("uniproc_executor", False, "non-uniproc executor"),
         ],
@@ -221,7 +226,6 @@ class TestGate:
         ("flag", "value", "reason"),
         [
             ("native_greedy", False, "non-native sampling"),
-            ("has_prompt_logprobs", True, "prompt logprobs requested"),
         ],
     )
     def test_each_sampling_blocker_rejects_with_its_reason(self, flag, value, reason):
