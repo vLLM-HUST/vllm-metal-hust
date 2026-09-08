@@ -280,8 +280,6 @@ class DraftModelProposer:
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         num_speculative_tokens = ctx.num_speculative_tokens
-        if num_speculative_tokens <= 0:
-            return None
         if self._committed_group_index is None:
             raise RuntimeError(
                 "DraftModelProposer.propose() called before "
@@ -302,6 +300,12 @@ class DraftModelProposer:
         # row that ingested this step, drafting or not.
         for plan in plans:
             self._draft_seq_lens[plan.req_id] = plan.committed_len
+
+        # A scheduler step can have no speculative-token budget while still
+        # advancing committed prefill tokens. Keep the draft KV cache in sync,
+        # but do not generate any draft tokens for that step.
+        if num_speculative_tokens <= 0:
+            return None
 
         drafting_plans = [plan for plan in plans if plan.is_drafting]
         if not drafting_plans:
@@ -398,12 +402,18 @@ class DraftModelProposer:
                 plans.append(plan)
 
         seen = {plan.req_id for plan in plans}
-        for prefill, result_mode in zip(
-            ctx.prefill_reqs, ctx.prefill_result_modes, strict=True
+        for prefill_index, (prefill, result_mode) in enumerate(
+            zip(ctx.prefill_reqs, ctx.prefill_result_modes, strict=True)
         ):
             if prefill.req_id in seen:
                 continue
             seen.add(prefill.req_id)
+            if prefill.req_id in drafting_req_ids:
+                # Target prefill already committed its first output token.
+                # Ingest it so the first draft predicts the following token.
+                prefill = prefill._replace(
+                    token_ids=[*prefill.token_ids, ctx.prefill_token_ids[prefill_index]]
+                )
             plan = self._make_prefill_plan(
                 prefill, result_mode, num_speculative_tokens, drafting_req_ids
             )
@@ -479,11 +489,13 @@ class DraftModelProposer:
         committed_len = prefill.start_pos + len(prefill.token_ids)
         is_drafting = result_mode != "intermediate" and req_id in drafting_req_ids
         assert self._committed_group_index is not None
+        # The ingest includes the target's sampled token. Producing K drafts
+        # then feeds only K-1 more tokens through the draft model.
         block_ids = self._ensure_blocks(
             req_id,
             committed_group_block_ids=prefill.block_ids[self._committed_group_index],
             total_positions=committed_len
-            + (num_speculative_tokens if is_drafting else 0),
+            + (max(num_speculative_tokens - 1, 0) if is_drafting else 0),
         )
         plan = _DraftPlan(
             req_id=req_id,
@@ -766,8 +778,12 @@ def _load_draft_model(
     # Its own instance (patched to its own draft KV cache, so it must not alias
     # the target). AWQ / variable-head-dim drafts aren't handled here yet
     # (canonical loader: ModelLifecycle._load_generation_model).
-    model_path = get_model_download_path(draft_model_config.model)
+    model_path = get_model_download_path(
+        draft_model_config.model, revision=draft_model_config.revision
+    )
     with mlx_lm_compatible_model_path(model_path) as compatible_path:
-        model, _ = mlx_lm_load(str(compatible_path))
+        model, _ = mlx_lm_load(
+            str(compatible_path), revision=draft_model_config.revision
+        )
 
     return model, dims
