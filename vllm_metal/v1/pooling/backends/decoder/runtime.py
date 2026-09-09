@@ -53,6 +53,22 @@ class DecoderModelView:
         return body if callable(body) else None
 
 
+EMBED_POOLING_ARCH_SUFFIXES = ("ForCausalLM", "ForTextEncoding", "EmbeddingModel")
+
+
+def is_embed_pooling_architecture(architectures: Any) -> bool:
+    """True when the architecture list reads as a decoder embedding model.
+
+    Shared between the LAST-token pooler support check and the load-time
+    embedding-only compat scope, so both apply the same rule: pooling
+    classify archs (for example Qwen3 rerankers) never count as embedding.
+    """
+    return any(
+        str(architecture).endswith(EMBED_POOLING_ARCH_SUFFIXES)
+        for architecture in architectures
+    )
+
+
 class LastTokenEmbeddingPooler:
     """Pool decoder hidden states into normalized LAST-token embeddings."""
 
@@ -79,9 +95,13 @@ class LastTokenEmbeddingPooler:
         span: DecoderPoolingSpan,
     ) -> torch.Tensor:
         token_index = span.start_row + span.num_tokens - 1
-        return self._pool_token(hidden_states, token_index)
+        return self._pool_token(
+            hidden_states, token_index, span.pooling_params.dimensions
+        )
 
-    def _pool_token(self, hidden_states: mx.array, token_index: int) -> torch.Tensor:
+    def _pool_token(
+        self, hidden_states: mx.array, token_index: int, dimensions: int | None
+    ) -> torch.Tensor:
         if hidden_states.ndim != 3 or hidden_states.shape[0] != 1:
             raise ValueError(
                 "Metal embed pooling expected hidden states with shape "
@@ -94,7 +114,7 @@ class LastTokenEmbeddingPooler:
                 f"state shape {hidden_states.shape} for model={self.config.label}."
             )
 
-        vector = hidden_states[0, token_index, :].astype(mx.float32)
+        vector = hidden_states[0, token_index, :dimensions].astype(mx.float32)
         vector = self._normalize_vector(vector)
         tensor = mlx_to_torch(vector, device="cpu", already_contiguous=True)
         return tensor.detach().clone()
@@ -105,12 +125,7 @@ class LastTokenEmbeddingPooler:
         return mx.contiguous(vector / norm)
 
     def _is_decoder_embedding(self) -> bool:
-        return any(
-            architecture.endswith("ForCausalLM")
-            or architecture.endswith("ForTextEncoding")
-            or architecture.endswith("EmbeddingModel")
-            for architecture in self.config.architectures
-        )
+        return is_embed_pooling_architecture(self.config.architectures)
 
 
 class MetalDecoderPoolingBackend:

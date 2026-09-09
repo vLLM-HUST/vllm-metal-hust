@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -18,7 +20,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _APPLIED = False
+_EMBEDDING_LOAD_SCOPE: ContextVar[bool] = ContextVar(
+    "vllm_metal_embedding_load_scope", default=False
+)
 _QWEN35_FP8_BLOCK_SIZE = 128
+_QWEN3_BACKBONE_ROOTS = frozenset({"embed_tokens", "layers", "norm", "lm_head"})
 _EXAONE4_LAYER_TYPE = {"L": "sliding_attention", "G": "full_attention"}
 
 
@@ -33,6 +39,7 @@ def apply_compat_patches() -> None:
     _apply_bytelevel_patch_during_registration()
     ensure_vllm_auto_fit_null_block_patch()
     _patch_mlx_lm_qwen35_fp8_sanitize()
+    _patch_mlx_lm_qwen3_flat_weight_prefix()
     _patch_transformers_exaone4_config()
 
 
@@ -990,5 +997,112 @@ def _wrap_model_sanitize(
         return original_sanitize(self, transform(self, weights))
 
     setattr(_patched_sanitize, sentinel_attr, True)
+    _patched_sanitize._vllm_metal_original_sanitize = original_sanitize
     model_cls.sanitize = _patched_sanitize
     return True
+
+
+@contextmanager
+def embedding_load_scope(*, enabled: bool = True) -> Iterator[None]:
+    """Mark the wrapped model load as embedding-only for compat shims.
+
+    The Qwen3 flat-prefix shim below drops mlx_lm's ``lm_head`` module only
+    inside this scope. Embedding pooling reads body hidden states and never
+    calls logits. Classify rerankers read ``lm_head`` logits and generation
+    needs the head tensor, so outside this scope the module stays and strict
+    load fails with the honest missing-tensor error.
+    """
+    if not enabled:
+        yield
+        return
+    token = _EMBEDDING_LOAD_SCOPE.set(True)
+    try:
+        yield
+    finally:
+        _EMBEDDING_LOAD_SCOPE.reset(token)
+
+
+def _qwen3_flat_weight_prefix(
+    model: Any, weights: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    """Re-key flat official Qwen3 checkpoints to mlx_lm's ``model.*`` layout.
+
+    Official Qwen3-Embedding checkpoints (0.6B/4B/8B) store backbone tensors
+    without the ``model.`` prefix that mlx_lm's wrapper ``Model`` expects, so
+    ``load_weights(strict=True)`` rejects every tensor. Only remap when every
+    top-level key is a Qwen3 backbone root; anything already in the
+    ``model.*`` layout (every mlx-community repo) passes through untouched.
+
+    ``lm_head.weight`` keeps its top-level name: upstream ``sanitize`` drops it
+    for tied embeddings, and untied checkpoints own it there. When an untied
+    checkpoint ships no head tensor at all (the official 8B embedding) and the
+    load runs inside ``embedding_load_scope()``, drop the module mlx_lm
+    constructed: embed pooling reads body hidden states and never this
+    module, and mlx ``nn.Module.__delattr__`` removes it from
+    ``parameters()``, so strict load stops demanding a tensor Qwen never
+    wrote.
+    """
+    keys = [str(key) for key in weights]
+    if any(key.startswith("model.") for key in keys):
+        return weights
+    roots = {key.split(".", 1)[0] for key in keys}
+    if not roots or not roots <= _QWEN3_BACKBONE_ROOTS:
+        return weights
+    if (
+        "lm_head.weight" not in weights
+        and not model.args.tie_word_embeddings
+        and getattr(model, "lm_head", None) is not None
+        and _EMBEDDING_LOAD_SCOPE.get()
+    ):
+        delattr(model, "lm_head")
+    return {
+        key if key.startswith("lm_head.") else f"model.{key}": value
+        for key, value in weights.items()
+    }
+
+
+def _patch_mlx_lm_qwen3_flat_weight_prefix() -> bool:
+    """Teach mlx_lm's Qwen3 loader to accept flat official Qwen3 checkpoints.
+
+    Qwen ships the Qwen3-Embedding checkpoints (0.6B/4B/8B) with backbone keys
+    such as ``layers.0....`` while mlx_lm's ``qwen3`` wrapper expects
+    ``model.layers.0....``; upstream ``sanitize`` never remaps, so
+    ``load_weights(strict=True)`` rejects all tensors. Mirrors the Qwen3.5 FP8
+    patch: narrow to the affected model module, upstream control flow intact.
+
+    This is an upstream key-layout shim, not permanent vllm-metal behavior.
+
+    TODO: remove when the pinned mlx_lm remaps flat official
+    checkpoints in ``mlx_lm.models.qwen3.Model.sanitize``. No upstream
+    mlx-lm issue or PR tracks this layout as of 0.32.0; vllm-metal
+    issue #730 carries the report.
+    """
+    from importlib import import_module
+    from importlib.util import find_spec
+
+    if find_spec("mlx_lm.models.qwen3") is None:
+        return False
+    try:
+        qwen3 = import_module("mlx_lm.models.qwen3")
+    except ImportError as exc:
+        logger.warning(
+            "Could not import mlx_lm.models.qwen3 while installing the flat "
+            "Qwen3 weight prefix compatibility patch: %s",
+            exc,
+        )
+        return False
+    model_cls = getattr(qwen3, "Model", None)
+    if model_cls is None:
+        logger.warning(
+            "Could not install the flat Qwen3 weight prefix compatibility "
+            "patch: mlx_lm.models.qwen3 has no Model class."
+        )
+        return False
+    patched = _wrap_model_sanitize(
+        model_cls,
+        "_vllm_metal_qwen3_flat_prefix_patch",
+        _qwen3_flat_weight_prefix,
+    )
+    if patched:
+        logger.debug("Patched mlx_lm Qwen3 flat weight prefix compatibility")
+    return patched

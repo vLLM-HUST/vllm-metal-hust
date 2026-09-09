@@ -90,6 +90,38 @@ curl http://localhost:8000/v1/embeddings \
   -d '{"model":"mlx-community/Qwen3-Embedding-0.6B-8bit","input":["hello metal","semantic search"]}'
 ```
 
+### Reduced Embedding Dimensions
+
+Dense `embed` requests support `dimensions` for Matryoshka-trained models.
+vLLM validates the model's Matryoshka metadata and allowed dimensions before
+scheduling. Metal truncates the pooled hidden state before L2 normalization.
+Without a configured default or request override, embeddings keep their full size.
+
+[Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)
+supports dimensions from 32 to 1024. The MLX conversion used above omits the
+Matryoshka metadata. Setting `is_matryoshka=true` alone lets vLLM accept any
+dimension from 1 to 1024, including values below Qwen's published minimum.
+Add an explicit allowlist to the server command, for example:
+
+```bash
+--hf-overrides '{"is_matryoshka":true,"matryoshka_dimensions":[32,64,128,256,512,1024]}'
+```
+
+This example permits only the listed dimensions. Add other values within
+Qwen's published 32–1024 range to `matryoshka_dimensions` as needed.
+Then request a shorter vector:
+
+```bash
+curl http://localhost:8000/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mlx-community/Qwen3-Embedding-0.6B-8bit","input":["hello metal","semantic search"],"dimensions":256}'
+```
+
+For offline requests, pass `PoolingParams(dimensions=256)` to `LLM.embed`.
+`--pooler-config '{"dimensions":256}'` sets a server default; an explicit
+request dimension overrides it. Use the checkpoint's published Matryoshka
+capabilities when supplying this metadata.
+
 ### Offline Qwen3 Reranking
 
 Original Qwen3 reranker checkpoints need vLLM's sequence-classification

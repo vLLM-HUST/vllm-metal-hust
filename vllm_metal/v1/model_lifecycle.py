@@ -15,7 +15,7 @@ from vllm.logger import init_logger
 
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
-from vllm_metal.compat import apply_compat_patches
+from vllm_metal.compat import apply_compat_patches, embedding_load_scope
 from vllm_metal.compiled_mlp import CompiledMLPBlocks
 from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
@@ -29,6 +29,9 @@ from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_adapter import ModelAdapter
 from vllm_metal.v1.pooling.backends.decoder.factory import (
     build_decoder_pooling_backend,
+)
+from vllm_metal.v1.pooling.backends.decoder.runtime import (
+    is_embed_pooling_architecture,
 )
 from vllm_metal.v1.pooling.backends.encoder.factory import (
     load_encoder_pooling_backend,
@@ -153,7 +156,17 @@ class ModelLifecycle:
             return
 
         request = GenerationLoadRequest.from_runner(self._runner, self._model_adapter)
-        loaded_model = self._load_generation(request)
+        # The headless lm_head shim is embedding-only: embedding pooling never
+        # calls logits. Pooling classify (Qwen3 reranker) reads lm_head, and
+        # generation loads must fail strict load on a headless checkpoint
+        # instead of the first forward pass.
+        with embedding_load_scope(
+            enabled=self._runner._is_pooling
+            and is_embed_pooling_architecture(
+                getattr(request.hf_config, "architectures", None) or ()
+            )
+        ):
+            loaded_model = self._load_generation(request)
 
         self._install_generation_model(loaded_model, request)
 
