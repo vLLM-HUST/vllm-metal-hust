@@ -4,6 +4,7 @@
 import importlib
 import os
 import platform
+import re
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -143,11 +144,10 @@ class TestMetalPlatform:
     @pytest.mark.parametrize(
         ("sampling_params", "control"),
         [
-            (SamplingParams(min_p=0.1), "min_p"),
             (SamplingParams(logit_bias={1: 2.0}), "logit_bias"),
             (SamplingParams(min_tokens=2), "min_tokens"),
         ],
-        ids=["min-p", "logit-bias", "min-tokens"],
+        ids=["logit-bias", "min-tokens"],
     )
     def test_validate_request_rejects_logits_processor_controls(
         self,
@@ -157,6 +157,9 @@ class TestMetalPlatform:
         with pytest.raises(VLLMValidationError, match=control) as exc_info:
             MetalPlatform.validate_request({}, sampling_params)
         assert exc_info.value.parameter == control
+
+    def test_validate_request_accepts_min_p(self) -> None:
+        MetalPlatform.validate_request({}, SamplingParams(min_p=0.2))
 
     def test_check_and_update_config_rejects_pipeline_with_tensor_parallel(
         self,
@@ -200,7 +203,6 @@ class TestMetalPlatform:
     ) -> None:
         """PP admits lazy loaders and rejects proven eager text loaders."""
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         reset_config()
         try:
             vllm_config = self._platform_config(
@@ -413,6 +415,22 @@ class TestMetalPlatform:
         with pytest.raises(NotImplementedError, match="single process"):
             MetalPlatform.check_and_update_config(vllm_config)
 
+    def test_check_and_update_config_rejects_explicit_v2_model_runner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit V2 request fails with the Metal constraint, not Triton's."""
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+
+        with pytest.raises(
+            NotImplementedError,
+            match=re.escape(
+                "VLLM_USE_V2_MODEL_RUNNER=1 is not supported on Metal: MetalWorker "
+                "implements the V1 model runner contract. Unset it (vllm-metal "
+                "defaults it to 0)."
+            ),
+        ):
+            MetalPlatform.check_and_update_config(self._platform_config())
+
     def test_check_and_update_config_rejects_tensor_parallel(self) -> None:
         """Tensor parallelism is unsupported on Metal yet; reject it at config time."""
         vllm_config = self._platform_config(
@@ -529,7 +547,6 @@ class TestMetalPlatform:
         string resolves to a real callable. ray.init is stubbed (no real cluster).
         """
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         init_calls = self._stub_ray(monkeypatch)
         reset_config()
         try:
@@ -564,7 +581,6 @@ class TestMetalPlatform:
         text-only backbone) is NOT rejected under DP — the DP multimodal guard runs
         AFTER normalize_model_config, not before."""
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         self._stub_ray(monkeypatch)
         # normalize clears multimodal_config (text-only backbone).
         monkeypatch.setattr(
@@ -721,7 +737,6 @@ class TestMetalPlatform:
         """A genuine multimodal model (multimodal_config survives normalize) is
         rejected under DP — the tensor-IPC path is DP=1 only."""
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         init_calls = self._stub_ray(monkeypatch)
         # normalize leaves multimodal_config in place (genuine multimodal model).
         monkeypatch.setattr(
@@ -749,7 +764,6 @@ class TestMetalPlatform:
     ) -> None:
         """STT models use a dedicated runner with no DP path; reject DP."""
         self._patch_stt_resolution(monkeypatch, is_stt=True)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         init_calls = self._stub_ray(monkeypatch)
         reset_config()
         try:
@@ -841,7 +855,6 @@ class TestMetalPlatform:
         from ray.runtime_env import RuntimeEnv
 
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         init_calls = self._stub_ray(monkeypatch)
         reset_config()
         try:
@@ -888,7 +901,6 @@ class TestMetalPlatform:
         # Admit path: the supported shape on a real config is accepted and
         # registers the job-level Ray worker hook.
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         init_calls = self._stub_ray(monkeypatch)
         admit_pc = ParallelConfig(
             data_parallel_size=2,
@@ -997,62 +1009,6 @@ class TestMetalPlatform:
         device = MetalPlatform.get_torch_device()
         assert device.type in ("mps", "cpu")
 
-    def test_check_and_update_config_disables_chunked_prefill_non_paged(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Non-paged path should disable chunked prefill.
-
-        When chunked prefill is disabled, max_num_batched_tokens must be at
-        least max_model_len so the scheduler can schedule the entire prompt
-        in a single step.
-        """
-        self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
-        reset_config()
-        try:
-            vllm_config = self._platform_config(
-                speculative_config=None,
-                parallel_config=SimpleNamespace(
-                    worker_cls="auto",
-                    distributed_executor_backend="auto",
-                    pipeline_parallel_size=1,
-                    tensor_parallel_size=1,
-                    disable_custom_all_reduce=False,
-                ),
-                cache_config=SimpleNamespace(
-                    kv_cache_dtype_skip_layers=[],
-                    block_size=None,
-                ),
-                model_config=SimpleNamespace(
-                    model="test-model",
-                    disable_cascade_attn=False,
-                    tokenizer=None,
-                    max_model_len=32768,
-                    multimodal_config=None,
-                    hf_config=SimpleNamespace(model_type="qwen3"),
-                    is_hybrid=False,
-                ),
-                scheduler_config=SimpleNamespace(
-                    async_scheduling=True,
-                    enable_chunked_prefill=True,
-                    max_num_batched_tokens=2048,
-                    max_num_scheduled_tokens=None,
-                ),
-            )
-
-            MetalPlatform.check_and_update_config(vllm_config)
-
-            assert vllm_config.scheduler_config.enable_chunked_prefill is False
-            assert vllm_config.scheduler_config.max_num_batched_tokens == 32768
-            assert (
-                vllm_config.parallel_config.worker_cls
-                == "vllm_metal.v1.worker.MetalWorker"
-            )
-            assert vllm_config.parallel_config.distributed_executor_backend == "uni"
-            assert vllm_config.parallel_config.disable_custom_all_reduce is True
-        finally:
-            reset_config()
-
     def test_check_and_update_config_keeps_chunked_prefill_for_paged_path(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1062,7 +1018,6 @@ class TestMetalPlatform:
         so chunked prefill works correctly on the paged path.
         """
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         reset_config()
         try:
             vllm_config = self._platform_config(
@@ -1164,18 +1119,13 @@ class TestMetalPlatform:
 
         assert vllm_config.scheduler_config.async_scheduling is False
 
-    @pytest.mark.parametrize("paged", ["0", "1"])
     def test_check_and_update_config_rejects_hybrid_all_cache_mode(
-        self, paged: str, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """mamba_cache_mode='all' fails fast on every path, before downgrades."""
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", paged)
         reset_config()
         try:
-            # enable_prefix_caching=True so the non-paged parametrization also
-            # pins that the raise fires BEFORE the APC downgrade overwrites
-            # the mode.
             vllm_config = self._hybrid_vllm_config(
                 SimpleNamespace(
                     block_size=None,
@@ -1190,24 +1140,8 @@ class TestMetalPlatform:
         finally:
             reset_config()
 
-    @pytest.mark.parametrize(
-        "paged,speculative",
-        [
-            ("0", None),
-            (
-                "1",
-                SimpleNamespace(
-                    use_heterogeneous_vocab=False,
-                    num_speculative_tokens=2,
-                ),
-            ),
-        ],
-        ids=["non_paged", "speculative_decoding"],
-    )
     def test_check_and_update_config_downgrades_default_hybrid_prefix_caching(
         self,
-        paged: str,
-        speculative: SimpleNamespace | None,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Hybrid combinations Metal cannot serve downgrade APC, not reject.
@@ -1218,7 +1152,6 @@ class TestMetalPlatform:
         The downgrade restores the upstream APC-off resolution.
         """
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", paged)
         reset_config()
         try:
             vllm_config = self._hybrid_vllm_config(
@@ -1229,7 +1162,10 @@ class TestMetalPlatform:
                     mamba_cache_mode="align",
                     mamba_ssm_cache_dtype="float32",
                 ),
-                speculative_config=speculative,
+                speculative_config=SimpleNamespace(
+                    use_heterogeneous_vocab=False,
+                    num_speculative_tokens=2,
+                ),
             )
             # Upstream resolves mamba_block_size = block_size AFTER CacheConfig
             # construction (models/config.py), so user_specified stays False.
@@ -1254,7 +1190,6 @@ class TestMetalPlatform:
         value with a misleading message; the Metal constraint wins instead.
         """
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
         reset_config()
         try:
             vllm_config = self._hybrid_vllm_config(
@@ -1265,6 +1200,9 @@ class TestMetalPlatform:
                     mamba_cache_mode="align",
                     mamba_block_size=64,
                     mamba_ssm_cache_dtype="float32",
+                ),
+                speculative_config=SimpleNamespace(
+                    use_heterogeneous_vocab=False, num_speculative_tokens=2
                 ),
             )
             assert vllm_config.cache_config.user_specified_mamba_block_size is True
@@ -1277,7 +1215,6 @@ class TestMetalPlatform:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         reset_config()
         try:
             vllm_config = self._hybrid_vllm_config(
@@ -1300,35 +1237,10 @@ class TestMetalPlatform:
         assert cache_config.mamba_cache_mode == "none"
         assert cache_config.mamba_block_size == 32768
 
-    def test_non_paged_hybrid_without_a_family_still_downgrades(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
-        reset_config()
-        try:
-            vllm_config = self._hybrid_vllm_config(
-                SimpleNamespace(
-                    block_size=16,
-                    kv_cache_dtype_skip_layers=[],
-                    enable_prefix_caching=True,
-                    mamba_cache_mode="align",
-                    mamba_ssm_cache_dtype="float32",
-                ),
-                model_type="falcon_h1",
-            )
-            vllm_config.cache_config.mamba_block_size = 16
-            MetalPlatform.check_and_update_config(vllm_config)
-        finally:
-            reset_config()
-
-        assert vllm_config.cache_config.enable_prefix_caching is False
-
     def test_hybrid_family_lookup_uses_the_text_model_type(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         reset_config()
         try:
             vllm_config = self._hybrid_vllm_config(
@@ -1354,7 +1266,6 @@ class TestMetalPlatform:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         reset_config()
         try:
             vllm_config = self._hybrid_vllm_config(
@@ -1377,7 +1288,6 @@ class TestMetalPlatform:
     ) -> None:
         """Paged hybrid + prefix caching (align mode) passes config checks."""
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         reset_config()
         try:
             vllm_config = self._hybrid_vllm_config(
@@ -1409,164 +1319,6 @@ class TestMetalPlatform:
         self._patch_stt_resolution(monkeypatch, is_stt=False)
         MetalPlatform.check_and_update_config(vllm_config)
         assert cache_config.mamba_ssm_cache_dtype == dtype
-
-    def test_check_and_update_config_increases_max_num_scheduled_tokens_below_max_model_len(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """max_num_scheduled_tokens below max_model_len should be bumped up to max_model_len.
-
-        When max_num_scheduled_tokens is explicitly set to a value smaller
-        than max_model_len, it must be raised to match max_model_len so that
-        the scheduler can schedule the full prompt in a single step.
-        """
-        self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
-        reset_config()
-        try:
-            vllm_config = self._platform_config(
-                speculative_config=None,
-                parallel_config=SimpleNamespace(
-                    worker_cls="auto",
-                    distributed_executor_backend="auto",
-                    pipeline_parallel_size=1,
-                    tensor_parallel_size=1,
-                    disable_custom_all_reduce=False,
-                ),
-                cache_config=SimpleNamespace(
-                    kv_cache_dtype_skip_layers=[],
-                    block_size=None,
-                ),
-                model_config=SimpleNamespace(
-                    model="test-model",
-                    disable_cascade_attn=False,
-                    tokenizer=None,
-                    max_model_len=32768,
-                    multimodal_config=None,
-                    hf_config=SimpleNamespace(model_type="qwen3"),
-                    is_hybrid=False,
-                ),
-                scheduler_config=SimpleNamespace(
-                    async_scheduling=True,
-                    enable_chunked_prefill=True,
-                    max_num_batched_tokens=2048,
-                    max_num_scheduled_tokens=2048,
-                ),
-            )
-
-            MetalPlatform.check_and_update_config(vllm_config)
-
-            assert vllm_config.scheduler_config.enable_chunked_prefill is False
-            assert vllm_config.scheduler_config.max_num_batched_tokens == 32768
-            assert vllm_config.scheduler_config.max_num_scheduled_tokens == 32768
-        finally:
-            reset_config()
-
-    def test_check_and_update_config_does_not_reduce_large_max_num_batched_tokens(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """max_num_batched_tokens must not be lowered when already >= max_model_len.
-
-        If the user has explicitly set a token budget larger than max_model_len,
-        that setting must be preserved.
-        """
-        self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
-        reset_config()
-        try:
-            vllm_config = self._platform_config(
-                speculative_config=None,
-                parallel_config=SimpleNamespace(
-                    worker_cls="auto",
-                    distributed_executor_backend="auto",
-                    pipeline_parallel_size=1,
-                    tensor_parallel_size=1,
-                    disable_custom_all_reduce=False,
-                ),
-                cache_config=SimpleNamespace(
-                    kv_cache_dtype_skip_layers=[],
-                    block_size=None,
-                ),
-                model_config=SimpleNamespace(
-                    model="test-model",
-                    disable_cascade_attn=False,
-                    tokenizer=None,
-                    max_model_len=32768,
-                    multimodal_config=None,
-                    hf_config=SimpleNamespace(model_type="qwen3"),
-                    is_hybrid=False,
-                ),
-                scheduler_config=SimpleNamespace(
-                    async_scheduling=True,
-                    enable_chunked_prefill=True,
-                    max_num_batched_tokens=65536,
-                    max_num_scheduled_tokens=None,
-                ),
-            )
-
-            MetalPlatform.check_and_update_config(vllm_config)
-
-            assert vllm_config.scheduler_config.enable_chunked_prefill is False
-            # 65536 > 32768, so the value must stay at 65536
-            assert vllm_config.scheduler_config.max_num_batched_tokens == 65536
-        finally:
-            reset_config()
-
-    @pytest.mark.parametrize("max_num_scheduled_tokens", [32768, 65536])
-    def test_check_and_update_config_does_not_reduce_max_num_scheduled_tokens_when_at_least_max_model_len(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        max_num_scheduled_tokens: int,
-    ) -> None:
-        """max_num_scheduled_tokens must not be lowered when already >= max_model_len.
-
-        If the user has explicitly set a scheduled-token budget at least
-        max_model_len, that setting must be preserved (only values strictly
-        below max_model_len are bumped up).
-        """
-        self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
-        reset_config()
-        try:
-            vllm_config = self._platform_config(
-                speculative_config=None,
-                parallel_config=SimpleNamespace(
-                    worker_cls="auto",
-                    distributed_executor_backend="auto",
-                    pipeline_parallel_size=1,
-                    tensor_parallel_size=1,
-                    disable_custom_all_reduce=False,
-                ),
-                cache_config=SimpleNamespace(
-                    kv_cache_dtype_skip_layers=[],
-                    block_size=None,
-                ),
-                model_config=SimpleNamespace(
-                    model="test-model",
-                    disable_cascade_attn=False,
-                    tokenizer=None,
-                    max_model_len=32768,
-                    multimodal_config=None,
-                    hf_config=SimpleNamespace(model_type="qwen3"),
-                    is_hybrid=False,
-                ),
-                scheduler_config=SimpleNamespace(
-                    async_scheduling=True,
-                    enable_chunked_prefill=True,
-                    max_num_batched_tokens=65536,
-                    max_num_scheduled_tokens=max_num_scheduled_tokens,
-                ),
-            )
-
-            MetalPlatform.check_and_update_config(vllm_config)
-
-            assert vllm_config.scheduler_config.enable_chunked_prefill is False
-            assert vllm_config.scheduler_config.max_num_batched_tokens == 65536
-            assert (
-                vllm_config.scheduler_config.max_num_scheduled_tokens
-                == max_num_scheduled_tokens
-            )
-        finally:
-            reset_config()
 
     def test_check_and_update_config_applies_stt_scheduler_policy(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1682,7 +1434,6 @@ class TestMetalPlatform:
         should_clear: bool,
     ) -> None:
         self._patch_stt_resolution(monkeypatch, is_stt=False)
-        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         if mode is not None:
             monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", mode)
         reset_config()
@@ -1905,24 +1656,16 @@ class TestKvBudgetBytes:
 
 
 class TestAutoFitMaxModelLenChain:
-    """The -1 sentinel drives the Metal null-block auto-fit contract.
+    """The -1 sentinel drives the null-block auto-fit contract on Metal shapes.
 
     Builds the gemma-4-31B mixed-MHA KV shape and runs vLLM's
-    ``get_kv_cache_configs`` against fixed synthetic memory budgets. These
-    tests do not re-test upstream's fitting algorithm; they check Metal's
-    null-block reservation, too-small-pool failure, and current mixed-layout
-    budget shape for issue #505.
+    ``get_kv_cache_configs`` against fixed synthetic memory budgets: the
+    fitted length leaves the null block free, a too-small pool fails, and
+    the mixed layout keeps its budget shape (issue #505).
     """
 
     _NUM_LAYERS = 60
     _MAX_BATCH_TOKENS = 2048
-
-    @pytest.fixture(autouse=True)
-    def _ensure_compat_patches(self) -> None:
-        """The null-block auto-fit patch (compat.py) is part of the contract
-        under test; ensure it directly because plugin activation can skip it
-        while vLLM is partially imported."""
-        compat.ensure_vllm_auto_fit_null_block_patch()
 
     # 16 tokens x (50 x 16 x 256 + 10 x 4 x 512) heads*dims x K/V x bf16 —
     # equals the packed per-block bytes the Metal pool reports.
@@ -1979,11 +1722,13 @@ class TestAutoFitMaxModelLenChain:
         assert len(full_groups) == 1
         assert sum(len(group.layer_names) for group in sliding_groups) == 50
         assert sum(len(group.layer_names) for group in full_groups) == 10
-        assert len(config.kv_cache_tensors) == 10
+        # One tensor per cache group, all describing the same backing allocation.
+        assert len(config.kv_cache_tensors) == 6
+        assert len({tensor.size for tensor in config.kv_cache_tensors}) == 1
         capacity, _ = get_kv_cache_capacity(vllm_config, config)
         assert vllm_config.model_config.max_model_len == self._DERIVED_MAX_LEN
         assert capacity >= self._DERIVED_MAX_LEN
-        assert sum(tensor.size for tensor in config.kv_cache_tensors) <= available
+        assert config.kv_cache_tensors[0].size <= available
 
     def test_insufficient_memory_for_one_block_raises(self) -> None:
         available = self._PACKED_BLOCK_BYTES - 1
