@@ -24,7 +24,7 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
 )
 
 from tests.stub_runner import make_stub_runner  # noqa: E402
-from vllm_metal.attention.caches.mha_layout import KV_CACHE_LAYOUT  # noqa: E402
+from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT  # noqa: E402
 from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
 from vllm_metal.config import AUTO_MEMORY_FRACTION, MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
@@ -38,7 +38,7 @@ from vllm_metal.v1.worker import MetalWorker  # noqa: E402
 class TestKVCacheLayoutRpcs:
     """The engine core resolves one KV layout from every worker's list."""
 
-    _MIXED_MHA_SPECS = (
+    _MIXED_ATTENTION_SPECS = (
         FullAttentionSpec(
             block_size=32, num_kv_heads=4, head_size=512, dtype=torch.bfloat16
         ),
@@ -63,7 +63,7 @@ class TestKVCacheLayoutRpcs:
         layout = resolve_kv_cache_layout(
             vllm_config,
             [worker.get_supported_kv_cache_layouts()],
-            self._MIXED_MHA_SPECS,
+            self._MIXED_ATTENTION_SPECS,
         )
 
         assert layout is KVCacheLayout.LBNHC
@@ -83,7 +83,7 @@ class TestKVCacheLayoutRpcs:
             resolve_kv_cache_layout(
                 VllmConfig(),
                 [worker.get_supported_kv_cache_layouts()],
-                self._MIXED_MHA_SPECS,
+                self._MIXED_ATTENTION_SPECS,
             )
 
     def test_initialize_from_config_records_resolved_layout(self) -> None:
