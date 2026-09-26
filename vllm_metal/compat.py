@@ -13,7 +13,7 @@ import logging
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +35,7 @@ def apply_compat_patches() -> None:
         return
     _APPLIED = True
     _patch_huggingface_hub_relative_redirect_query()
+    _patch_torch_mps_empty_host_cache()
     _patch_vllm_gemma4_mtp_config_loading()
     _apply_bytelevel_patch_during_registration()
     _patch_mlx_lm_qwen35_fp8_sanitize()
@@ -68,7 +69,9 @@ def _patch_huggingface_hub_relative_redirect_query() -> None:
     def _patched_follow_relative_redirects(method: str, url: str, **httpx_kwargs: Any):
         retry_on_errors = httpx_kwargs.pop("retry_on_errors", False)
         no_retry_kwargs = (
-            {} if retry_on_errors else {"retry_on_exceptions": (), "retry_on_status_codes": ()}
+            {}
+            if retry_on_errors
+            else {"retry_on_exceptions": (), "retry_on_status_codes": ()}
         )
         while True:
             current = urlparse(url)
@@ -112,12 +115,35 @@ def _patch_huggingface_hub_relative_redirect_query() -> None:
             break
         return response
 
-    setattr(_patched_follow_relative_redirects, "_vllm_metal_preserves_query", True)
-    _http._httpx_follow_relative_redirects_with_backoff = _patched_follow_relative_redirects
+    _patched_follow_relative_redirects._vllm_metal_preserves_query = True  # type: ignore[attr-defined]
+    _http._httpx_follow_relative_redirects_with_backoff = (
+        _patched_follow_relative_redirects
+    )
     file_download._httpx_follow_relative_redirects_with_backoff = (
         _patched_follow_relative_redirects
     )
     logger.debug("Installed Hugging Face Hub relative redirect compatibility patch")
+
+
+def _patch_torch_mps_empty_host_cache() -> None:
+    """Avoid PyTorch's unsupported MPS host-cache cleanup during vLLM exit."""
+    import torch
+
+    original = getattr(torch.accelerator, "empty_host_cache", None)
+    if original is None or getattr(original, "_metal_mps_guard", False):
+        return
+
+    @wraps(original)
+    def empty_host_cache() -> None:
+        accelerator = torch.accelerator.current_accelerator()
+        # MLX owns model memory, and MPS has no pinned-host caching allocator.
+        # Calling PyTorch's native emptyHostCache on MPS can segfault.
+        if accelerator is not None and accelerator.type == "mps":
+            return
+        original()
+
+    empty_host_cache._metal_mps_guard = True  # type: ignore[attr-defined]
+    torch.accelerator.empty_host_cache = empty_host_cache
 
 
 def _apply_bytelevel_patch_during_registration() -> None:

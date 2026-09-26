@@ -27,10 +27,11 @@ class SyncCompatibilityTests(unittest.TestCase):
         compat = load_compat()
         names = [
             "_patch_huggingface_hub_relative_redirect_query",
+            "_patch_torch_mps_empty_host_cache",
             "_patch_vllm_gemma4_mtp_config_loading",
             "_apply_bytelevel_patch_during_registration",
-            "ensure_vllm_auto_fit_null_block_patch",
             "_patch_mlx_lm_qwen35_fp8_sanitize",
+            "_patch_mlx_lm_qwen3_flat_weight_prefix",
             "_patch_transformers_exaone4_config",
         ]
         calls = []
@@ -94,23 +95,25 @@ class SyncCompatibilityTests(unittest.TestCase):
         )
         self.assertIs(download._httpx_follow_relative_redirects_with_backoff, wrapped)
 
-    def test_upstream_null_block_reservation_survives_merge(self):
+    def test_mps_empty_host_cache_guard_preserves_other_accelerators(self):
         compat = load_compat()
-        budgets = []
-        kv = SimpleNamespace(
-            _estimate_max_model_len_from_groups=lambda cfg, groups, memory: (
-                budgets.append(memory) or memory
-            ),
-            _pool_bytes_per_block=lambda cfg, groups: 16,
+        calls = []
+        accelerator = SimpleNamespace(
+            current_accelerator=lambda: SimpleNamespace(type="mps"),
+            empty_host_cache=lambda: calls.append("original"),
         )
-        core = ModuleType("vllm.v1.core")
-        core.kv_cache_utils = kv
-        with patch.dict(sys.modules, {"vllm.v1.core": core}):
-            compat.ensure_vllm_auto_fit_null_block_patch()
-            compat.ensure_vllm_auto_fit_null_block_patch()
-            kv._estimate_max_model_len_from_groups(None, None, 100)
-            kv._estimate_max_model_len_from_groups(None, None, 8)
-        self.assertEqual(budgets, [84, 0])
+        torch = SimpleNamespace(accelerator=accelerator)
+        with patch.dict(sys.modules, {"torch": torch}):
+            compat._patch_torch_mps_empty_host_cache()
+            guarded = accelerator.empty_host_cache
+            compat._patch_torch_mps_empty_host_cache()
+            self.assertIs(guarded, accelerator.empty_host_cache)
+
+            guarded()
+            accelerator.current_accelerator = lambda: SimpleNamespace(type="cpu")
+            guarded()
+
+        self.assertEqual(calls, ["original"])
 
 
 if __name__ == "__main__":
