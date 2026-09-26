@@ -46,7 +46,37 @@ Native multimodal support currently targets image-only vision-language requests 
 | Model | Support | Runner | Scope | Example checkpoint |
 | --- | --- | --- | --- | --- |
 | Qwen3-VL | 🔵 | native multimodal paged generation | image input, no video | `mlx-community/Qwen3-VL-4B-Instruct-4bit` |
+| Qwen3.5 (dense) | 🔵 | native multimodal paged generation | image input, no video; FP8 checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
 | PaddleOCR-VL | 🔵 | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
+| Gemma 4 | 🔵 | mlx_lm text backbone + mlx-vlm vision sidecar, paged generation | image input, no video/audio, bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4` |
+
+Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
+selective logits, intermediate forward); only `vision_tower` and `embed_vision`
+are loaded from the checkpoint through mlx-vlm. The sidecar activates in
+`VLLM_METAL_MULTIMODAL_MODE=auto` when the checkpoint resolves to a local
+safetensors directory with `vision_tower.*` weights, the HF `Gemma4Processor`
+builds (the checkpoint's `processor_config.json` needs a `video_processor`
+block with transformers 5.14+), the text config has no per-layer inputs, and
+no speculative decoding is configured; otherwise the model stays text-only and
+the reason is logged. A repo id such as the example above only resolves when
+it is already fully cached locally (`hf download <repo>` first) — the sidecar
+never triggers a download itself, and an uncached repo id falls back to
+text-only with a logged reason exactly like a nonexistent local path.
+
+Image soft tokens attend bidirectionally to each other inside their own image
+block on sliding-window layers, matching HF's
+`create_masks_for_vision_model` semantics; full-attention layers and text
+tokens stay causal. The engine logs `Metal: bidirectional image attention: N
+segment(s), M block(s), R row(s)` the first time a prefill batch recomputes an
+image block this way. An image block that does not fit inside one prefill
+step falls back to causal attention for the rest of the request, with a
+warning containing `falling back to causal attention`; raise
+`--max-num-batched-tokens` or lower `--max-num-seqs` to keep the block inside
+one step instead. `--max-num-batched-tokens` must be at least the image
+soft-token count plus two (282 by default, for the boi/eoi tokens) so a block
+fits one prefill step at all. TurboQuant KV cache compression is refused at
+load time in sidecar mode, since bidirectional image attention reads K/V back
+from the paged cache and needs it unquantized.
 
 ## Text-Only Language Models
 
@@ -73,10 +103,8 @@ quantized (Q8_0/Q4_0/Q4_1, not a dense fallback). Scope is dense
 with per-tensor `Q8_0`/`Q4_0`/`Q4_1`; K-quants, fused-QKV, MoE, SSM/hybrid,
 vision, ambiguous remote matches, and sharded remote GGUF files are rejected
 with a clear error. See [GGUF](gguf.md) for serve examples and source
-precedence. The narrow exception is an unused tied `output.weight`: MLX may
-briefly materialize an unsupported qtype such as Q6_K as FP16 before the loader
-discards it. Preflight limits that transient table to 512 MiB. Verified
-end-to-end on Qwen3-0.6B Q4_1 and on Qwen3-0.6B,
+precedence. A tied model's unused `output.weight` is skipped whatever its
+qtype. Verified end-to-end on Qwen3-0.6B Q4_1 and on Qwen3-0.6B,
 Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 ([#415](https://github.com/vllm-project/vllm-metal/issues/415)).
 
