@@ -63,7 +63,13 @@ Remote Hugging Face checkpoints are supported. Pin `revision` in
 Follow the upstream [draft-model guide](https://docs.vllm.ai/en/latest/features/speculative_decoding/draft_model/)
 for configuration details. The draft must use the target vocabulary and full
 attention. Sliding-window and hybrid draft models are rejected at startup.
-Its committed KV cache shares the Metal KV memory budget with the target.
+Its committed KV and speculative lookahead share the Metal KV memory budget
+with the target. The scheduler allocates both; no separate draft scratch pool
+is reserved. Drafting stops when its write span would exceed the smaller of
+the draft model's context limit and the engine's final target context limit.
+When no configured positive draft width can fit, the engine logs the request
+and effective context limit once and continues with target-only decoding.
+Temporary dynamic-width skips and K=0 steps do not trigger this message.
 
 ### Example
 
