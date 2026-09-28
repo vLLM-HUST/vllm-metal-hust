@@ -51,6 +51,7 @@ from vllm_metal.attention.context import (
     prepare_grouped,
 )
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
+from vllm_metal.attention.impls.mm_prefix import image_block_path
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 from vllm_metal.config import get_config
@@ -60,6 +61,7 @@ from vllm_metal.distributed import (
     is_non_last_stage,
     pipeline_send,
 )
+from vllm_metal.metal import get_ops
 from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
 from vllm_metal.multimodal import merge_multimodal_embeddings
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
@@ -1005,7 +1007,7 @@ class MetalModelRunner:
                 speculative_config=spec,
                 parallel_config=self.vllm_config.parallel_config,
                 controller=self._spec_decode_controller,
-                extract_logits=self._model_adapter.extract_logits,
+                model_adapter=self._model_adapter,
                 num_blocks=num_blocks,
                 max_model_len=spec.draft_model_config.max_model_len,
                 max_num_seqs=self.scheduler_config.max_num_seqs,
@@ -1028,12 +1030,16 @@ class MetalModelRunner:
                 "(supported: Gemma4 MTP, draft_model, ngram)."
             )
 
-    def warm_up(self) -> None:
-        """Warm up the model with a dummy forward pass.
+    def get_draft_model_stats(self) -> dict[str, int] | None:
+        """Return ordinary draft-model statistics, or None for other methods."""
+        get_stats = getattr(self._drafter, "get_stats", None)
+        return get_stats() if callable(get_stats) else None
 
-        Paged-attention Metal/MLX kernels JIT-compile lazily on first use,
-        so the paged backend's ``warm_up`` is a no-op; this method only runs
-        a small dummy forward pass.
+    def warm_up(self) -> None:
+        """Warm up the model with a dummy forward pass, then load the kernels.
+
+        For a model whose image blocks attend bidirectionally, also resolve
+        and log the image-block attention path (``_log_image_block_path``).
         """
         if self.model is None:
             logger.warning("Model not loaded, skipping warm-up")
@@ -1047,6 +1053,25 @@ class MetalModelRunner:
 
         if self._paged_attention_runtime is not None:
             self._paged_attention_runtime.warm_up()
+            if getattr(self._multimodal_adapter, "bidirectional_layer_kinds", None):
+                self._log_image_block_path()
+
+    def _log_image_block_path(self) -> None:
+        """Say at startup which path image blocks take, as the forward will.
+
+        Resolving it here also fails a bad ``VLLM_METAL_MM_PREFIX_PATH`` and
+        warns about a build without mm_prefix support before the first image
+        request.
+        """
+        dtype = self.kv_cache_dtype
+        path = image_block_path(get_ops(), float32_cache=dtype == mx.float32)
+        logger.info(
+            "Metal: image blocks attend through the %s "
+            "(VLLM_METAL_MM_PREFIX_PATH=%s, %s KV cache)",
+            "tiled prefill kernel" if path == "kernel" else "MLX recompute",
+            envs.VLLM_METAL_MM_PREFIX_PATH or "kernel",
+            str(dtype).rsplit(".", 1)[-1],
+        )
 
     # ------------------------------------------------------------------
     # Unified prefill + decode (single forward pass)

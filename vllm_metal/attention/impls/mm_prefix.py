@@ -8,8 +8,8 @@ kernel unmasks ``start <= key <= end`` for such rows on top of the causal rule
 and ANDs the sliding window afterwards, which is HF's
 ``(causal OR same_block) AND window``.
 
-Leaf module: numpy only, so the attention impl and tests can import it
-without MLX or torch.
+Leaf module: numpy and ``vllm_metal.envs`` only, so the attention impl, the
+model runner and tests can import it without MLX or torch.
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ from __future__ import annotations
 import functools
 
 import numpy as np
+
+import vllm_metal.envs as envs
 
 MM_PREFIX_PATHS = ("kernel", "recompute")
 
@@ -73,6 +75,32 @@ def resolve_mm_prefix_path(value: str | None, supported: bool) -> str:
         _warn_kernel_path_unavailable()
         return "recompute"
     return value
+
+
+def mm_prefix_path(ops: object) -> str:
+    """The configured image-block attention path for these compiled ops.
+
+    The native ops always advertise ``supports_mm_prefix``, so the probe only
+    fails for a build that predates it (or a test fake).  Such ops serve image
+    blocks through the recompute: the attention impl passes
+    ``mm_prefix_ranges=`` only on the kernel path, and
+    ``resolve_mm_prefix_path`` warns once about the fallback.
+    """
+    supported = bool(getattr(ops, "supports_mm_prefix", lambda: False)())
+    return resolve_mm_prefix_path(envs.VLLM_METAL_MM_PREFIX_PATH, supported)
+
+
+def image_block_path(ops: object, *, float32_cache: bool) -> str:
+    """The path image blocks take with these compiled ops and this KV cache.
+
+    ``mm_prefix_path``, except that a float32 cache keeps the recompute: the
+    tiled kernel has no float32 instantiation, so handing it the ranges would
+    reach the primitive's eager ValueError mid-request.  The attention impl
+    calls this per forward; the model runner calls it once at warm-up, so a
+    bad value or an old build shows at startup and the log names the path.
+    """
+    path = mm_prefix_path(ops)
+    return "recompute" if float32_cache else path
 
 
 @functools.cache
