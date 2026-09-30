@@ -40,9 +40,8 @@ class MLAPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._wrappers: list[MLAPagedAttentionWrapper] = []
 
     def initialize(self, num_blocks: int) -> None:
-        # TODO: Bind latent views to KVCacheStorage with writes that preserve
-        # sharing. Then remove this initializer and MLAPagedLatentCache's
-        # per-layer allocation.
+        # TODO: Move standalone MLA to KVCacheStorage. Hybrid MLA already binds
+        # shared storage through MLAPagedLatentCache.from_upstream().
         self._cache = MLAPagedLatentCache(
             num_layers=self._num_layers,
             latent_dim=self._latent_dim,
@@ -61,7 +60,7 @@ class MLAPagedAttentionRuntime(PagedAttentionRuntimeBase):
         def wrap_layer(layer_idx: int, attn: Any) -> Any:
             if isinstance(attn, MLAPagedAttentionWrapper):
                 # Already patched — refresh cache reference in place.
-                object.__setattr__(attn, "_mla_latent_cache", latent_cache)
+                attn.rebind_cache(latent_cache, cache_idx=layer_idx)
                 wrapper = attn
             else:
                 wrapper = MLAPagedAttentionWrapper(attn, layer_idx, latent_cache)

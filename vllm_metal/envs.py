@@ -12,11 +12,91 @@ During plugin registration (``vllm_metal._register``), the
 ``vllm.envs.environment_variables`` so that ``validate_environ()``
 recognises our variables and does not emit spurious "Unknown vLLM
 environment variable" warnings.
+
+``validate_environment`` parses every variable once at startup (from
+``MetalPlatform.check_and_update_config``) and reports every bad value
+together, so a typo fails the startup rather than the first request that
+reads it.  Boolean switches treat ``"1"`` as on and anything else as off.
 """
 
 import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
+
+MLX_DEVICES = ("gpu", "cpu")
+MULTIMODAL_MODES = ("auto", "multimodal-native", "text-only")
+MM_PREFIX_PATHS = ("kernel", "recompute")
+TQ_PREFILL_MODES = ("auto", "0", "1")
+
+
+def _choice(
+    name: str, default: str | None, choices: tuple[str, ...]
+) -> Callable[[], str | None]:
+    """A variable limited to ``choices``; a bad value lists them."""
+
+    def parse() -> str | None:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        if raw not in choices:
+            raise ValueError(f"{name} must be one of {', '.join(choices)}, got {raw!r}")
+        return raw
+
+    return parse
+
+
+def _int(
+    name: str,
+    default: int,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+    note: str = "",
+) -> Callable[[], int]:
+    """An integer variable; a bad value names the variable and the value."""
+
+    def parse() -> int:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+        too_low = minimum is not None and value < minimum
+        too_high = maximum is not None and value > maximum
+        if too_low or too_high:
+            if maximum is None:
+                bound = f"at least {minimum}"
+            elif minimum is None:
+                bound = f"at most {maximum}"
+            else:
+                bound = f"in [{minimum}, {maximum}]"
+            raise ValueError(f"{name} must be {bound}{note}, got {raw!r}")
+        return value
+
+    return parse
+
+
+def _auto_or_nonnegative_int(name: str, *, unit: str) -> Callable[[], int | str]:
+    """``auto`` (the default) or an integer of at least 0, in ``unit``."""
+
+    def parse() -> int | str:
+        raw = os.getenv(name, "auto")
+        if raw == "auto":
+            return raw
+        try:
+            value: int | None = int(raw)
+        except ValueError:
+            value = None
+        if value is None or value < 0:
+            raise ValueError(
+                f"{name} must be auto or a nonnegative integer in {unit}, got {raw!r}"
+            )
+        return value
+
+    return parse
+
 
 if TYPE_CHECKING:
     VLLM_MLX_DEVICE: str = "gpu"
@@ -30,7 +110,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_DISABLE_NAX: bool = False
     VLLM_METAL_TQ_PREFILL: str = "auto"
-    VLLM_METAL_TQ_PREFILL_MAX_MIB: str = "auto"
+    VLLM_METAL_TQ_PREFILL_MAX_MIB: int | str = "auto"
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
     VLLM_METAL_SPEC_INGEST_CHUNK: int = 1024
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
@@ -39,23 +119,23 @@ if TYPE_CHECKING:
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # MLX device type: "gpu" (default) or "cpu".
-    "VLLM_MLX_DEVICE": lambda: os.getenv("VLLM_MLX_DEVICE", "gpu"),
+    "VLLM_MLX_DEVICE": _choice("VLLM_MLX_DEVICE", "gpu", MLX_DEVICES),
     # Multimodal serving mode:
     # - "auto": known-incompatible multimodal checkpoints fall back to the
     #   text-only compatibility path; Gemma 4 serves images through the
     #   vision sidecar on the mlx_lm text backbone when the checkpoint allows.
     # - "multimodal-native": keep native multimodal loading enabled.
     # - "text-only": force the text-only path for every multimodal checkpoint.
-    "VLLM_METAL_MULTIMODAL_MODE": lambda: os.getenv(
-        "VLLM_METAL_MULTIMODAL_MODE", "auto"
+    "VLLM_METAL_MULTIMODAL_MODE": _choice(
+        "VLLM_METAL_MULTIMODAL_MODE", "auto", MULTIMODAL_MODES
     ),
     # Gemma 4 vision image-block attention path: "kernel" (default) hands the
     # per-row block ranges to the tiled Metal prefill kernel; "recompute"
     # keeps the MLX SDPA recompute of the block rows after the kernel
-    # (the reference path).  Read per forward, and once at warm-up for a model
-    # with image blocks, which rejects any other value at startup
-    # (impls.mm_prefix.resolve_mm_prefix_path).
-    "VLLM_METAL_MM_PREFIX_PATH": lambda: os.getenv("VLLM_METAL_MM_PREFIX_PATH"),
+    # (the reference path).  Read per forward.
+    "VLLM_METAL_MM_PREFIX_PATH": _choice(
+        "VLLM_METAL_MM_PREFIX_PATH", None, MM_PREFIX_PATHS
+    ),
     # Custom cache directory for ModelScope downloads (None if unset).
     "VLLM_METAL_MODELSCOPE_CACHE": lambda: os.getenv("VLLM_METAL_MODELSCOPE_CACHE"),
     # Enable lazy GDN kernels by default.
@@ -97,12 +177,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_DISABLE_NAX": lambda: os.getenv("VLLM_METAL_DISABLE_NAX", "0") == "1",
     # TQ materialized prefill: auto enables only when NAX is available;
     # 1 explicitly opts into tiled prefill on older GPUs, 0 disables it.
-    "VLLM_METAL_TQ_PREFILL": lambda: os.getenv("VLLM_METAL_TQ_PREFILL", "auto"),
+    "VLLM_METAL_TQ_PREFILL": _choice("VLLM_METAL_TQ_PREFILL", "auto", TQ_PREFILL_MODES),
     # Temporary-workspace allowance, deducted before KV sizing. Auto takes
     # 2% of the recommended working set (256 MiB to 2 GiB). A numeric value
     # sets an explicit MiB limit; 0 disables. Set before worker startup.
-    "VLLM_METAL_TQ_PREFILL_MAX_MIB": lambda: os.getenv(
-        "VLLM_METAL_TQ_PREFILL_MAX_MIB", "auto"
+    "VLLM_METAL_TQ_PREFILL_MAX_MIB": _auto_or_nonnegative_int(
+        "VLLM_METAL_TQ_PREFILL_MAX_MIB", unit="MiB"
     ),
     # Spec-decode verification window mode (issue #465). Off by default —
     # verify windows keep the expanded per-token layout (main behavior)
@@ -123,8 +203,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tokens is ~2 ms of draft-model work on a modern M-series chip; a
     # multiple of the block size is recommended. Set to "0" to restore the
     # single-forward behavior.
-    "VLLM_METAL_SPEC_INGEST_CHUNK": lambda: int(
-        os.getenv("VLLM_METAL_SPEC_INGEST_CHUNK", "1024")
+    "VLLM_METAL_SPEC_INGEST_CHUNK": _int(
+        "VLLM_METAL_SPEC_INGEST_CHUNK",
+        1024,
+        minimum=0,
+        note=" (0 means single-forward ingest)",
     ),
     # When set, compile the native _paged_ops extension from source at runtime
     # instead of loading the prebuilt artifact shipped in the wheel. Intended
@@ -142,10 +225,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stage r binds base + r (default 32323/32324 for two stages). Set the same
     # value on every node to move the ring off a busy port. Default matches
     # mlx.launch's starting_port. See distributed.md#pipeline-parallelism.
-    "VLLM_METAL_RING_BASE_PORT": lambda: int(
-        os.getenv("VLLM_METAL_RING_BASE_PORT", "32323")
+    "VLLM_METAL_RING_BASE_PORT": _int(
+        "VLLM_METAL_RING_BASE_PORT",
+        32323,
+        minimum=1024,
+        maximum=65535,
+        note=" (the user-port range)",
     ),
 }
+
+
+def validate_environment() -> None:
+    """Parse every variable once and report all bad values together."""
+    errors = []
+    for name, parse in environment_variables.items():
+        try:
+            parse()
+        except ValueError as exc:
+            message = str(exc)
+            errors.append(message if message.startswith(name) else f"{name}: {message}")
+    if errors:
+        raise ValueError("Invalid vllm-metal environment: " + "; ".join(errors))
 
 
 def __getattr__(name: str) -> Any:

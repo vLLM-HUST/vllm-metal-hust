@@ -24,13 +24,15 @@ from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE as TQ_BLOCK_SIZE,
 )
 from vllm_metal.attention.caches.turboquant import (
-    FWHT_SUPPORTED_HEAD_DIMS,
     QUANT_PARAMS,
     V_QUANT_PARAMS,
     packed_dim,
     prefill_workspace_bytes,
 )
-from vllm_metal.attention.impls.turboquant_prefill import workspace_upper_bound
+from vllm_metal.attention.impls.turboquant_prefill import (
+    dtype_head_reason,
+    workspace_upper_bound,
+)
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
@@ -227,16 +229,12 @@ class ModelCachePolicy:
         # vLLM resolves max_model_len before workers start. Its later auto-fit
         # may shorten the context, but does not reclaim this fixed reservation.
         if runner.vllm_config.speculative_config is None:
-            if (
-                runner.head_dim not in FWHT_SUPPORTED_HEAD_DIMS
-                or self._require_kv_cache_dtype() not in (mx.float16, mx.bfloat16)
+            if reason := dtype_head_reason(
+                self._require_kv_cache_dtype(), runner.head_dim
             ):
                 cap = 0
                 logger.info_once(
-                    "Metal: TurboQuant prefill stays compressed for "
-                    "head_dim=%d, dtype=%s.",
-                    runner.head_dim,
-                    runner.kv_cache_dtype,
+                    "Metal: TurboQuant prefill stays compressed (%s).", reason
                 )
             else:
                 cap = workspace_upper_bound(
@@ -739,6 +737,7 @@ class ModelCachePolicy:
         )
 
     def _build_hybrid_backend(self) -> HybridPagedAttentionRuntime:
+        self._reject_turboquant_for_mla()
         return HybridPagedAttentionRuntime(
             hybrid_plan=self._hybrid_plan(),
             dtype=self._require_kv_cache_dtype(),
@@ -746,19 +745,21 @@ class ModelCachePolicy:
         )
 
     def _build_mla_backend(self, block_size: int) -> MLAPagedAttentionRuntime:
-        config = get_config()
-        if config.turboquant:
-            raise NotImplementedError(
-                "TurboQuant is not supported for MLA models. "
-                "Disable `turboquant` in --additional-config or select a "
-                "non-MLA model."
-            )
+        self._reject_turboquant_for_mla()
         return MLAPagedAttentionRuntime(
             num_layers=self._runner.num_layers,
             latent_dim=self._runner.mla_latent_dim,
             block_size=block_size,
             dtype=self._require_kv_cache_dtype(),
         )
+
+    def _reject_turboquant_for_mla(self) -> None:
+        if self._runner.is_mla and get_config().turboquant:
+            raise NotImplementedError(
+                "TurboQuant is not supported for MLA models. "
+                "Disable `turboquant` in --additional-config or select a "
+                "non-MLA model."
+            )
 
     def _build_sdpa_backend(self, block_size: int) -> SDPAPagedAttentionRuntime:
         num_layers, cache_idx_map = self._cache_layer_mapping()
@@ -842,10 +843,9 @@ class ModelCachePolicy:
         return self._runner.num_kv_cache_layers
 
     def _use_turboquant(self, config: MetalConfig) -> bool:
-        # Hybrid models compress their SDPA layers too (see
-        # ``_build_hybrid_backend``), so they must not be excluded here:
-        # every scheduler-visible sizing path (specs, per-block bytes,
-        # one-sequence estimates) has to agree with the runtime layout.
+        # Hybrid models with standard attention compress their SDPA layers too,
+        # so every sizing path must agree with the runtime layout. Hybrid MLA
+        # is excluded here and rejected when its backend is built.
         return bool(config.turboquant and not self._runner.is_mla)
 
     def _kv_factor(self) -> int:

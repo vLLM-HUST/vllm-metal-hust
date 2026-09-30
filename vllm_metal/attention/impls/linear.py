@@ -283,8 +283,9 @@ class GDNPagedAttentionWrapper(nn.Module):
             )
         ]
         inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        rms_eps = 1e-6 * inv_scale**2
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, rms_eps)
+        k = inv_scale * mx.fast.rms_norm(k, None, rms_eps)
         return q, k, v
 
     def _compute_gates(

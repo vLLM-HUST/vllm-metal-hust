@@ -156,7 +156,8 @@ build_native_artifacts() {
 }
 
 # Fail unless the freshly built wheel actually bundles the prebuilt native
-# artifacts: the _paged_ops*.so extension, three required metallibs, and NAX.
+# artifacts: the _paged_ops*.so extension, its MLX version record, three
+# required metallibs, and NAX.
 # setup.py's package data is what pulls these (gitignored)
 # files in; if that ever regresses, the wheel would install fine but fail at
 # first run with "Prebuilt native extension not found". The expected filenames
@@ -169,8 +170,9 @@ verify_wheel_artifacts() {
 
   local expected
   if ! expected=$(python -c "
-from vllm_metal.metal.build import METALLIB_NAMES, NAX_METALLIB_NAME, metallib_path, output_path
+from vllm_metal.metal.build import METALLIB_NAMES, NAX_METALLIB_NAME, metallib_path, mlx_version_path, output_path
 print(output_path().name)
+print(mlx_version_path().name)
 for _name in (*METALLIB_NAMES, NAX_METALLIB_NAME):
     print(metallib_path(_name).name)
 "); then

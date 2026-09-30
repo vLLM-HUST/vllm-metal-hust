@@ -42,6 +42,7 @@ def initialize_hybrid_runtime(
     num_kv_heads=1,
     head_dim=4,
     mamba_cache_mode="none",
+    mla=False,
 ):
     """Build the test runtime from vLLM's real grouping and placement functions."""
     from dataclasses import replace
@@ -50,12 +51,13 @@ def initialize_hybrid_runtime(
         get_kv_cache_config_from_groups,
         get_kv_cache_groups,
     )
-    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
 
     from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
 
     plan = runtime._hybrid_plan
-    attention = FullAttentionSpec(
+    attention_cls = MLAAttentionSpec if mla else FullAttentionSpec
+    attention = attention_cls(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
         head_size=head_dim,
@@ -345,6 +347,29 @@ _GDN_FAMILY_SPEC = build_hybrid_runtime_plan(
     2,
     (torch.float16, torch.float32),
 ).family
+
+
+def make_bailing_hybrid_plan(
+    num_layers: int,
+    *,
+    state_dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.float32),
+    **overrides: Any,
+) -> HybridRuntimePlan:
+    """Build a small Bailing V3 plan through the production family owner."""
+    return build_hybrid_runtime_plan(
+        {
+            "model_type": "bailing_hybrid",
+            "layer_group_size": 2,
+            "num_attention_heads": 2,
+            "head_dim": 4,
+            "short_conv_kernel_size": 3,
+            "no_kda_lora": True,
+            "kda_safe_gate": True,
+            **overrides,
+        },
+        num_layers,
+        state_dtypes,
+    )
 
 
 def make_gdn_hybrid_plan(

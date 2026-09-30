@@ -1875,6 +1875,27 @@ class TestNativeGDNStateScatter:
         mx.eval(out)
         np.testing.assert_array_equal(np.array(pool[2]), 1.0)
 
+    @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+    @pytest.mark.parametrize("width", [5, 12])
+    def test_paged_scatter_preserves_padding_and_untouched_slots(
+        self, dtype, width
+    ) -> None:
+        ops = _get_native_ops_or_skip()
+        page_stride = 4 * width
+        backing = mx.full((2 * page_stride,), 99, dtype=dtype)
+        pool = ops.as_strided(backing, (2, 3, width), (page_stride, width, 1))
+        slots = mx.array([4, 1, 5], dtype=mx.int32)
+        values = mx.arange(3 * width).reshape(3, width).astype(dtype)
+
+        updated = ops.gdn_state_scatter(pool, values, slots, paged=True)
+        mx.eval(updated)
+
+        expected = np.full(2 * page_stride, 99, dtype=np.float32)
+        for row, slot in enumerate([4, 1, 5]):
+            start = (slot // 3) * page_stride + (slot % 3) * width
+            expected[start : start + width] = np.arange(row * width, (row + 1) * width)
+        np.testing.assert_array_equal(np.array(backing.astype(mx.float32)), expected)
+
     @pytest.mark.parametrize("dtype", [mx.uint8, mx.int8, mx.float16, mx.float32])
     @pytest.mark.parametrize(("dst_offset", "src_offset"), [(1, 0), (0, 1), (3, 1)])
     @pytest.mark.parametrize("zero", [False, True])

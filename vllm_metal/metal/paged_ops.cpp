@@ -1378,8 +1378,9 @@ void init_gdn_library(const std::string& src) {
 
 class GDNStateScatterPrimitive : public Primitive {
  public:
-  explicit GDNStateScatterPrimitive(Stream stream, bool zero = false)
-      : Primitive(stream), zero_(zero) {}
+  explicit GDNStateScatterPrimitive(
+      Stream stream, bool zero = false, bool paged = false)
+      : Primitive(stream), zero_(zero), paged_(paged) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
     throw std::runtime_error("GDNStateScatterPrimitive only supports GPU");
@@ -1399,20 +1400,23 @@ class GDNStateScatterPrimitive : public Primitive {
     if (n == 0) {
       return;
     }
-    int row_elems = static_cast<int>(pool.size() / pool.shape(0));
+    int tokens_per_page = paged_ ? pool.shape(1) : 1;
+    int row_elems = static_cast<int>(
+        pool.size() / pool.shape(0) / tokens_per_page);
 
     // Both GPU kernels scatter the same rows. Select four elements per thread
     // for dense, vector-aligned rows, or one element per thread for other views.
     // This selection happens before launch.
     bool dense_row = true;
     size_t inner_stride = 1;
-    for (int axis = pool.ndim() - 1; axis > 0; --axis) {
+    for (int axis = pool.ndim() - 1; axis >= (paged_ ? 2 : 1); --axis) {
       dense_row &= pool.shape(axis) == 1 || pool.strides()[axis] == inner_stride;
       inner_stride *= pool.shape(axis);
     }
     // Row sizes alone do not guarantee aligned vector access to sliced views.
     const size_t vector_bytes = 4 * pool.itemsize();
     bool vec4 = dense_row && (row_elems % 4) == 0 && (pool.strides()[0] % 4) == 0
+        && (!paged_ || (pool.strides()[1] % 4) == 0)
         && reinterpret_cast<uintptr_t>(pool.data<char>()) % vector_bytes == 0
         && (zero_ || reinterpret_cast<uintptr_t>(src.data<char>()) % vector_bytes == 0);
     int lanes = vec4 ? row_elems / 4 : row_elems;
@@ -1432,12 +1436,21 @@ class GDNStateScatterPrimitive : public Primitive {
     enc.set_input_array(dst_ids,     2);
     enc.set_bytes(lanes,             3);
     int64_t row_stride = pool.strides()[0] / (vec4 ? 4 : 1);
+    int64_t token_stride = paged_ ? pool.strides()[1] / (vec4 ? 4 : 1) : 0;
     enc.set_bytes(row_stride,        4);
     enc.set_bytes(zero_,             8);
+    enc.set_bytes(tokens_per_page,   9);
+    enc.set_bytes(token_stride,     10);
     if (!vec4) {
-      enc.set_vector_bytes(pool.shape(), 5);
-      enc.set_vector_bytes(pool.strides(), 6);
-      int ndim = dense_row ? 0 : pool.ndim();
+      auto row_shape = pool.shape();
+      auto row_strides = pool.strides();
+      if (paged_) {
+        row_shape.erase(row_shape.begin());
+        row_strides.erase(row_strides.begin());
+      }
+      enc.set_vector_bytes(row_shape, 5);
+      enc.set_vector_bytes(row_strides, 6);
+      int ndim = dense_row ? 0 : static_cast<int>(row_shape.size());
       enc.set_bytes(ndim, 7);
     }
 
@@ -1459,17 +1472,24 @@ class GDNStateScatterPrimitive : public Primitive {
 
   bool is_equivalent(const Primitive& other) const override {
     auto* rhs = dynamic_cast<const GDNStateScatterPrimitive*>(&other);
-    return rhs && rhs->zero_ == zero_;
+    return rhs && rhs->zero_ == zero_ && rhs->paged_ == paged_;
   }
  private:
   bool zero_;
+  bool paged_;
 };
 
 static array gdn_state_scatter_primitive_fn(
-    const array& pool, const array& src, const array& dst_ids, bool zero = false) {
-  if (pool.ndim() < 2) {
+    const array& pool, const array& src, const array& dst_ids,
+    bool zero = false, bool paged = false) {
+  if (pool.ndim() < (paged ? 3 : 2)) {
     throw std::runtime_error(
-        "gdn_state_scatter: pool must be [num_slots, ...]");
+        "gdn_state_scatter: pool must be [num_slots, ...] or "
+        "[num_blocks, block_size, ...] with paged=True");
+  }
+  if (paged && (zero || pool.shape(1) == 0)) {
+    throw std::runtime_error(
+        "gdn_state_scatter: paged writes require a positive block size and zero=False");
   }
   if (pool.dtype() != float16 &&
       pool.dtype() != bfloat16 &&
@@ -1486,9 +1506,9 @@ static array gdn_state_scatter_primitive_fn(
   if (dst_ids.ndim() != 1) {
     throw std::runtime_error("gdn_state_scatter: dst_ids must be 1-D");
   }
-  if (src.ndim() != pool.ndim() ||
+  if (src.ndim() != pool.ndim() - (paged ? 1 : 0) ||
       !std::equal(
-          pool.shape().begin() + 1, pool.shape().end(),
+          pool.shape().begin() + (paged ? 2 : 1), pool.shape().end(),
           src.shape().begin() + 1)) {
     throw std::runtime_error(
         "gdn_state_scatter: src row shape does not match pool row shape");
@@ -1502,7 +1522,7 @@ static array gdn_state_scatter_primitive_fn(
   auto contiguous_src = zero ? pool : contiguous(src);
   auto contiguous_ids = contiguous(dst_ids);
   auto prim = std::make_shared<GDNStateScatterPrimitive>(
-      default_stream(Device::gpu), zero);
+      default_stream(Device::gpu), zero, paged);
   return array::make_arrays(
       {pool.shape()}, {pool.dtype()}, prim,
       {pool, contiguous_src, contiguous_ids})[0];
@@ -1970,7 +1990,8 @@ NB_MODULE(_paged_ops, m) {
         "[num_blocks, block_size, num_kv_heads, head_size].");
 
   m.def("gdn_state_scatter",
-        [](nb::handle pool_h, nb::handle src_h, nb::handle ids_h, bool zero) {
+        [](nb::handle pool_h, nb::handle src_h, nb::handle ids_h,
+           bool zero, bool paged) {
           // inst_ptr<array> on a non-array is undefined behaviour, so check
           // before dereferencing: a wrong type must raise, not crash.
           nb::object mx_array_cls =
@@ -1985,7 +2006,7 @@ NB_MODULE(_paged_ops, m) {
           auto result = gdn_state_scatter_primitive_fn(
               *nb::inst_ptr<array>(pool_h),
               *nb::inst_ptr<array>(src_h),
-              *nb::inst_ptr<array>(ids_h), zero);
+              *nb::inst_ptr<array>(ids_h), zero, paged);
 
           // Same placeholder dance as tq_encode / reshape_and_cache: mint an
           // mx.core.array and overwrite_descriptor to bypass cross-module
@@ -1998,12 +2019,15 @@ NB_MODULE(_paged_ops, m) {
           return out;
         },
         nb::arg("pool"), nb::arg("src"), nb::arg("dst_ids"), nb::arg("zero") = false,
+        nb::arg("paged") = false,
         "In-place row scatter into a slot-indexed GDN state pool. Writes "
         "src[i] into pool[dst_ids[i]] without MLX's whole-pool copy preamble; "
         "source rows and indices are made contiguous; destination strides and "
         "backing storage are preserved, so the caller MUST rebind its pool "
         "reference. dst_ids must be distinct int32 slots; src is "
-        "[n, *pool.shape[1:]] with pool's dtype.");
+        "[n, *pool.shape[1:]] with pool's dtype. With paged=True, pool is "
+        "[num_blocks, block_size, ...], src is [n, *pool.shape[2:]], and "
+        "dst_ids address flattened token slots while preserving page padding.");
 
   // Paged attention primitive (read-only): dispatches paged_attention_v2_online.
   // Cache writes are handled by MLX-native scatter upstream.

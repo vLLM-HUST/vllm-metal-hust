@@ -42,6 +42,9 @@ def _stamp_path(artifact: Path) -> Path:
 # The .so's stamp; identical mechanism to each .metallib's (see is_stale).
 _HASH = _stamp_path(_OUT)
 
+# The MLX version build() compiled the .so against; shipped in the wheel.
+_MLX_VERSION = _THIS_DIR / "_paged_ops.mlx-version"
+
 # Names of the three precompiled Metal shader libraries.  Each is the cache-key
 # name the C++ extension registers the library under (passed to
 # ``init_library_path(name, path)`` in paged_ops.cpp), so a later dispatch's
@@ -55,6 +58,10 @@ NAX_METALLIB_NAME = "paged_attention_nax_kern"
 def output_path() -> Path:
     """Path to the prebuilt native extension (whether or not it exists yet)."""
     return _OUT
+
+
+def mlx_version_path() -> Path:
+    return _MLX_VERSION
 
 
 def metallib_path(name: str) -> Path:
@@ -350,6 +357,31 @@ def is_stale(artifact: Path, expected_digest: str) -> bool:
         return False
 
 
+def built_mlx_version() -> str | None:
+    """The MLX version the native extension was built against, if recorded."""
+    try:
+        return _MLX_VERSION.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def mlx_version_mismatch() -> tuple[str, str] | None:
+    """``(built, installed)`` when the extension was built against another MLX.
+
+    The ``.so`` links MLX private headers, so it is only ABI-safe against the
+    exact MLX it was compiled with. ``build()`` records that version next to
+    the artifact and the wheel ships it; an artifact built before the record
+    existed has nothing to compare and loads as before.
+    """
+    built = built_mlx_version()
+    if built is None:
+        return None
+    installed = _package_version("mlx.core")
+    if installed == built:
+        return None
+    return built, installed
+
+
 def stale_artifacts() -> list[Path]:
     """Prebuilt artifacts whose stamp no longer matches the current sources —
     the ``_paged_ops`` ``.so`` (vs ``paged_ops.cpp`` et al.) and each
@@ -405,6 +437,7 @@ def build() -> Path:
     _run_or_raise(spec.cmd, "build paged_ops extension")
 
     _HASH.write_text(expected_hash)
+    _MLX_VERSION.write_text(spec.mlx_version + "\n")
     logger.info("Built %s", _OUT)
     return _OUT
 

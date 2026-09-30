@@ -18,6 +18,7 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.sample.sampler import Sampler
 
 import vllm_metal.attention.impls.mm_prefix as mm_prefix_module
 import vllm_metal.envs as metal_envs
@@ -1576,15 +1577,22 @@ class TestV1MetalModelRunnerExecuteModel:
         monkeypatch.setattr(runner, "_sample_paged_batch", fail)
         with pytest.raises(RuntimeError, match="failed to compile"):
             runner.sample_tokens(None)
+        # Diagnostic text only: the exception would keep the step's frames.
+        assert (
+            runner._sample_failure == "RuntimeError: logprobs kernel failed to compile"
+        )
 
         monkeypatch.setattr(
             runner,
             "_start_paged_forward",
             lambda *args, **kwargs: pytest.fail("the next step must not run"),
         )
-        with pytest.raises(RuntimeError, match="sample_tokens") as info:
+        with pytest.raises(
+            RuntimeError,
+            match=r"sample_tokens failed on the previous step "
+            r"\(RuntimeError: logprobs kernel failed to compile\)",
+        ):
             runner.execute_model(self._make_scheduler_output(["req-0"]))
-        assert info.value.__cause__ is cause
 
     def test_paged_cached_request_without_state_raises(self) -> None:
         runner = self._make_runner()
@@ -2599,6 +2607,100 @@ class _StageDummyRecorder:
 class _FullPathMustNotRun:
     def __call__(self, input_ids: object) -> object:
         raise AssertionError("full-model dummy path must not run on a PP stage")
+
+
+class TestProfileLogitsIndices:
+    """``_profile_logits_indices`` names the rows a maximal step can sample."""
+
+    def _runner(
+        self,
+        *,
+        selective: bool = True,
+        max_num_seqs: int = 8,
+        num_speculative_tokens: int | None = None,
+        multimodal_adapter: object | None = None,
+    ) -> mr.MetalModelRunner:
+        speculative = (
+            None
+            if num_speculative_tokens is None
+            else SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+        )
+        return make_stub_runner(
+            _selective_logits_supported=selective,
+            _multimodal_adapter=multimodal_adapter,
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=8192, max_num_seqs=max_num_seqs
+            ),
+            vllm_config=SimpleNamespace(
+                speculative_config=speculative,
+                lora_config=None,
+                load_config=SimpleNamespace(download_dir=None, ignore_patterns=[]),
+                parallel_config=SimpleNamespace(distributed_executor_backend="uni"),
+            ),
+        )
+
+    def _ids(self, rows: int) -> mx.array:
+        return mx.zeros((1, rows), dtype=mx.int32)
+
+    def test_no_selection_keeps_every_row(self) -> None:
+        # Pipeline parallel and LoRA models cannot select rows, and neither can
+        # a model whose adapter rejects it: all keep the full-head projection
+        # the profile used before.
+        runner = self._runner(selective=False)
+        assert runner._profile_logits_indices(self._ids(64)) is None
+
+    def test_forward_ready_multimodal_adapter_keeps_every_row(self) -> None:
+        # The mm forward projects logits for every packed row, so a step with
+        # an image needs the full-row reserve even when the text path selects.
+        runner = self._runner(multimodal_adapter=SimpleNamespace(forward_ready=True))
+        assert runner._profile_logits_indices(self._ids(64)) is None
+
+    def test_adapter_that_cannot_run_the_mm_forward_still_selects(self) -> None:
+        runner = self._runner(multimodal_adapter=SimpleNamespace(forward_ready=False))
+        indices = runner._profile_logits_indices(self._ids(64))
+        assert indices is not None
+        assert indices.tolist() == [*range(64 - 8, 64)]
+
+    @pytest.mark.parametrize("rows", [1, 7, 8])
+    def test_batch_no_larger_than_the_sampled_rows_keeps_every_row(
+        self, rows: int
+    ) -> None:
+        # A step can sample at most ``max_num_seqs`` rows, so a batch that size
+        # or smaller already is the selective set — no gather, no indices.
+        runner = self._runner(max_num_seqs=8)
+        assert runner._profile_logits_indices(self._ids(rows)) is None
+
+    def test_selects_the_last_rows_a_step_can_sample(self) -> None:
+        runner = self._runner(max_num_seqs=8)
+        indices = runner._profile_logits_indices(self._ids(64))
+        assert indices is not None
+        assert indices.dtype == mx.int32
+        assert indices.tolist() == [*range(64 - 8, 64)]
+
+    def test_one_row_over_the_bound_selects_that_row(self) -> None:
+        # The tight boundary: one request that samples a single row leaves
+        # exactly the rows outside it.
+        runner = self._runner(max_num_seqs=1)
+        indices = runner._profile_logits_indices(self._ids(2))
+        assert indices is not None
+        assert indices.tolist() == [1]
+
+    def test_speculative_tokens_widen_the_sampled_rows(self) -> None:
+        # A verification window reads ``1 + num_speculative_tokens`` rows per
+        # request, so the reserve has to cover that many.
+        runner = self._runner(max_num_seqs=2, num_speculative_tokens=3)
+        indices = runner._profile_logits_indices(self._ids(64))
+        assert indices is not None
+        assert indices.tolist() == [*range(64 - 8, 64)]
+
+    def test_indices_stay_inside_the_batch(self) -> None:
+        rows = 10
+        runner = self._runner(max_num_seqs=3)
+        indices = runner._profile_logits_indices(self._ids(rows))
+        assert indices is not None
+        assert len(indices) == 3
+        assert int(mx.min(indices)) >= 0
+        assert int(mx.max(indices)) < rows
 
 
 class TestDummyForwardOutputsPPRouting:
@@ -3784,6 +3886,83 @@ class TestIntermediateBodyOnlyForward:
         # Act / Assert
         with pytest.raises(RuntimeError, match="must sample"):
             runner._sample_paged_batch()
+
+
+@pytest.mark.parametrize("has_final_prefill", [False, True])
+def test_intermediate_prefill_keeps_rng_and_drafter_bookkeeping(has_final_prefill):
+    runner = make_stub_runner(model_args={"vocab_size": 8}, _sampler=Sampler())
+    # An installed drafter excludes the intermediate-only short-circuit.
+    # It must still receive every chunk, including those that sample nothing.
+    runner._drafter = Mock()
+    runner._drafter.propose.return_value = None
+    params = SamplingParams(temperature=0.8, seed=7, logprobs=2)
+    generator = torch.Generator().manual_seed(7)
+    before = generator.get_state()
+    prefills = [
+        mr.PrefillRequest("chunk", [1, 2], params, [[0]], generator, None, 0, None)
+    ]
+    if has_final_prefill:
+        prefills.append(
+            mr.PrefillRequest(
+                "final",
+                [3, 4],
+                SamplingParams(temperature=0, logprobs=2),
+                [[1]],
+                None,
+                2,
+                0,
+                None,
+            )
+        )
+    batch = mr._ExecutionBatch()
+    for pr in prefills:
+        batch.paged_prefill_entries.append(
+            mr._PendingPrefillEntry(
+                output_idx=batch.add_output(pr.req_id, []),
+                prefill=pr,
+                result_mode="intermediate" if pr.prompt_len is None else "new_final",
+            )
+        )
+    runner._request_states["chunk"] = mr.RequestState(
+        token_ids=[1, 2, 3, 4],
+        prompt_len=4,
+        sampling_params=params,
+        generator=generator,
+        block_ids=[[0]],
+    )
+    boundaries = list(range(0, 2 * len(prefills) + 1, 2))
+    runner._execute_model_state = mr._PagedForwardState(
+        batch=batch,
+        prefill_reqs=prefills,
+        decode_reqs=[],
+        scheduler_output=SimpleNamespace(
+            num_spec_tokens_to_schedule=3, finished_req_ids=set()
+        ),
+        logits=mx.broadcast_to(mx.arange(8), (1, boundaries[-1], 8)).astype(mx.float32),
+        target_hidden_states=None,
+        cu_seqlens=boundaries,
+        logits_cu_seqlens=boundaries,
+        decode_segments=(),
+        num_decode_tokens=0,
+        mm_prefill_deltas={},
+    )
+
+    result, _ = runner._sample_paged_batch()
+
+    assert torch.equal(generator.get_state(), before)
+    assert result.sampled_tokens[0] == []
+    assert result.sample_logprobs[0] is None
+    assert runner._request_states["chunk"].token_ids == [1, 2, 3, 4]
+    assert runner._paged_request_seq_lens["chunk"] == 2
+    runner._drafter.propose.assert_called_once()
+    ctx = runner._drafter.propose.call_args.args[0]
+    assert ctx.prefill_reqs == prefills
+    assert ctx.prefill_result_modes[0] == "intermediate"
+    if has_final_prefill:
+        assert result.sampled_tokens[1] == [7]
+        assert result.sample_logprobs[1].logprob_token_ids[0, 0] == 7
+        assert runner._request_states["final"].token_ids == [3, 4, 7]
+        assert ctx.prefill_token_ids[1] == 7
 
 
 class TestStateBlockIdLifecycle:

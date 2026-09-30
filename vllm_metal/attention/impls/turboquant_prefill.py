@@ -14,16 +14,12 @@ from vllm_metal.attention.caches.turboquant import (
     prefill_bytes_per_token,
 )
 from vllm_metal.attention.context import PagedAttentionContext
+from vllm_metal.metal.constants import KERNEL_BLOCK_SIZES
 
 if TYPE_CHECKING:
     from vllm_metal.attention.impls.sdpa import _KernelMetadata
 
 logger = init_logger(__name__)
-
-# The paged attention Metal kernel is template-instantiated for these block
-# sizes only.  Sorted descending so the kernel block size picker selects the
-# largest valid divisor first, minimising the block-table expansion ratio.
-KERNEL_BLOCK_SIZES = (32, 16, 8)
 
 # Dequantizing cached context must be amortized by enough query rows. Keep
 # short suffixes (including prefix hits) on the compressed kernel. MHA needs
@@ -44,6 +40,15 @@ def min_prefill_tokens(num_query_heads: int, num_kv_heads: int, head_dim: int) -
     )
 
 
+def dtype_head_reason(dtype: mx.Dtype, head_dim: int) -> str | None:
+    """Why a model's dtype/head_dim rule out compressed-KV prefill, or ``None``."""
+    if dtype not in (mx.bfloat16, mx.float16):
+        return f"activation dtype {dtype} requires FP16/BF16"
+    if head_dim not in FWHT_SUPPORTED_HEAD_DIMS:
+        return f"head_dim {head_dim} is unsupported"
+    return None
+
+
 def unsupported_reason(
     *,
     dtype: mx.Dtype,
@@ -52,10 +57,8 @@ def unsupported_reason(
     cache_block_size: int,
     stored_block_size: int,
 ) -> str | None:
-    if dtype not in (mx.bfloat16, mx.float16):
-        return f"activation dtype {dtype} requires FP16/BF16"
-    if head_dim not in FWHT_SUPPORTED_HEAD_DIMS:
-        return f"head_dim {head_dim} is unsupported"
+    if reason := dtype_head_reason(dtype, head_dim):
+        return reason
     if (
         kernel_block_size not in KERNEL_BLOCK_SIZES
         or stored_block_size != cache_block_size
@@ -66,6 +69,21 @@ def unsupported_reason(
             f"kernel={kernel_block_size}) is unsupported"
         )
     return None
+
+
+def _routing_bytes(queries: int, num_query_heads: int, head_dim: int) -> int:
+    # Splitting also gathers Q and concatenates/restores the outputs. Charge
+    # those three FP16/BF16 copies plus query-gather and output-restore indices.
+    query_row_bytes = num_query_heads * head_dim * 2  # FP16/BF16 element width.
+    return queries * (3 * query_row_bytes + 2 * 4)
+
+
+def _split_metadata_bytes(
+    num_sequences: int, fallback_count: int, table_width: int
+) -> int:
+    # Split seq_lens have N int32s; the two cu_seqlens_q have N + 2.
+    # Each fallback needs a padded table row and its int32 gather index.
+    return (2 * num_sequences + 2) * 4 + fallback_count * (table_width + 1) * 4
 
 
 def workspace_upper_bound(
@@ -99,8 +117,8 @@ def workspace_upper_bound(
     )
     if max_num_seqs == 1:
         return materialized
-    routing = queries * (3 * num_query_heads * head_dim * 2 + 2 * 4)
-    split_metadata = (2 * max_num_seqs + 2) * 4 + max_num_seqs * (table_width + 1) * 4
+    routing = _routing_bytes(queries, num_query_heads, head_dim)
+    split_metadata = _split_metadata_bytes(max_num_seqs, max_num_seqs, table_width)
     return materialized + routing + split_metadata
 
 
@@ -165,17 +183,12 @@ def _turboquant_prefill_plan(
     kernel_bs = meta.block_size
     ratio = cache_block_size // kernel_bs
     bytes_per_block = kernel_bs * prefill_bytes_per_token(num_kv_heads, head_dim)
-    # Splitting also gathers Q and concatenates/restores the outputs. Charge
-    # those three FP16/BF16 copies plus query-gather and output-restore indices.
-    query_row_bytes = num_query_heads * head_dim * 2  # FP16/BF16 element width.
-    routing_bytes = cu_seqlens[-1] * (3 * query_row_bytes + 2 * 4)
+    routing_bytes = _routing_bytes(cu_seqlens[-1], num_query_heads, head_dim)
 
     def split_metadata_bytes(fallback_count: int) -> int:
-        # Split seq_lens have N int32s; the two cu_seqlens_q have N + 2.
-        # Each fallback needs a padded table row and its int32 gather index.
-        sequence_bytes = (2 * len(lengths) + 2) * 4
-        table_bytes = fallback_count * (meta.block_tables.shape[1] + 1) * 4
-        return sequence_bytes + table_bytes
+        return _split_metadata_bytes(
+            len(lengths), fallback_count, meta.block_tables.shape[1]
+        )
 
     def select_rows(
         limit: int,

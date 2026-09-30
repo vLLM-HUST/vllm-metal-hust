@@ -17,11 +17,11 @@ from vllm_metal.attention.context import (
     prepare_unified,
 )
 from vllm_metal.attention.impls.sdpa import (
-    KERNEL_BLOCK_SIZES,
     _build_block_tables,
     _kernel_metadata,
     _pick_kernel_block_size,
 )
+from vllm_metal.metal.constants import KERNEL_BLOCK_SIZES
 
 
 class TestPickKernelBlockSize:

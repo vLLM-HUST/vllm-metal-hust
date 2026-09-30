@@ -13,10 +13,13 @@ embedding and output projection; comparisons use that same target precision.
 
 ## Model contract
 
-- Checkpoint target layer IDs name zero-based decoder outputs before final
-  normalization. `DFlashConfig.capture_layer_ids` translates
-  `[1, 9, 17, 25, 33]` to the shared capture bridge's `[2, 10, 18, 26, 34]`,
-  preserving order.
+- Checkpoint target layer ID `i` selects Hugging Face `hidden_states[i + 1]`.
+  Intermediate entries are decoder outputs before final normalization; the
+  final entry is **after** the target's final norm. Use `DFlashTargetCapture`
+  to adapt the shared bridge's pre-norm outputs to this contract. It preserves
+  order and duplicates, and applies the target norm only for a final-layer tap.
+  The reference checkpoint's `[1, 9, 17, 25, 33]` maps to bridge indices
+  `[2, 10, 18, 26, 34]` and needs no final normalization.
 - Each block attends to the complete committed context and every position
   within its own block. Proposal logits come from slots 1 onward.
 - The caller supplies the target projections and full-prefix features.
@@ -27,7 +30,45 @@ embedding and output projection; comparisons use that same target precision.
   unsupported checkpoint semantics fail explicitly.
 - Target geometry checks establish structural compatibility. Use the target
   named by the checkpoint's model card; equal geometry alone does not establish
-  tokenizer identity or training compatibility.
+  tokenizer identity or training compatibility. `load_dflash` requires the
+  target's configuration as `target_config` and checks it before loading weights.
+- `draft_logits` accepts valid target token IDs, normally supplied by the target
+  sampler, and does not read token values back to the CPU. Validate external
+  token IDs with `draft.validate_anchors(anchors)` at the input boundary, outside
+  the compiled or repeated draft forward. Shape and dtype checks remain in the
+  forward; mask IDs and anchors are represented as int64 without narrowing.
+
+## Reuse compiled drafting across context lengths
+
+Create a callable once after loading the draft and target weights, then pass it
+unpadded full-prefix features on each step:
+
+```python
+compiled_draft = draft.compile_draft(
+    num_draft_tokens=15,
+    embed=target.model.embed_tokens,
+    project=project,  # The same tied or untied target head used for qualification.
+)
+logits = compiled_draft(anchors, features)
+```
+
+The callable projects the real prefix, then pads its K/V to multiples of
+`context_bucket_size` (default 256), capped at the checkpoint's position limit minus the block width.
+Buckets also stop at MLX attention dispatch boundaries so padding does not
+select a different reduction algorithm before the real sequence reaches it.
+The callable validates the real prefix length before padding. The compiled
+forward receives that length as a device scalar for RoPE and attention masking, so growing within
+a bucket reuses its graph. Valid context and block keys remain contiguous, with
+masked padding at the end, preserving their attention reduction order.
+
+Call the returned wrapper directly. Prefix projections and padding run outside
+its compiled block forward: padding raw feature rows can change the GEMM
+reduction and BF16 rounding. The block graph receives the padded K/V and is
+reused as the real prefix grows. All rows must still have the same real context
+length. Draft width and weights stay fixed for the callable's lifetime; changing batch size, dtype, or
+bucket can create another graph. External anchors need the same boundary
+validation as `draft_logits`. Bucketing still recomputes full-context K/V and
+adds padded work; it is not scheduler cache integration or a serving speedup claim.
 
 ## Reproduce the numerical comparison
 
@@ -52,12 +93,21 @@ python -m tools.dflash_parity \
     --output /path/to/new-results.json
 ```
 
-The tool uses both capture implementations and compares draft logits and greedy
-proposal IDs at batch sizes 1 and 2, context lengths 17, 33, and 65, and block
-sizes 2, 5, and 16. It records exact equality separately from the numerical
-tolerance (`atol=rtol=1e-3`), rejects non-finite or incomplete comparisons, and
-fails on any proposal mismatch. The report includes snapshot paths, native and
+The tool uses both capture implementations and compares eager, compiled, and
+bucketed compiled draft logits and greedy proposal IDs at batch sizes 1 and 2,
+context lengths 17, 33, 65, 255, 256, 257, 769, 1022, 1023, 1024, and 1025,
+and block sizes 2, 5, 8, 9, and 16.
+It reuses the compiled callables across lengths, including bucket
+and attention dispatch boundaries. Use `--context-bucket-size N` to qualify
+another bucket size; the report records that setting.
+It records exact equality separately from the numerical tolerance
+(`atol=rtol=1e-3`), rejects non-finite or incomplete comparisons,
+and fails on any proposal mismatch. The report includes snapshot paths, native and
 reference source hashes, and library versions. Use a new output file for each run.
+If a checkpoint selects the final target layer, the tool normalizes the reference
+hook's output to match the PyTorch/Hugging Face contract and records that adjustment
+as `reference_final_norm_applied`. Independent tests compare captured features with
+an actual Hugging Face Qwen3 forward, including the final layer and compiled replay.
 
 This is forward parity, not generated-sequence parity or a performance benchmark.
 The independent small-model tests also compare against explicit CPU attention

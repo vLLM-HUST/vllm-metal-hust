@@ -221,7 +221,12 @@ def get_ops() -> ModuleType:
     # 1. Locate the native extension: load the prebuilt artifact by default;
     #    only compile from source when explicitly opted in (no silent fallback).
     from vllm_metal import envs
-    from vllm_metal.metal.build import build, output_path, stale_artifacts
+    from vllm_metal.metal.build import (
+        build,
+        mlx_version_mismatch,
+        output_path,
+        stale_artifacts,
+    )
 
     build_from_source = envs.VLLM_METAL_BUILD_FROM_SOURCE
     if build_from_source:
@@ -248,6 +253,16 @@ def get_ops() -> ModuleType:
                 f"edited without rebuilding. Set VLLM_METAL_BUILD_FROM_SOURCE=1 "
                 f"to build from source, or run `python -m vllm_metal.metal.build` "
                 f"to refresh the prebuilt artifacts."
+            )
+        mismatch = mlx_version_mismatch()
+        if mismatch:
+            built, installed = mismatch
+            raise RuntimeError(
+                f"The prebuilt native extension was built against MLX {built} "
+                f"but MLX {installed} is installed. It links MLX private headers "
+                f"and is only ABI-safe against that exact version. Install "
+                f"mlx=={built}, or set VLLM_METAL_BUILD_FROM_SOURCE=1 to rebuild "
+                f"it against the installed MLX."
             )
 
     # 2. Import the built extension

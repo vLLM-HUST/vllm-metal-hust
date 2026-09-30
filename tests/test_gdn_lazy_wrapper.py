@@ -1149,3 +1149,43 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             np.full(cache.recurrent_states[0].shape, 7, dtype=np.float32),
         )
         assert out.shape == (1, 2, inner.num_v_heads * inner.head_v_dim)
+
+
+class TestSplitAndNormalize:
+    def test_q_k_norm_matches_l2norm_with_eps_on_the_sum_of_squares(self) -> None:
+        inner = _TinyGDNInner()
+        cache = _make_state_cache(
+            conv_kernel_dim=inner.conv_kernel_size,
+            conv_dim=inner.conv_dim,
+            num_v_heads=inner.num_v_heads,
+            value_head_dim=inner.head_v_dim,
+            key_head_dim=inner.head_k_dim,
+        )
+        wrapper = GDNPagedAttentionWrapper(
+            inner, layer_idx=0, cache_idx=0, state_cache=cache
+        )
+        state = attention_linear._GDNForwardState(
+            x=mx.zeros((1, 2, inner.conv_dim), dtype=mx.float32),
+            cu_seqlens=[0, 2],
+            num_requests=1,
+            total_tokens=2,
+            slot_ids=[0],
+            num_decode_requests=0,
+        )
+        # Elements of 1e-3 put sum(x^2) near the 1e-6 eps, where adding it to
+        # the mean instead of the sum changes the result by tens of percent.
+        packed = np.random.default_rng(0).normal(size=(1, 2, inner.conv_dim))
+        packed = (packed * 1e-3).astype(np.float32)
+
+        q, k, _ = wrapper._split_and_normalize(mx.array(packed), state)
+        mx.eval(q, k)
+
+        def l2norm(x: np.ndarray) -> np.ndarray:
+            return x / np.sqrt((x * x).sum(axis=-1, keepdims=True) + 1e-6)
+
+        heads = (1, 2, inner.num_k_heads, inner.head_k_dim)
+        q_in = packed[..., : inner.key_dim].reshape(heads)
+        k_in = packed[..., inner.key_dim : 2 * inner.key_dim].reshape(heads)
+        inv_scale = inner.head_k_dim**-0.5
+        np.testing.assert_allclose(np.array(q), inv_scale * l2norm(q_in), rtol=1e-4)
+        np.testing.assert_allclose(np.array(k), l2norm(k_in), rtol=1e-4)

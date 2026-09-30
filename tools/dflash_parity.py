@@ -13,6 +13,7 @@ import importlib.util
 import json
 import sys
 from dataclasses import fields
+from functools import partial
 from pathlib import Path
 
 import mlx.core as mx
@@ -20,8 +21,7 @@ import numpy as np
 from mlx_lm import load
 
 from tools.attention_bench_utils import package_versions
-from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
-from vllm_metal.v1.dflash import load_dflash
+from vllm_metal.v1.dflash import DFlashTargetCapture, load_dflash
 
 
 def compare(actual: mx.array, expected: mx.array) -> dict:
@@ -40,7 +40,13 @@ def compare(actual: mx.array, expected: mx.array) -> dict:
     }
 
 
-def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
+def qualify(
+    target_path: Path,
+    draft_path: Path,
+    reference_path: Path,
+    *,
+    context_bucket_size: int = 256,
+) -> dict:
     # Loading arbitrary remote Python is deliberately not part of this tool.
     spec = importlib.util.spec_from_file_location("dflash_reference", reference_path)
     if spec is None or spec.loader is None:
@@ -48,8 +54,10 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
     reference = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = reference
     spec.loader.exec_module(reference)
-    draft = load_dflash(draft_path)
-    draft.config.validate_target(json.loads((target_path / "config.json").read_text()))
+    draft = load_dflash(
+        draft_path,
+        target_config=json.loads((target_path / "config.json").read_text()),
+    )
     target, tokenizer = load(str(target_path))
     embed = target.model.embed_tokens
     project = embed.as_linear if target.args.tie_word_embeddings else target.lm_head
@@ -68,16 +76,42 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
     ref_draft.eval()
     ref_draft.bind(target)
     mx.eval(ref_draft.parameters())
-    capture = AuxHiddenStateCapture(target, draft.config.capture_layer_ids)
+    capture = DFlashTargetCapture(target, draft.config)
     prompts = [
         "Explain how a computer works in simple terms.",
         "Write a Python function that adds two numbers and explain it.",
     ]
+    # MLX switches from vector to full attention above eight block queries.
+    widths = sorted(
+        {
+            2,
+            *(min(n, draft.config.block_size) for n in (5, 8, 9)),
+            draft.config.block_size,
+        }
+    )
+    forwards = {
+        width: partial(
+            draft.draft_logits, num_draft_tokens=width - 1, embed=embed, project=project
+        )
+        for width in widths
+    }
+    compiled_forwards = {
+        width: mx.compile(forward) for width, forward in forwards.items()
+    }
+    bucketed_forwards = {
+        width: draft.compile_draft(
+            num_draft_tokens=width - 1,
+            embed=embed,
+            project=project,
+            context_bucket_size=context_bucket_size,
+        )
+        for width in widths
+    }
     rows = []
     for batch in (1, 2):
-        for length in (17, 33, 65):
+        for length in (17, 33, 65, 255, 256, 257, 769, 1022, 1023, 1024, 1025):
             token_rows = [
-                tokenizer.encode(prompts[i] * 12)[:length] for i in range(batch)
+                tokenizer.encode(prompts[i] * 256)[:length] for i in range(batch)
             ]
             if any(len(row) != length for row in token_rows):
                 raise ValueError("Prompt did not produce the requested context length")
@@ -87,7 +121,19 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
             try:
                 reference._patch_model(target, ref_draft.config.target_layer_ids)
                 ref_logits = target(tokens)
-                ref_features = tuple(target._hidden_states)
+                # The MLX hook observes pre-norm decoder outputs. Match the HF
+                # hidden_states[lid + 1] contract used by the PyTorch reference
+                # when a checkpoint requests the final target layer.
+                ref_features = tuple(
+                    target.model.norm(feature)
+                    if lid == ref_draft.config.num_target_layers - 1
+                    else feature
+                    for lid, feature in zip(
+                        ref_draft.config.target_layer_ids,
+                        target._hidden_states,
+                        strict=True,
+                    )
+                )
                 compare(native_logits, ref_logits)
                 capture_checks = [
                     compare(a, b) for a, b in zip(features, ref_features, strict=True)
@@ -97,16 +143,11 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
                 if hasattr(target, "_hidden_states"):
                     delattr(target, "_hidden_states")
             anchors = mx.argmax(native_logits[:, -1], axis=-1)
-            for width in sorted(
-                {2, min(5, draft.config.block_size), draft.config.block_size}
-            ):
-                actual = draft.draft_logits(
-                    anchors,
-                    features,
-                    num_draft_tokens=width - 1,
-                    embed=embed,
-                    project=project,
-                )
+            draft.validate_anchors(anchors)
+            for width in widths:
+                actual = forwards[width](anchors, features)
+                compiled = compiled_forwards[width](anchors, features)
+                bucketed = bucketed_forwards[width](anchors, features)
                 block = mx.concatenate(
                     [
                         anchors[:, None],
@@ -125,10 +166,13 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
                     logits_start=1,
                 )
                 comparison = compare(actual, expected)
-                np.testing.assert_array_equal(
-                    np.array(mx.argmax(actual, axis=-1)),
-                    np.array(mx.argmax(expected, axis=-1)),
-                )
+                compiled_comparison = compare(compiled, expected)
+                bucketed_comparison = compare(bucketed, expected)
+                for logits in (actual, compiled, bucketed):
+                    np.testing.assert_array_equal(
+                        np.array(mx.argmax(logits, axis=-1)),
+                        np.array(mx.argmax(expected, axis=-1)),
+                    )
                 rows.append(
                     {
                         "batch": batch,
@@ -136,15 +180,21 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
                         "block_size": width,
                         "proposal_positions": batch * (width - 1),
                         "logits": comparison,
+                        "compiled_logits": compiled_comparison,
+                        "bucketed_logits": bucketed_comparison,
                         "capture": capture_checks,
                         "argmax_exact": True,
                     }
                 )
                 print(
-                    f"PASS B={batch} context={length} block={width} max_error={comparison['max_abs_error']}",
+                    f"PASS B={batch} context={length} block={width} "
+                    f"eager_error={comparison['max_abs_error']} "
+                    f"compiled_error={compiled_comparison['max_abs_error']} "
+                    f"bucketed_error={bucketed_comparison['max_abs_error']}",
                     flush=True,
                 )
     return {
+        "context_bucket_size": context_bucket_size,
         "target": str(target_path.resolve()),
         "draft": str(draft_path.resolve()),
         "reference_sha256": hashlib.sha256(reference_path.read_bytes()).hexdigest(),
@@ -154,6 +204,8 @@ def qualify(target_path: Path, draft_path: Path, reference_path: Path) -> dict:
         "versions": package_versions("mlx", "mlx-lm", "numpy"),
         "capture_layer_ids": draft.config.capture_layer_ids,
         "draft_layers": draft.config.num_hidden_layers,
+        "reference_final_norm_applied": draft.config.num_target_layers - 1
+        in draft.config.target_layer_ids,
         "cases": rows,
         "passed": True,
     }
@@ -165,12 +217,20 @@ def main() -> None:
     parser.add_argument("--draft", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--context-bucket-size", type=int, default=256)
     args = parser.parse_args()
+    if args.context_bucket_size < 1:
+        parser.error("--context-bucket-size must be a positive integer")
     if args.output.exists():
         parser.error(
             "--output must name a new file, so a failed run cannot leave a stale pass"
         )
-    result = qualify(args.target, args.draft, args.reference)
+    result = qualify(
+        args.target,
+        args.draft,
+        args.reference,
+        context_bucket_size=args.context_bucket_size,
+    )
     args.output.write_text(json.dumps(result, indent=2) + "\n")
 
 

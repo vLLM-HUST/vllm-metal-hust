@@ -321,6 +321,50 @@ class TestPagedAttentionPlanDiagnostics:
         assert plan.kv_budget == 5 * 10**9 - allowance
 
     @pytest.mark.parametrize(
+        "head_dim,kv_cache_dtype", [(96, mx.bfloat16), (128, mx.float32)]
+    )
+    def test_tq_cap_zero_when_dtype_or_head_dim_unsupported(
+        self, monkeypatch, head_dim, kv_cache_dtype
+    ) -> None:
+        """Unsupported dtype/head_dim resolves cap=0 instead of an allowance."""
+        monkeypatch.setenv("VLLM_METAL_TQ_PREFILL", "1")
+        monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "auto")
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.get_config",
+            lambda: MetalConfig(mlx_device="gpu", turboquant=True),
+        )
+        runner = make_stub_runner(
+            num_kv_heads=2,
+            head_dim=head_dim,
+            kv_cache_dtype=kv_cache_dtype,
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=4, max_num_batched_tokens=512
+            ),
+        )
+        assert runner.tq_prefill_workspace_bytes == 0
+
+    def test_tq_speculative_keeps_the_full_auto_allowance(self, monkeypatch) -> None:
+        """cap stays None under speculation: the reservation is not bounded."""
+        from vllm_metal.attention.caches.turboquant import prefill_workspace_bytes
+
+        monkeypatch.setenv("VLLM_METAL_TQ_PREFILL", "1")
+        monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "auto")
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.get_config",
+            lambda: MetalConfig(mlx_device="gpu", turboquant=True),
+        )
+        runner = make_stub_runner(
+            num_kv_heads=2,
+            head_dim=128,
+            kv_cache_dtype=mx.bfloat16,
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=4, max_num_batched_tokens=512
+            ),
+        )
+        runner.vllm_config.speculative_config = object()
+        assert runner.tq_prefill_workspace_bytes == prefill_workspace_bytes()
+
+    @pytest.mark.parametrize(
         "turboquant,mode,expected_mib",
         [(True, "1", 64), (True, "0", 0), (False, "1", 0)],
     )

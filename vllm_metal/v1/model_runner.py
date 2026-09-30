@@ -454,8 +454,9 @@ class MetalModelRunner:
         # Async forward state: stashed by execute_model, consumed by
         # sample_tokens (mirrors upstream's execute_model_state pattern).
         self._execute_model_state: _PagedForwardState | None = None
-        # The exception a sample_tokens call raised; execute_model re-raises it.
-        self._sample_failure: Exception | None = None
+        # What a failed sample_tokens call raised (type and message); the next
+        # execute_model raises on it.
+        self._sample_failure: str | None = None
 
         # Resolved in load_model by probing the output head; False until then so
         # a partially initialized runner keeps full logits.
@@ -927,9 +928,56 @@ class MetalModelRunner:
                 return [output]
             return [self._extract_logits(output)]
 
-        output = self._forward_model(input_ids)
-        logits = self._extract_logits(output)
-        return [logits]
+        logits_indices = self._profile_logits_indices(input_ids)
+        if logits_indices is None:
+            return [self._extract_logits(self._forward_model(input_ids))]
+        return [self._target_forward(input_ids, logits_indices=logits_indices).logits]
+
+    def _profile_logits_indices(self, input_ids: mx.array) -> mx.array | None:
+        """Rows a maximal serving step projects logits for, or ``None`` for all.
+
+        The paged forward projects only the rows
+        :meth:`_paged_logits_layout` selects: every decode row (one per
+        request, ``1 + num_speculative_tokens`` when drafting) plus one row per
+        prompt that completes prefill in the step. Profiling the whole packed
+        batch instead reserves a vocabulary-sized tensor for every packed row —
+        ``max_num_batched_tokens x vocab`` bf16 is ~2.5 GB at the 8192-token
+        default — out of the KV budget, halving the capacity the engine can
+        actually use.
+
+        ``None`` keeps the full-row projection whenever selection cannot apply
+        (pipeline parallel, LoRA, an adapter that rejects it), whenever the
+        model serves multimodal requests, or when the batch is smaller than
+        the rows a step can sample. The mm forward projects every packed row,
+        so on a forward-ready multimodal adapter a step with an image is the
+        worst case whatever the text path selects.
+
+        This is the *sampler's* worst case. A step whose batch carries a
+        prompt-logprobs request projects a logits row for every packed prompt
+        position instead — ``needs_prompt_logprob_rows`` skips both pruning
+        paths — so those steps can exceed the profiled allowance by up to
+        ``max_num_batched_tokens x vocab x dtype size`` (the whole-batch logits
+        tensor). That path is opt-in per request and cannot be disabled by
+        configuration: vLLM caps ``prompt_logprobs`` at ``max_logprobs``, but
+        ``prompt_logprobs=0`` is still accepted. ``_start_paged_forward``
+        warns once when a step first takes it.
+        """
+        adapter = self._multimodal_adapter
+        if not self._selective_logits_supported or (
+            adapter is not None and adapter.forward_ready
+        ):
+            return None
+        rows = int(input_ids.shape[-1])
+        speculative = self.vllm_config.speculative_config
+        num_speculative_tokens = (
+            0 if speculative is None else int(speculative.num_speculative_tokens)
+        )
+        max_sampled_rows = self.scheduler_config.max_num_seqs * (
+            1 + num_speculative_tokens
+        )
+        if max_sampled_rows >= rows:
+            return None
+        return mx.arange(rows - max_sampled_rows, rows, dtype=mx.int32)
 
     def build_paged_attention_runtime(
         self, *, block_size: int
@@ -1091,9 +1139,8 @@ class MetalModelRunner:
     def _log_image_block_path(self) -> None:
         """Say at startup which path image blocks take, as the forward will.
 
-        Resolving it here also fails a bad ``VLLM_METAL_MM_PREFIX_PATH`` and
-        warns about a build without mm_prefix support before the first image
-        request.
+        Resolving it here also warns about a build without mm_prefix support
+        before the first image request.
         """
         dtype = self.kv_cache_dtype
         path = image_block_path(get_ops(), float32_cache=dtype == mx.float32)
@@ -1343,6 +1390,18 @@ class MetalModelRunner:
                 needs_prompt_logprob_rows = self._prompt_logprobs_tracker.wants_any(
                     pr.req_id for pr in prefill_reqs
                 )
+                if needs_prompt_logprob_rows:
+                    # The profiled activation allowance covers the rows the
+                    # sampler reads (see _profile_logits_indices); this step
+                    # projects every packed prompt position instead, so say so
+                    # once rather than letting the KV budget look inclusive.
+                    logger.warning_once(
+                        "A step with prompt logprobs projects a logits row for every "
+                        "packed prompt position — up to max_num_batched_tokens x vocab "
+                        "— which the profiled activation allowance does not reserve. "
+                        "Lower --gpu-memory-utilization if these requests share a "
+                        "large KV cache."
+                    )
                 if (
                     intermediate_only
                     and self._intermediate_forward_supported
@@ -1716,6 +1775,10 @@ class MetalModelRunner:
 
         # ---- postprocess: write results back into batch ----
         for i, entry in enumerate(batch.paged_prefill_entries):
+            if entry.result_mode == "intermediate":
+                batch.set_output(entry.output_idx, [])
+                continue
+
             next_token = prefill_result.token_ids[i]
             logprobs = (
                 prefill_result.logprobs.slice_request(i, 1)
@@ -1723,10 +1786,6 @@ class MetalModelRunner:
                 else None
             )
             prefill = prefill_reqs[i]
-
-            if entry.result_mode == "intermediate":
-                batch.set_output(entry.output_idx, [], logprobs)
-                continue
 
             batch.set_output(entry.output_idx, [next_token], logprobs)
             mm_delta = mm_prefill_deltas.get(prefill.req_id)
@@ -2709,9 +2768,10 @@ class MetalModelRunner:
         """
         if self._sample_failure is not None:
             raise RuntimeError(
-                "sample_tokens failed on the previous step, so its requests "
-                "never received their sampled tokens; no further step can run"
-            ) from self._sample_failure
+                f"sample_tokens failed on the previous step ({self._sample_failure}), "
+                "so its requests never received their sampled tokens; no further "
+                "step can run"
+            )
         if self.model is None:
             raise RuntimeError("Model not loaded")
         if self._uses_encoder_pooling_backend():
@@ -2840,7 +2900,8 @@ class MetalModelRunner:
             # Under async scheduling the engine dispatches the next
             # execute_model before it reads this failure; that step raises it
             # instead of running on request state the sample never updated.
-            self._sample_failure = exc
+            # Store diagnostic text without retaining traceback frames.
+            self._sample_failure = f"{type(exc).__name__}: {exc}"
             raise
 
     def _sample_tokens(

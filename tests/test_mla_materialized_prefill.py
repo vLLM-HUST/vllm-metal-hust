@@ -378,3 +378,173 @@ def test_threshold_none_blocks_only_cached_context_segments(
     assert wrapper._materialized_segments(
         inner, _ctx([4 + 1024, 32], [0, 1024, 1056])
     ) == [False, True]
+
+
+def test_decode_batch_rows_gating(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Batched decode picks single-token rows under the per-row context cap,
+    and only when enough rows batch to amortize the dispatch; rows over the
+    cap or past the padded-volume cap keep the per-segment loop."""
+    import vllm_metal.attention.impls.mla as mla_mod
+
+    _, _, wrapper = _make()
+    route = wrapper._decode_batch_rows
+
+    # Below the row-count floor: nothing batches.
+    assert route(_ctx([16] * 8, list(range(9)))) is None
+
+    monkeypatch.setattr(mla_mod, "_DECODE_BATCH_MIN_ROWS", 4)
+    ctx = _ctx([16] * 4, list(range(5)))
+    assert route(ctx) == [0, 1, 2, 3]
+
+    # Rows over the context cap are excluded; the rest still batch.
+    ctx = _ctx([16, 4096, 16, 16, 16], list(range(6)))
+    assert route(ctx) == [0, 2, 3, 4]
+
+    # Multi-token segments (fresh prefill, continuation chunk) never batch.
+    ctx = _ctx([16, 16, 32, 16, 16], [0, 1, 2, 4, 5, 6])
+    assert route(ctx) == [0, 1, 3, 4]
+
+    # Padded volume past the cap no longer rejects: the batch chunks
+    # inside _absorbed_decode_batch instead.
+    monkeypatch.setattr(mla_mod, "_DECODE_BATCH_MAX_TOKENS", 512)
+    ctx = _ctx([64] * 16, list(range(17)))
+    assert route(ctx) == list(range(16))
+
+    # The row list is memoized on the per-forward metadata.
+    assert mla_mod._mla_metadata(ctx).decode_batch_rows == list(range(16))
+
+
+@pytest.mark.parametrize(
+    ("quantize", "atol"),
+    [(False, 2e-2), (True, 6e-2)],
+    ids=["dense", "quantized-4bit"],
+)
+@pytest.mark.parametrize(
+    "token_cap",
+    [65536, 64],
+    ids=["single-chunk", "chunked"],
+)
+def test_batched_decode_matches_absorbed_loop(
+    quantize: bool, atol: float, token_cap: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """18 decode rows with varied contexts, one over the cap: the short rows
+    take the batched absorbed pass (unequal contexts exercise the padding
+    mask), the long row stays on the per-segment loop, and the packed output
+    matches the all-looped reference.  The chunked variant caps the padded
+    volume so the batch splits into multiple passes instead of falling back
+    to the loop."""
+    import math
+
+    import vllm_metal.attention.impls.mla as mla_mod
+
+    n_rows = 18
+    attn_passes: list[int] = []
+    real_attn = MLAPagedAttentionWrapper._apply_absorbed_mla_attention
+
+    def attn_spy(self, *args, **kwargs):
+        # rq_nope is [n_rows, nheads, 1, dim]: the pass's batch size.
+        attn_passes.append(kwargs["rq_nope"].shape[0])
+        return real_attn(self, *args, **kwargs)
+
+    # _apply_mla_attention is bound to _apply_absorbed_mla_attention at
+    # __init__, so the spy must be installed before the wrapper is built.
+    monkeypatch.setattr(
+        MLAPagedAttentionWrapper, "_apply_absorbed_mla_attention", attn_spy
+    )
+    inner, cache, wrapper = _make(quantize=quantize, num_blocks=64)
+    # Scaled-down gates: the row with 48 cached tokens stays on the
+    # per-segment loop while the other 17 rows batch.  max_ctx is 29, so a
+    # 64-token cap chunks the batch into groups of 2.
+    monkeypatch.setattr(mla_mod, "_DECODE_BATCH_MAX_CTX", 40)
+    monkeypatch.setattr(mla_mod, "_DECODE_BATCH_MIN_ROWS", 4)
+    monkeypatch.setattr(mla_mod, "_DECODE_BATCH_MAX_TOKENS", token_cap)
+
+    # Varied past lengths (16..30) so batched rows pad to the max context.
+    pasts = [16 + 3 * (i % 5) for i in range(n_rows)]
+    pasts[9] = 47  # context 48 > cap -> loops
+    tables: list[list[int]] = []
+    nb = 0
+    for p in pasts:
+        n_blocks = math.ceil((p + 1) / _BLK)
+        tables.append(list(range(nb, nb + n_blocks)))
+        nb += n_blocks
+
+    def slots(block_ids: list[int], start: int, num: int) -> list[int]:
+        return [
+            block_ids[pos // _BLK] * _BLK + pos % _BLK
+            for pos in range(start, start + num)
+        ]
+
+    # Phase 1 seeds each row's past context.
+    ctx1 = pac.PagedAttentionContext(
+        slot_mapping=[
+            s for t, p in zip(tables, pasts, strict=True) for s in slots(t, 0, p)
+        ],
+        block_tables=tables,
+        context_lens=pasts,
+        cu_seqlens=[0] + [int(c) for c in np.cumsum(pasts)],
+        offsets=[0] * n_rows,
+    )
+    x1 = mx.random.normal((1, int(np.cumsum(pasts)[-1]), _HID)).astype(mx.float16)
+
+    # Phase 2: one decode token per row, appended at each row's last slot.
+    ctx2 = pac.PagedAttentionContext(
+        slot_mapping=[slots(t, p, 1)[0] for t, p in zip(tables, pasts, strict=True)],
+        block_tables=tables,
+        context_lens=[p + 1 for p in pasts],
+        cu_seqlens=list(range(n_rows + 1)),
+        offsets=pasts,
+        num_decode_requests=n_rows,
+    )
+    x2 = mx.random.normal((1, n_rows, _HID)).astype(mx.float16)
+
+    absorbed_calls: list[int] = []
+    batched_groups: list[list[int]] = []
+    real_segment = MLAPagedAttentionWrapper._absorbed_segment
+    real_batch = MLAPagedAttentionWrapper._absorbed_decode_batch
+
+    def segment_spy(self, *args, **kwargs):
+        absorbed_calls.append(args[-1])
+        return real_segment(self, *args, **kwargs)
+
+    def batch_spy(self, *args, **kwargs):
+        batched_groups.append(list(args[-1]))
+        return real_batch(self, *args, **kwargs)
+
+    def run() -> mx.array:
+        cache.latent_caches[0] = mx.zeros_like(cache.latent_caches[0])
+        pac.set_context(ctx1)
+        mx.eval(wrapper(x1, mask=None, cache=None))
+        pac.clear_context()
+        absorbed_calls.clear()
+        batched_groups.clear()
+        attn_passes.clear()
+        pac.set_context(ctx2)
+        out = wrapper(x2, mask=None, cache=None)
+        mx.eval(out)
+        pac.clear_context()
+        return out
+
+    monkeypatch.setattr(MLAPagedAttentionWrapper, "_absorbed_segment", segment_spy)
+    monkeypatch.setattr(MLAPagedAttentionWrapper, "_absorbed_decode_batch", batch_spy)
+    out = run()
+    assert absorbed_calls == [9]  # only the over-cap row loops
+    batched = [i for i in range(n_rows) if i != 9]
+    assert batched_groups == [batched]
+    # Chunk size = token_cap // 29 (the batch's max ctx): one pass when the
+    # cap fits, chunked otherwise — never the loop.
+    rows_per = max(1, token_cap // 29)
+    assert attn_passes == [
+        min(rows_per, len(batched) - i) for i in range(0, len(batched), rows_per)
+    ] + [1]
+
+    # Reference: batching gate off -> every row on the per-segment loop.
+    monkeypatch.setattr(
+        MLAPagedAttentionWrapper, "_decode_batch_rows", lambda *a, **k: None
+    )
+    ref = run()
+    assert absorbed_calls == list(range(n_rows))
+    assert batched_groups == []
+
+    assert out.shape == (1, n_rows, _HID)
+    np.testing.assert_allclose(np.array(out), np.array(ref), atol=atol, rtol=1e-2)

@@ -17,6 +17,7 @@ setup(
     package_data={
         "vllm_metal.metal": [
             f"_paged_ops{sysconfig.get_config_var('EXT_SUFFIX')}",
+            "_paged_ops.mlx-version",
             "*.metallib",
             "*.cpp",
             "kernels_v2/*.metal",

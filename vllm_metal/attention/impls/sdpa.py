@@ -53,7 +53,6 @@ from vllm_metal.attention.impls.mm_prefix import (
     image_block_path,
 )
 from vllm_metal.attention.impls.turboquant_prefill import (
-    KERNEL_BLOCK_SIZES,
     _AttentionBatch,
     _turboquant_prefill_plan,
     _TurboQuantPrefillPlan,
@@ -63,6 +62,7 @@ from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
 )
 from vllm_metal.metal import get_ops
+from vllm_metal.metal.constants import KERNEL_BLOCK_SIZES
 
 logger = init_logger(__name__)
 

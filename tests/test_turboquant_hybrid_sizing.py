@@ -17,7 +17,11 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
-from tests.stub_runner import make_gdn_hybrid_plan, make_stub_runner
+from tests.stub_runner import (
+    make_bailing_hybrid_plan,
+    make_gdn_hybrid_plan,
+    make_stub_runner,
+)
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT
 from vllm_metal.config import MetalConfig
 from vllm_metal.platform import MetalPlatform
@@ -80,6 +84,24 @@ def _tq_config() -> MetalConfig:
 
 
 class TestHybridTurboQuantCachePolicy:
+    def test_hybrid_mla_is_rejected(self) -> None:
+        runner = make_stub_runner(
+            model_args={"kv_lora_rank": 512, "qk_rope_head_dim": 64},
+            is_hybrid=True,
+            num_layers=2,
+            hybrid_runtime_plan=make_bailing_hybrid_plan(2),
+            num_kv_heads=1,
+            head_dim=576,
+            kv_cache_dtype=mx.float16,
+            cache_config=SimpleNamespace(mamba_cache_mode="none"),
+        )
+
+        with (
+            patch("vllm_metal.v1.cache_policy.get_config", return_value=_tq_config()),
+            pytest.raises(NotImplementedError, match="TurboQuant.*MLA"),
+        ):
+            runner._cache_policy.build_paged_attention_runtime(block_size=BLOCK_SIZE)
+
     def test_sdpa_specs_report_packed_pages(self) -> None:
         runner = _hybrid_runner()
         with patch("vllm_metal.v1.cache_policy.get_config", return_value=_tq_config()):

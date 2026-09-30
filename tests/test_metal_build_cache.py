@@ -311,3 +311,63 @@ def test_stale_artifacts_propagates_builder_drift(stale_env, monkeypatch):
     monkeypatch.setattr(build, "_metallib_source", _raise(KeyError("gdn_kern")))
     with pytest.raises(KeyError):
         build.stale_artifacts()
+
+
+def test_built_mlx_version_none_when_unrecorded(tmp_path, monkeypatch):
+    monkeypatch.setattr(build, "_MLX_VERSION", tmp_path / "_paged_ops.mlx-version")
+    assert build.built_mlx_version() is None
+
+
+def test_mlx_version_mismatch_reports_built_and_installed(tmp_path, monkeypatch):
+    record = tmp_path / "_paged_ops.mlx-version"
+    record.write_text("0.32.1\n")
+    monkeypatch.setattr(build, "_MLX_VERSION", record)
+    monkeypatch.setattr(build, "_package_version", lambda name: "0.32.3")
+    assert build.mlx_version_mismatch() == ("0.32.1", "0.32.3")
+
+
+def test_mlx_version_mismatch_none_when_installed_matches(tmp_path, monkeypatch):
+    record = tmp_path / "_paged_ops.mlx-version"
+    record.write_text("0.32.1\n")
+    monkeypatch.setattr(build, "_MLX_VERSION", record)
+    monkeypatch.setattr(build, "_package_version", lambda name: "0.32.1")
+    assert build.mlx_version_mismatch() is None
+
+
+def test_mlx_version_mismatch_none_when_unrecorded(tmp_path, monkeypatch):
+    # Artifacts built before the record existed keep loading as they did.
+    monkeypatch.setattr(build, "_MLX_VERSION", tmp_path / "_paged_ops.mlx-version")
+    monkeypatch.setattr(build, "_package_version", lambda name: "0.32.3")
+    assert build.mlx_version_mismatch() is None
+
+
+def test_build_records_the_mlx_version_it_compiled_against(
+    patched, tmp_path, monkeypatch
+):
+    (tmp_path / "libmlx.dylib").write_bytes(b"")
+    spec = dataclasses.replace(
+        patched.spec, py_include=str(tmp_path), mlx_include=tmp_path, mlx_lib=tmp_path
+    )
+    record = tmp_path / "_paged_ops.mlx-version"
+    monkeypatch.setattr(build, "_build_spec", lambda: spec)
+    monkeypatch.setattr(build, "_MLX_VERSION", record)
+    monkeypatch.setattr(build, "_run_or_raise", lambda cmd, what: None)
+
+    build.build()
+
+    assert record.read_text() == "0.31.0\n"
+    assert patched.hsh.read_text() == build._input_hash(spec)
+
+
+def test_get_ops_rejects_an_extension_built_against_another_mlx(tmp_path, monkeypatch):
+    import vllm_metal.metal as metal
+
+    so = tmp_path / "_paged_ops.so"
+    so.write_bytes(b"")
+    monkeypatch.delenv("VLLM_METAL_BUILD_FROM_SOURCE", raising=False)
+    monkeypatch.setattr(metal, "_ops_module", None)
+    monkeypatch.setattr(build, "output_path", lambda: so)
+    monkeypatch.setattr(build, "stale_artifacts", lambda: [])
+    monkeypatch.setattr(build, "mlx_version_mismatch", lambda: ("0.32.1", "0.32.3"))
+    with pytest.raises(RuntimeError, match=r"MLX 0\.32\.1.*MLX 0\.32\.3"):
+        metal.get_ops()

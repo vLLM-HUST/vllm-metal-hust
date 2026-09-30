@@ -509,21 +509,22 @@ def test_two_segments_with_blocks_are_spliced_independently() -> None:
 
 
 @pytest.mark.parametrize("magnitude", [1.5, 2.0, 4.0])
+@pytest.mark.parametrize("poisoned_group", [0, 1])
 def test_tiled_prefill_rows_behind_masked_first_tile_stay_neutral(
-    magnitude,
+    magnitude, poisoned_group
 ) -> None:
-    """The KV tile loop starts at the tile holding the window of the
-    threadgroup's first row, so a row far enough behind it sees that whole
-    first tile masked.  Its -INFINITY row max must not clamp the running
-    max to 0: later in-window keys would be weighted by exp2(score) instead
-    of exp2(score - max), collapsing rows whose real scores are far below 0
-    (#876).
+    """A KV tile fully masked for a row must not affect that row's max
+    state or its V output (#876).  The masked V slots carry +/-fp16-max:
+    a leaked weight swings the output far past the reference, while the
+    correct kernel contributes exactly 0.  (inf would poison the
+    *correct* kernel too — the PV MMA computes 0 * inf = NaN for
+    P == 0 elements.)
 
-    64 rows span two BQ-row threadgroups (BQ == TILE_KV at HD == 64).
-    seq_len 216 puts row 0's window start at key 57 == 25 mod TILE_KV, so
-    the last 25 rows of each threadgroup see the first scanned tile fully
-    masked.  q = a*ones and k = -a*ones + noise put every in-window scaled
-    score near -8*a*a.
+    One threadgroup's first tile is poisoned per case.  Rows of an earlier
+    threadgroup read those keys inside their window, so their reference is
+    dominated by the poison and a relative tolerance says nothing about
+    them; the tight comparison covers the poisoned group and every group
+    after it.
     """
     n, seq_len, window = 64, 216, 96
     cfg = get_ops().tile_config(HD)
@@ -538,11 +539,20 @@ def test_tiled_prefill_rows_behind_masked_first_tile_stay_neutral(
     key_cache = (
         -magnitude * mx.ones(key_cache.shape) + 0.05 * mx.random.normal(key_cache.shape)
     ).astype(DTYPE)
-    mx.eval(query, key_cache)
+    # Keys left of a threadgroup's first row's window start are masked for
+    # every row in the group; poison their V slots.
+    table_row = table[0].tolist()
+    huge = np.finfo(np.float16).max
+    vc = np.array(value_cache)
+    first_row = poisoned_group * bq
+    w0 = row0_win_start + first_row
+    for p in range(w0 - w0 % tile_kv, w0):
+        vc[table_row[p // BLOCK], p % BLOCK] = huge if p % 2 == 0 else -huge
+    value_cache = mx.array(vc)
+    mx.eval(query, key_cache, value_cache)
     got = _kernel(
         query, key_cache, value_cache, table, n=n, seq_len=seq_len, window=window
     )
-    table_row = list(range(1, (seq_len + BLOCK - 1) // BLOCK + 1))
     qi = np.arange(seq_len - n, seq_len)[:, None]
     ki = np.arange(seq_len)[None, :]
     mask = (ki <= qi) & (qi - ki < window)
@@ -552,4 +562,6 @@ def test_tiled_prefill_rows_behind_masked_first_tile_stay_neutral(
         _rows(value_cache, table_row, 0, seq_len),
         mask,
     )
-    np.testing.assert_allclose(np.array(got), ref, atol=1.5e-2, rtol=1e-2)
+    out = np.array(got)
+    assert np.isfinite(out).all()
+    np.testing.assert_allclose(out[first_row:], ref[first_row:], atol=1.5e-2, rtol=1e-2)
