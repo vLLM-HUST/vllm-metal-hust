@@ -13,6 +13,7 @@ from vllm_metal import envs
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
 from vllm_metal.attention.context import PagedAttentionContext, get_context
 from vllm_metal.attention.impls.varlen_rope_compat import apply_packed_rope
+from vllm_metal.metal.constants import MLA_KERNEL_BLOCK_SIZES
 
 # Default rope head dim for GLM/DeepSeek-V2 lineage models.
 # Used as fallback when qk_rope_head_dim is absent from model config.
@@ -203,7 +204,6 @@ class MLAPagedAttentionWrapper(nn.Module):
     # through to the MLX SDPA slow path.
     _KERNEL_KV_LORA_RANK = 512
     _KERNEL_QK_ROPE_HEAD_DIM = 64
-    _KERNEL_BLOCK_SIZES = frozenset({16, 32})
 
     def __init__(
         self,
@@ -347,8 +347,8 @@ class MLAPagedAttentionWrapper(nn.Module):
                 f"qk_rope_head_dim {inner.qk_rope_head_dim}, "
                 f"the kernel takes {self._KERNEL_QK_ROPE_HEAD_DIM}"
             )
-        if latent_cache.block_size not in self._KERNEL_BLOCK_SIZES:
-            sizes = " or ".join(str(s) for s in sorted(self._KERNEL_BLOCK_SIZES))
+        if latent_cache.block_size not in MLA_KERNEL_BLOCK_SIZES:
+            sizes = " or ".join(str(s) for s in sorted(MLA_KERNEL_BLOCK_SIZES))
             return f"block size {latent_cache.block_size}, the kernel takes {sizes}"
         if latent_cache.dtype not in (mx.float16, mx.bfloat16):
             dtype = str(latent_cache.dtype).rsplit(".", 1)[-1]
@@ -536,18 +536,34 @@ class MLAPagedAttentionWrapper(nn.Module):
         n = len(req_indices)
         kv_lora_rank = inner.kv_lora_rank
         kernel = _kernel_inputs(ctx)
-        max_ctx = max(ctx.context_lens[i] for i in req_indices)
 
         meta = _mla_metadata(ctx)
         idx = meta.decode_batch_idx
-        if idx is None or idx.shape[0] != len(req_indices):
-            idx = meta.decode_batch_idx = mx.array(req_indices, dtype=mx.int32)
+        if meta.decode_batch_rows == req_indices:
+            if idx is None:
+                idx = meta.decode_batch_idx = mx.array(req_indices, dtype=mx.int32)
+        else:
+            # A caller outside _decode_batch_rows never populates the
+            # per-forward cache — build a throwaway index for this call.
+            idx = mx.array(req_indices, dtype=mx.int32)
 
         outs = []
-        rows_per = max(1, _DECODE_BATCH_MAX_TOKENS // max_ctx)
-        for c0 in range(0, n, rows_per):
-            rows = req_indices[c0 : c0 + rows_per]
-            cidx = idx[c0 : c0 + len(rows)]
+        c0 = 0
+        while c0 < n:
+            # A chunk's padded volume is (row count * its max context); keep
+            # a running max so the cap holds for any row order. Rows from
+            # _decode_batch_rows are sorted, which keeps that max tight.
+            c1 = c0
+            chunk_max = 0
+            while c1 < n:
+                next_max = max(chunk_max, ctx.context_lens[req_indices[c1]])
+                if (c1 - c0 + 1) * next_max > _DECODE_BATCH_MAX_TOKENS:
+                    break
+                chunk_max = next_max
+                c1 += 1
+            c1 = max(c1, c0 + 1)
+            rows = req_indices[c0:c1]
+            cidx = idx[c0:c1]
             n_c = len(rows)
             max_ctx_c = max(ctx.context_lens[i] for i in rows)
             # Padded block tables are built once per forward (#821); padding
@@ -582,6 +598,7 @@ class MLAPagedAttentionWrapper(nn.Module):
                     causal_mask=valid,
                 )
             )  # [n_c, nheads, 1, v_head_dim]
+            c0 = c1
         return outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=0)
 
     def _decode_batch_rows(self, ctx: Any) -> list[int] | None:
@@ -604,7 +621,12 @@ class MLAPagedAttentionWrapper(nn.Module):
                 for i, ctx_len in enumerate(ctx.context_lens)
                 if cu[i + 1] - cu[i] == 1 and ctx_len <= _DECODE_BATCH_MAX_CTX
             ]
-            meta.decode_batch_rows = idx if len(idx) >= _DECODE_BATCH_MIN_ROWS else []
+            if len(idx) >= _DECODE_BATCH_MIN_ROWS:
+                # Ascending context order keeps each chunk's padded span tight.
+                idx.sort(key=ctx.context_lens.__getitem__)
+            else:
+                idx = []
+            meta.decode_batch_rows = idx
         return meta.decode_batch_rows or None
 
     def _materialized_prefill(

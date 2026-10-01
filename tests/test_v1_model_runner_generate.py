@@ -215,6 +215,7 @@ class TestV1MetalModelRunnerGenerate:
                 logits_processors=None,
                 runner_type="generate",
                 logprobs_mode=logprobs_mode,
+                is_multimodal_model=False,
             ),
             cache_config=SimpleNamespace(),
             scheduler_config=SimpleNamespace(async_scheduling=False),
@@ -2619,6 +2620,7 @@ class TestProfileLogitsIndices:
         max_num_seqs: int = 8,
         num_speculative_tokens: int | None = None,
         multimodal_adapter: object | None = None,
+        supports_mm_inputs: bool = True,
     ) -> mr.MetalModelRunner:
         speculative = (
             None
@@ -2628,6 +2630,7 @@ class TestProfileLogitsIndices:
         return make_stub_runner(
             _selective_logits_supported=selective,
             _multimodal_adapter=multimodal_adapter,
+            _supports_mm_inputs=supports_mm_inputs,
             scheduler_config=SimpleNamespace(
                 max_num_batched_tokens=8192, max_num_seqs=max_num_seqs
             ),
@@ -2660,6 +2663,28 @@ class TestProfileLogitsIndices:
         indices = runner._profile_logits_indices(self._ids(64))
         assert indices is not None
         assert indices.tolist() == [*range(64 - 8, 64)]
+
+    def test_mm_disabled_by_config_restores_the_selective_profile(self) -> None:
+        runner = self._runner(
+            multimodal_adapter=SimpleNamespace(
+                forward_ready=True, requires_explicit_positions=False
+            ),
+            supports_mm_inputs=False,
+        )
+        indices = runner._profile_logits_indices(self._ids(64))
+        assert indices is not None
+        assert indices.tolist() == [*range(64 - 8, 64)]
+
+    def test_explicit_positions_adapter_keeps_every_row_despite_mm_disabled(
+        self,
+    ) -> None:
+        runner = self._runner(
+            multimodal_adapter=SimpleNamespace(
+                forward_ready=True, requires_explicit_positions=True
+            ),
+            supports_mm_inputs=False,
+        )
+        assert runner._profile_logits_indices(self._ids(64)) is None
 
     @pytest.mark.parametrize("rows", [1, 7, 8])
     def test_batch_no_larger_than_the_sampled_rows_keeps_every_row(

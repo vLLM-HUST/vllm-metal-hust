@@ -624,10 +624,12 @@ def sdpa_forward(
     # denominator without contributing a value row (GPT-OSS). Models without
     # sinks leave this None and the kernel keeps its plain-softmax path.
     # The kernel reads them as device float, so cast only when the checkpoint
-    # stored them in another dtype; this is the per-layer hot path.
+    # stored them in another dtype; this is the per-layer hot path.  Write the
+    # widened tensor back to the module so the astype runs once instead of
+    # re-entering the lazy graph on every layer of every forward.
     sinks = getattr(inner, "sinks", None)
     if sinks is not None and sinks.dtype != mx.float32:
-        sinks = sinks.astype(mx.float32)
+        sinks = inner.sinks = sinks.astype(mx.float32)
 
     queries, keys, values, gate, kv_for_sharing = prepare_sdpa_qkv(
         inner,

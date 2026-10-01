@@ -100,6 +100,11 @@ def test_a_bad_value_names_the_variable_and_the_value(
         ("VLLM_METAL_TQ_PREFILL_MAX_MIB", "auto", "auto"),
         ("VLLM_METAL_TQ_PREFILL_MAX_MIB", "0", 0),
         ("VLLM_METAL_TQ_PREFILL_MAX_MIB", "256", 256),
+        # Boolean switches: "1" on, anything else off (documented contract).
+        ("VLLM_METAL_DECODE_PIPELINE", "1", True),
+        ("VLLM_METAL_DECODE_PIPELINE", "0", False),
+        ("VLLM_METAL_MLA_KERNEL", "1", True),
+        ("VLLM_METAL_BUILD_FROM_SOURCE", "yes", False),
     ],
 )
 def test_a_good_value_parses(
@@ -108,6 +113,27 @@ def test_a_good_value_parses(
     monkeypatch.setenv(name, value)
 
     assert getattr(envs, name) == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("VLLM_METAL_GDN_LAZY_KERNELS", True),
+        ("VLLM_METAL_DECODE_PIPELINE", True),
+        ("VLLM_METAL_COMPILED_MLP", False),
+        ("VLLM_METAL_NATIVE_SAMPLING", False),
+        ("VLLM_METAL_MLA_KERNEL", False),
+        ("VLLM_METAL_DISABLE_NAX", False),
+        ("VLLM_METAL_SPEC_VERIFY_WINDOW", False),
+        ("VLLM_METAL_BUILD_FROM_SOURCE", False),
+    ],
+)
+def test_boolean_defaults(
+    monkeypatch: pytest.MonkeyPatch, name: str, expected: bool
+) -> None:
+    monkeypatch.delenv(name, raising=False)
+
+    assert getattr(envs, name) is expected
 
 
 def test_validate_environment_accepts_the_defaults(

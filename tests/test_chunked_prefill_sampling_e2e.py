@@ -4,7 +4,6 @@
 Run explicitly with ``pytest -m slow tests/test_chunked_prefill_sampling_e2e.py``.
 """
 
-import multiprocessing as mp
 import os
 
 import pytest
@@ -120,19 +119,7 @@ def _run_chunked_prefill_sampling(with_draft):
 
 @pytest.mark.slow
 @pytest.mark.parametrize("with_draft", [False, True])
-def test_chunked_prefill_preserves_seeded_sampling_e2e(with_draft):
-    process = mp.get_context("spawn").Process(
-        target=_run_chunked_prefill_sampling, args=(with_draft,)
-    )
-    process.start()
-    try:
-        process.join(timeout=300)
-        assert not process.is_alive(), "Chunked prefill sampling test timed out"
-        assert process.exitcode == 0, "Chunked prefill sampling test failed"
-    finally:
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=10)
-            if process.is_alive():
-                process.kill()
-                process.join(timeout=10)
+def test_chunked_prefill_preserves_seeded_sampling_e2e(
+    with_draft, run_in_spawn_process
+):
+    run_in_spawn_process(_run_chunked_prefill_sampling, with_draft)

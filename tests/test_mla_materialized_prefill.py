@@ -400,6 +400,11 @@ def test_decode_batch_rows_gating(monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = _ctx([16, 4096, 16, 16, 16], list(range(6)))
     assert route(ctx) == [0, 2, 3, 4]
 
+    # Eligible rows come out sorted by context length so chunks group
+    # similar-sized rows and stay tight under the token cap.
+    ctx = _ctx([32, 8, 16, 8, 24], list(range(6)))
+    assert route(ctx) == [1, 3, 2, 4, 0]
+
     # Multi-token segments (fresh prefill, continuation chunk) never batch.
     ctx = _ctx([16, 16, 32, 16, 16], [0, 1, 2, 4, 5, 6])
     assert route(ctx) == [0, 1, 3, 4]
@@ -500,6 +505,7 @@ def test_batched_decode_matches_absorbed_loop(
 
     absorbed_calls: list[int] = []
     batched_groups: list[list[int]] = []
+    batch_calls: list[tuple[tuple, mx.array]] = []
     real_segment = MLAPagedAttentionWrapper._absorbed_segment
     real_batch = MLAPagedAttentionWrapper._absorbed_decode_batch
 
@@ -509,7 +515,9 @@ def test_batched_decode_matches_absorbed_loop(
 
     def batch_spy(self, *args, **kwargs):
         batched_groups.append(list(args[-1]))
-        return real_batch(self, *args, **kwargs)
+        result = real_batch(self, *args, **kwargs)
+        batch_calls.append((args, result))
+        return result
 
     def run() -> mx.array:
         cache.latent_caches[0] = mx.zeros_like(cache.latent_caches[0])
@@ -518,6 +526,7 @@ def test_batched_decode_matches_absorbed_loop(
         pac.clear_context()
         absorbed_calls.clear()
         batched_groups.clear()
+        batch_calls.clear()
         attn_passes.clear()
         pac.set_context(ctx2)
         out = wrapper(x2, mask=None, cache=None)
@@ -530,13 +539,47 @@ def test_batched_decode_matches_absorbed_loop(
     out = run()
     assert absorbed_calls == [9]  # only the over-cap row loops
     batched = [i for i in range(n_rows) if i != 9]
+    # The batch rows are sorted by context length so chunk bounds group
+    # similar-sized rows.
+    batched.sort(key=lambda i: pasts[i])
     assert batched_groups == [batched]
-    # Chunk size = token_cap // 29 (the batch's max ctx): one pass when the
-    # cap fits, chunked otherwise — never the loop.
-    rows_per = max(1, token_cap // 29)
-    assert attn_passes == [
-        min(rows_per, len(batched) - i) for i in range(0, len(batched), rows_per)
-    ] + [1]
+    # Greedy chunks: take sorted rows until count * ctx of the next row would
+    # pass the cap — one pass when the cap fits everything, chunks otherwise.
+    expected_chunks: list[int] = []
+    run_rows = 0
+    for i in batched:
+        if run_rows and (run_rows + 1) * (pasts[i] + 1) > token_cap:
+            expected_chunks.append(run_rows)
+            run_rows = 0
+        run_rows += 1
+    expected_chunks.append(run_rows)
+    assert attn_passes == expected_chunks + [1]
+
+    # The memoized device index is keyed on the row list itself.
+    idx = mla_mod._mla_metadata(ctx2).decode_batch_idx
+    assert idx is not None and idx.tolist() == batched
+
+    # A different same-length row list must get its own index, not the memoized
+    # one, and the token cap must hold for rows that are not sorted.
+    ((call_args, first),) = batch_calls
+    rev_rows = batched[::-1]
+    attn_passes.clear()
+    rev = real_batch(wrapper, *call_args[:-1], rev_rows)
+    mx.eval(rev)
+    expected_rev: list[int] = []
+    run_rows = run_max = 0
+    for i in rev_rows:
+        if run_rows and (run_rows + 1) * max(run_max, pasts[i] + 1) > token_cap:
+            expected_rev.append(run_rows)
+            run_rows = run_max = 0
+        run_rows += 1
+        run_max = max(run_max, pasts[i] + 1)
+    expected_rev.append(run_rows)
+    assert attn_passes == expected_rev
+    np.testing.assert_allclose(
+        np.array(rev), np.array(first)[::-1], atol=atol, rtol=1e-2
+    )
+    assert idx.tolist() == batched  # the memoized index is left untouched
 
     # Reference: batching gate off -> every row on the per-segment loop.
     monkeypatch.setattr(

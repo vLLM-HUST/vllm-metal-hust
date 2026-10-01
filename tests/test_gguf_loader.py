@@ -844,6 +844,74 @@ def test_rejects_unsupported_qtype_before_model_allocation(tmp_path, monkeypatch
         ).load()
 
 
+def test_builds_the_skeleton_lazily(tmp_path, monkeypatch):
+    # The GGUF replaces every skeleton parameter, so the skeleton's own weights
+    # (random init, or dense safetensors in config_dir) must never be evaluated.
+    gguf_path, cfg_dir = _build_dense_fixture(tmp_path, "qwen3", has_qk_norm=True)
+    real_load_model = gguf_loader.load_model
+    lazy_flags = []
+
+    def spy_load_model(*args, **kwargs):
+        lazy_flags.append(kwargs.get("lazy"))
+        return real_load_model(*args, **kwargs)
+
+    monkeypatch.setattr(gguf_loader, "load_model", spy_load_model)
+
+    GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
+
+    assert lazy_flags == [True]
+
+
+def test_lazy_skeleton_keeps_peak_memory_off_the_eager_path(tmp_path, monkeypatch):
+    """Peak-memory regression check for the lazy skeleton.
+
+    ``load_model(lazy=False)`` ends with ``mx.eval(model.parameters())``,
+    materializing every skeleton parameter the GGUF then replaces — pure
+    overhead.  Load the same fixture twice, once lazily and once with the
+    regression forced (lazy=False monkeypatched in), and pin the lazy peak
+    well under the eager one: if the lazy flag is lost the two peaks
+    converge and the ratio collapses toward 1.
+    """
+    # Inflated dims so the fp32 skeleton is tens of MB — well above the
+    # quantized GGUF payload and any per-process noise floor.
+    config_overrides = {
+        "hidden_size": 512,
+        "num_hidden_layers": 4,
+        "intermediate_size": 1024,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 4,
+        "head_dim": 64,
+        "vocab_size": 1024,
+    }
+    gguf_path, cfg_dir = _build_dense_fixture(
+        tmp_path, "qwen3", config_overrides=config_overrides, has_qk_norm=True
+    )
+    real_load_model = gguf_loader.load_model
+
+    def load_eager(*args, **kwargs):
+        kwargs["lazy"] = False
+        return real_load_model(*args, **kwargs)
+
+    def peak_of_load() -> int:
+        # Peak above what the process already holds, so memory retained by
+        # earlier tests (or the first load) cannot skew the ratio.
+        mx.reset_peak_memory()
+        baseline = mx.get_active_memory()
+        GGUFModelLoader(gguf_path, config_dir=cfg_dir, target_dtype=mx.float32).load()
+        return mx.get_peak_memory() - baseline
+
+    lazy_peak = peak_of_load()
+    monkeypatch.setattr(gguf_loader, "load_model", load_eager)
+    eager_peak = peak_of_load()
+
+    assert lazy_peak < eager_peak
+    # The lazy peak is the GGUF payload alone (~1 byte/param Q8); the eager
+    # peak adds the full fp32 skeleton (~4 bytes/param), so lazy should sit
+    # far below — the bound keeps slack for CI variance while still failing
+    # the moment the flag is dropped (ratio -> 1).
+    assert lazy_peak <= 0.75 * eager_peak
+
+
 def test_rejects_unsupported_untied_output(tmp_path):
     gguf_path, cfg_dir = _build_dense_fixture(
         tmp_path,

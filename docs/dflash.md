@@ -1,8 +1,9 @@
-# DFlash checkpoint qualification
+# Experimental DFlash serving
 
-This is the model-qualification stage of [RFC #825](https://github.com/vllm-project/vllm-metal/issues/825).
-It provides a native Qwen3 DFlash block forward and a numerical comparison tool.
-It does **not** enable `method="dflash"` in vLLM serving.
+This implements the first experimental serving stage of
+[RFC #825](https://github.com/vllm-project/vllm-metal/issues/825): synchronous
+DFlash drafting with native Metal block attention and
+scheduler-owned KV. The standalone model qualification tools remain available.
 
 The first reference checkpoint is
 [z-lab/Qwen3-4B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16/tree/b74e3a329c4d963783143b1e970d95b002be72bd),
@@ -10,6 +11,102 @@ paired with Qwen3-4B. It has **five draft layers** and a 16-position block:
 one anchor and 15 predictions. It does not fulfill the RFC's preferred
 three-layer milestone. Quantized target conversions borrow their own actual
 embedding and output projection; comparisons use that same target precision.
+
+## Serve the qualified pair
+
+```bash
+vllm serve mlx-community/Qwen3-4B-4bit \
+    --no-enable-prefix-caching --no-async-scheduling \
+    --max-model-len 4096 --max-num-seqs 4 \
+    --speculative-config '{"method":"dflash","model":"z-lab/Qwen3-4B-DFlash-b16","num_speculative_tokens":3}'
+```
+
+Use `temperature=0` without penalties, token constraints, or sample logprobs to
+exercise drafting. Other requests use ordinary target sampling. The current
+serving path requires a single-device Qwen3 text target, matching FP16 or BF16
+target/draft activation precision, and a native cache block size (8, 16, or 32).
+LoRA, TurboQuant, and prefix caching fail explicitly.
+For this checkpoint, the configured maximum draft width may be 1–15. Near the context limit,
+requests continue with target-only decoding when a complete block cannot fit.
+
+## Choose draft widths by batch size
+
+DFlash also accepts vLLM's `num_speculative_tokens_per_batch_size` schedule.
+For example, this drafts three tokens for one scheduled request and pauses
+drafting for larger batches:
+
+```bash
+vllm serve mlx-community/Qwen3-4B-4bit \
+    --no-enable-prefix-caching --no-async-scheduling \
+    --max-model-len 4096 --max-num-seqs 4 \
+    --speculative-config '{
+      "method": "dflash",
+      "model": "z-lab/Qwen3-4B-DFlash-b16",
+      "num_speculative_tokens": 3,
+      "num_speculative_tokens_per_batch_size": [[1, 1, 3], [2, 4, 0]]
+    }'
+```
+
+Ranges are inclusive and count requests scheduled in the current step, including
+prefill. The upstream scheduler validates the schedule, carries widths through
+gaps and the tail, and caps them at `num_speculative_tokens`. Intermediate widths
+such as `[[1,1,3],[2,2,1],[3,4,0]]` are supported too. Each selected width controls
+the next proposals; verification still consumes the previously issued width.
+The context-limit check uses the selected width, so a shorter block can still fit
+when the maximum width cannot.
+
+At K=0, target sampling continues and committed features still update draft KV.
+This lets drafting resume on the next step without replaying the prefix. Draft
+weights, capture/projection work, KV capacity, and maximum-width lookahead remain
+allocated or active, so a paused drafter does not have target-only memory or cost.
+Compiled callables are reused per encountered nonzero width. The first use of a
+new width/batch shape can incur compilation; warm the tiers before measuring.
+
+This is an explicit batch-size policy, not a learned confidence or cost planner.
+Measure it on your workload: fixed-width drafting can be slower than the target
+alone at higher concurrency. The default remains fixed-width when no schedule
+is supplied.
+
+## Cache lifecycle and validation
+
+Draft weights load before memory profiling. Draft layer specs are included in
+the scheduler's cache budget, and target/draft views share its `KVCacheStorage`.
+Captured target features are projected once per committed position. The
+compiled block reads that paged context and writes the anchor/masks into the
+scheduler's lookahead slots; each query sees the whole block. After verification,
+only committed target-feature rows enter draft context. These overwrite temporary
+KV even for accepted draft tokens. Preemption and cancellation clear logical
+coverage before pages or request IDs are reused.
+
+The full-prefix callable below is for qualification. Serving uses
+`DFlashPagedCache.compile_draft`, passing cache views and fixed-width block
+tables as graph inputs, so it does not gather or reproject the full prefix.
+Different batch sizes can compile different graphs; context growth within the
+configured limit does not change the block-table shape.
+
+Run the real-checkpoint lifecycle test with:
+
+```bash
+pytest -m slow tests/test_dflash_serving_e2e.py
+pytest -m slow tests/test_dflash_schedule_e2e.py
+python -m tools.dflash_serving_parity --output-dir /path/to/new-parity-results
+python -m tools.dflash_serving_parity --batch-size 1 2 4 \
+    --draft-schedule '[[1,1,3],[2,2,1],[3,4,0]]' \
+    --output-dir /path/to/new-scheduled-parity-results
+```
+
+It checks target-only parity, page boundaries, chunked prefill, acceptance and
+rejection, constrained-cache preemption, cancellation, and context-limit fallback.
+It also covers EOS, stop tokens, short output budgets, and mixed batches with
+sampling/logprob fallback, including cache-page release after completion.
+The scheduled-width test covers shrinking/growing blocks, consecutive K=0 steps,
+cancellation, and preemption/recomputation. The parity tool records selected
+widths and verified drafts; a configured K=0 batch need not verify any drafts.
+Floating-point reduction differences between single-token and multi-token target
+forwards can change greedy choices near ties. Report exact matches separately
+from mutual top-k agreement; the latter checks only the first differing token.
+Measure throughput for your target, draft width, and workload before enabling
+this experimental mode in a deployment.
 
 ## Model contract
 
@@ -113,12 +210,9 @@ This is forward parity, not generated-sequence parity or a performance benchmark
 The independent small-model tests also compare against explicit CPU attention
 math and check that a causal block mask produces a different result.
 
-## Serving milestones
+## Remaining milestones
 
-The qualification forward recomputes context K/V with MLX attention. Serving
-integration must bind committed draft KV to scheduler-owned `KVCacheStorage`,
-use scheduler lookahead for temporary block writes, and express the block mask
-through Metal paged attention. The first experimental serving stage must reject
-prefix caching, as requested in the RFC. Lifecycle correctness, generated-token
-parity, and batch-1/batch-N serving measurements remain separate gates before
-claiming DSpark support or acceleration.
+This is DFlash serving, not full DSpark support. A smaller qualified checkpoint,
+DSpark-specific prediction heads, confidence/cost-based planning, sampled verification, prefix
+reuse, and asynchronous execution remain separate roadmap items. Keep each
+change independently reviewable and qualify its lifecycle and serving behavior.

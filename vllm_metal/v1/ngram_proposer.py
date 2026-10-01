@@ -41,6 +41,8 @@ from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer as VllmNgramProposer
 
+from vllm_metal.v1.proposer import NoOwnKVProposer
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -67,7 +69,7 @@ _MAX_CONSECUTIVE_MISSES = 8
 _COOLDOWN_STEPS = 8
 
 
-class NgramProposer:
+class NgramProposer(NoOwnKVProposer):
     """:class:`vllm_metal.v1.proposer.MetalProposer` backed by vLLM's n-gram kernel."""
 
     def __init__(

@@ -78,6 +78,18 @@ def _int(
     return parse
 
 
+def _bool(name: str, default: bool) -> Callable[[], bool]:
+    """A switch: ``"1"`` is on, anything else is off; unset is ``default``."""
+
+    def parse() -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        return raw == "1"
+
+    return parse
+
+
 def _auto_or_nonnegative_int(name: str, *, unit: str) -> Callable[[], int | str]:
     """``auto`` (the default) or an integer of at least 0, in ``unit``."""
 
@@ -140,21 +152,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_MODELSCOPE_CACHE": lambda: os.getenv("VLLM_METAL_MODELSCOPE_CACHE"),
     # Enable lazy GDN kernels by default.
     # Set to "0" to force the eager conv / C++ recurrent fallback path.
-    "VLLM_METAL_GDN_LAZY_KERNELS": lambda: (
-        os.getenv("VLLM_METAL_GDN_LAZY_KERNELS", "1") == "1"
-    ),
+    "VLLM_METAL_GDN_LAZY_KERNELS": _bool("VLLM_METAL_GDN_LAZY_KERNELS", True),
     # One-step-ahead decode pipelining (default on). Eligible pure-decode
     # greedy steps defer the sampling sync one step so the next step's graph
     # build and submit overlap the in-flight GPU forward. Set to "0" to
     # force the fully synchronous per-step sample path.
-    "VLLM_METAL_DECODE_PIPELINE": lambda: (
-        os.getenv("VLLM_METAL_DECODE_PIPELINE", "1") == "1"
-    ),
+    "VLLM_METAL_DECODE_PIPELINE": _bool("VLLM_METAL_DECODE_PIPELINE", True),
     # Compiled stateless-MLP dispatch (opt-in): decode-shaped MLP/MoE
     # block calls run through an mx.compile trace, fusing the per-layer
     # elementwise glue. Bitwise-identical on the quantized serving path;
     # set to "1" to enable, the default keeps the eager per-op dispatch.
-    "VLLM_METAL_COMPILED_MLP": lambda: os.getenv("VLLM_METAL_COMPILED_MLP", "0") == "1",
+    "VLLM_METAL_COMPILED_MLP": _bool("VLLM_METAL_COMPILED_MLP", False),
     # MLX-native non-greedy sampling for the decode pipeline (opt-in): the
     # pipeline's deferred sampler learns a temperature/top-k/top-p graph, so
     # eligible non-greedy pure-decode steps defer like greedy ones instead
@@ -162,9 +170,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # penalties, logprobs, or token constraints keep the torch path
     # unchanged. Set to "1" to enable; intended to flip default-on once the
     # path has serve mileage, with this var remaining as the kill switch.
-    "VLLM_METAL_NATIVE_SAMPLING": lambda: (
-        os.getenv("VLLM_METAL_NATIVE_SAMPLING", "0") == "1"
-    ),
+    "VLLM_METAL_NATIVE_SAMPLING": _bool("VLLM_METAL_NATIVE_SAMPLING", False),
     # Experimental MLA Metal decode kernel (RFC #360). Off by default —
     # the MLA wrapper uses the MLX SDPA per-request slow path unless
     # this opt-in is set. Set to "1" to route absorbed-MLA decode
@@ -172,9 +178,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the kernel's instantiated specialization (kv_lora_rank=512,
     # qk_rope_head_dim=64, block_size ∈ {16, 32}, fp16/bf16,
     # decode-only).
-    "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
+    "VLLM_METAL_MLA_KERNEL": _bool("VLLM_METAL_MLA_KERNEL", False),
     # Emergency override for automatic M5 NAX prefill attention.
-    "VLLM_METAL_DISABLE_NAX": lambda: os.getenv("VLLM_METAL_DISABLE_NAX", "0") == "1",
+    "VLLM_METAL_DISABLE_NAX": _bool("VLLM_METAL_DISABLE_NAX", False),
     # TQ materialized prefill: auto enables only when NAX is available;
     # 1 explicitly opts into tiled prefill on older GPUs, 0 disables it.
     "VLLM_METAL_TQ_PREFILL": _choice("VLLM_METAL_TQ_PREFILL", "auto", TQ_PREFILL_MODES),
@@ -192,9 +198,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # conc >= 4 with 8k+ context (M2 Ultra / M3 Ultra / M4 Pro, up to
     # +40% e2e at conc 16-32), measured losses single-stream on M4 Pro
     # and at conc 32 on M2 Max. Outputs are bitwise identical either way.
-    "VLLM_METAL_SPEC_VERIFY_WINDOW": lambda: (
-        os.getenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "0") == "1"
-    ),
+    "VLLM_METAL_SPEC_VERIFY_WINDOW": _bool("VLLM_METAL_SPEC_VERIFY_WINDOW", False),
     # Max tokens of cold draft KV ingested per forward (issue #482,
     # direction 3). The first propose of a fresh prefix ingests the whole
     # prompt into the draft model's KV in one tiled prefill forward;
@@ -213,9 +217,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of loading the prebuilt artifact shipped in the wheel. Intended
     # for kernel developers / source installs; requires Xcode command-line
     # tools (clang++). Default off — release wheels ship the .so prebuilt.
-    "VLLM_METAL_BUILD_FROM_SOURCE": lambda: (
-        os.getenv("VLLM_METAL_BUILD_FROM_SOURCE", "0") == "1"
-    ),
+    "VLLM_METAL_BUILD_FROM_SOURCE": _bool("VLLM_METAL_BUILD_FROM_SOURCE", False),
     # Per-worker visible-device list set by vLLM's Ray executor (the
     # CUDA_VISIBLE_DEVICES analog for Metal; see MetalPlatform.device_control_env_var).
     # Registered here only so validate_environ() does not warn — vLLM reads it

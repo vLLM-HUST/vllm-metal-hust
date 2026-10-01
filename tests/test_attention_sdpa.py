@@ -1043,6 +1043,26 @@ class TestSDPAForward:
         assert isinstance(sinks, mx.array)
         assert sinks.dtype == mx.float32
 
+        # The widened tensor is stored back on the module, so a later forward
+        # skips the astype and hands the kernel the same float32 array.
+        with (
+            patch.object(
+                sdpa_mod,
+                "prepare_sdpa_qkv",
+                return_value=(queries, keys, values, None, (keys, values)),
+            ),
+            patch.object(sdpa_mod, "get_ops", return_value=_FakeOps()),
+            patch.object(
+                sdpa_mod,
+                "truncate_padded_output",
+                return_value=mx.zeros((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM)),
+            ),
+        ):
+            sdpa_forward(inner, x, _make_ctx(_SEQ_LEN), cache, layer_idx=0)
+
+        assert inner.sinks.dtype == mx.float32
+        assert captured["sinks"] is inner.sinks
+
     def _run_capturing_softcap(self, inner: SimpleNamespace) -> float:
         """Drive ``sdpa_forward`` and return the softcap the kernel received."""
         cache = MetalPagedKVCache(

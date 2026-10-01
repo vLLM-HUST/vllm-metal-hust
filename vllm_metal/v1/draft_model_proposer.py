@@ -74,6 +74,7 @@ from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
 from vllm_metal.v1.proposer import (
     _DECODE_INGEST_MAX_TOKENS,
+    NoOwnKVProposer,
     validate_scheduler_blocks,
 )
 
@@ -126,7 +127,7 @@ class _DraftPlan:
 _SELECTIVE_LOGITS_MIN_ROWS = 16
 
 
-class DraftModelProposer:
+class DraftModelProposer(NoOwnKVProposer):
     """:class:`vllm_metal.v1.proposer.MetalProposer` backed by a separate model."""
 
     def __init__(

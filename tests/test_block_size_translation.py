@@ -8,6 +8,9 @@ kernel-compatible block sizes (8, 16, 32).
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 from vllm_metal.attention.context import (
@@ -21,7 +24,7 @@ from vllm_metal.attention.impls.sdpa import (
     _kernel_metadata,
     _pick_kernel_block_size,
 )
-from vllm_metal.metal.constants import KERNEL_BLOCK_SIZES
+from vllm_metal.metal.constants import KERNEL_BLOCK_SIZES, MLA_KERNEL_BLOCK_SIZES
 
 
 class TestPickKernelBlockSize:
@@ -166,3 +169,33 @@ class TestKernelMetadataMemo:
         assert m1 is not m0
         assert m0.block_tables.tolist() == [[10, 11]]
         assert m1.block_tables.tolist() == [[77, 78]]
+
+
+class TestMLAKernelBlockSizes:
+    """MLA_KERNEL_BLOCK_SIZES is the Python-side copy of the block sizes the
+    mla.metal single-pass kernel is instantiated for — drift between them
+    means the admission check admits a block size with no compiled kernel
+    (or rejects one that exists).  Parse the instantiate_mla calls and keep
+    the two in lockstep."""
+
+    _MLA_METAL = (
+        Path(__file__).resolve().parent.parent
+        / "vllm_metal"
+        / "metal"
+        / "kernels_v2"
+        / "mla.metal"
+    )
+
+    def test_matches_mla_metal_instantiations(self):
+        # instantiate_mla(type, kv_lora_rank, qk_rope_head_dim, block_size, ...)
+        # — a column at the start of a line is a call site; the #define and
+        # comments are excluded by anchoring to the line start.
+        src = self._MLA_METAL.read_text()
+        instantiated = {
+            int(m.group(1))
+            for m in re.finditer(
+                r"^instantiate_mla\([^,]+,[^,]+,[^,]+,\s*(\d+)", src, re.M
+            )
+        }
+        assert instantiated, "no instantiate_mla call sites found in mla.metal"
+        assert instantiated == set(MLA_KERNEL_BLOCK_SIZES)
