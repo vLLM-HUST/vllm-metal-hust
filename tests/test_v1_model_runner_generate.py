@@ -2823,6 +2823,68 @@ class TestDummyForwardOutputsPPRouting:
         assert limits == [80]
 
 
+class TestProfileRunDrafterWarmup:
+    """``profile_run`` must warm the drafter's buffers in the measured peak."""
+
+    def test_profile_run_calls_drafter_profile_warmup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner = make_stub_runner(
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=4)
+        )
+        runner._dummy_forward_outputs = Mock(return_value=[])
+        warmups: list[tuple[object, mx.array]] = []
+        runner._drafter = SimpleNamespace(
+            profile_warmup=lambda r, tokens: warmups.append((r, tokens))
+        )
+        cache_readings = iter([100, 180])
+        monkeypatch.setattr(mr.mx, "clear_cache", lambda: None)
+        monkeypatch.setattr(mr.mx, "get_cache_memory", lambda: next(cache_readings))
+        monkeypatch.setattr(mr.mx, "set_cache_limit", lambda _n: None)
+
+        runner.profile_run()
+
+        assert len(warmups) == 1
+        warmed_runner, tokens = warmups[0]
+        assert warmed_runner is runner
+        # The drafter profiles the same max-batched-tokens warmup shape.
+        assert tokens.shape == (1, 4)
+        assert tokens.dtype == mx.int32
+
+    def test_skips_encoder_profiling_when_multimodal_cannot_run(self) -> None:
+        # No mm inputs and no explicit-positions requirement: an mm step can
+        # never run, so the encoder pass must not inflate the profiled peak.
+        adapter = SimpleNamespace(
+            forward_ready=True,
+            requires_explicit_positions=False,
+            profile_features=Mock(return_value=["feat"]),
+            encode_multimodal=Mock(),
+        )
+        runner = make_stub_runner(
+            _multimodal_adapter=adapter, _supports_mm_inputs=False
+        )
+
+        assert runner._dummy_encoder_outputs() == []
+        adapter.encode_multimodal.assert_not_called()
+
+    def test_keeps_encoder_profiling_for_explicit_positions_adapter(self) -> None:
+        adapter = SimpleNamespace(
+            forward_ready=True,
+            requires_explicit_positions=True,
+            profile_features=lambda: ["feat"],
+            encode_multimodal=lambda _features: [
+                SimpleNamespace(
+                    hidden_states=mx.zeros((2, 4)), deepstack_visual_embeds=None
+                )
+            ],
+        )
+        runner = make_stub_runner(
+            _multimodal_adapter=adapter, _supports_mm_inputs=False
+        )
+
+        assert len(runner._dummy_encoder_outputs()) == 1
+
+
 class TestPipelineGateSpecDecodeDerivation:
     """Runner-side capability derivation for the decode pipeline."""
 

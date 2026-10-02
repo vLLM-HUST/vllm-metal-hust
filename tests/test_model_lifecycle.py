@@ -949,10 +949,10 @@ class TestModelLifecycle:
         fake_model = SimpleNamespace(
             create_runtime_adapter=lambda model_name: (object(), model_name)
         )
-        calls: list[str] = []
+        calls: list[tuple[str, mx.Dtype]] = []
 
-        def _load_model(model_name: str) -> object:
-            calls.append(model_name)
+        def _load_model(model_name: str, dtype: mx.Dtype) -> object:
+            calls.append((model_name, dtype))
             return fake_model
 
         monkeypatch.setitem(
@@ -961,8 +961,10 @@ class TestModelLifecycle:
             SimpleNamespace(load_model=_load_model),
         )
 
-        assert model_lifecycle.load_stt_model("stub-model") is fake_model
-        assert calls == ["stub-model"]
+        assert (
+            model_lifecycle.load_stt_model("stub-model", torch.bfloat16) is fake_model
+        )
+        assert calls == [("stub-model", mx.bfloat16)]
 
     @pytest.mark.parametrize(
         "is_awq", [True, False], ids=["awq-checkpoint", "non-awq-checkpoint"]

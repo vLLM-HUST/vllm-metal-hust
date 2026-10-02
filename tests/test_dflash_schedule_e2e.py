@@ -2,28 +2,19 @@
 """Real scheduler-driven DFlash width changes, pause/resume, and preemption."""
 
 import json
-import os
 
 import pytest
 
-from tests.test_dflash_serving_e2e import _serve
+from tests.test_dflash_serving_e2e import _dflash_llm, _serve, _spawn_env
 
 
 def _serve_scheduled(baseline_path, verify_window, pressure=False):
-    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    os.environ["VLLM_METAL_SPEC_VERIFY_WINDOW"] = "1" if verify_window else "0"
-    from vllm import LLM, SamplingParams
+    _spawn_env(verify_window)
+    from vllm import SamplingParams
 
-    llm = LLM(
-        model="mlx-community/Qwen3-4B-4bit",
-        max_model_len=128,
+    llm = _dflash_llm(
         max_num_seqs=3,
-        max_num_batched_tokens=32,
-        block_size=16,
         num_gpu_blocks_override=10 if pressure else 14,
-        gpu_memory_utilization=0.25,
-        enable_prefix_caching=False,
-        async_scheduling=False,
         speculative_config={
             "method": "dflash",
             "model": "z-lab/Qwen3-4B-DFlash-b16",
@@ -150,6 +141,8 @@ def test_dflash_scheduler_width_transitions(
     tmp_path, run_in_spawn_process, verify_window
 ):
     baseline = tmp_path / "target.json"
-    run_in_spawn_process(_serve, "target", baseline, verify_window)
-    run_in_spawn_process(_serve_scheduled, baseline, verify_window)
-    run_in_spawn_process(_serve_scheduled, baseline, verify_window, True)
+    run_in_spawn_process(_serve, "target", baseline, verify_window, label="target")
+    run_in_spawn_process(_serve_scheduled, baseline, verify_window, label="scheduled")
+    run_in_spawn_process(
+        _serve_scheduled, baseline, verify_window, True, label="scheduled+cancel"
+    )

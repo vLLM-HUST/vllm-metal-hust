@@ -11,10 +11,34 @@ import os
 import pytest
 
 
-def _serve(mode, baseline_path, verify_window):
+def _spawn_env(verify_window):
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     os.environ["VLLM_METAL_SPEC_VERIFY_WINDOW"] = "1" if verify_window else "0"
-    from vllm import LLM, SamplingParams
+
+
+def _dflash_llm(**overrides):
+    """LLM with the shared DFlash test configuration, tuned by *overrides*."""
+    from vllm import LLM
+
+    return LLM(
+        **{
+            "model": "mlx-community/Qwen3-4B-4bit",
+            "max_model_len": 128,
+            "max_num_seqs": 2,
+            "max_num_batched_tokens": 32,
+            "block_size": 16,
+            "num_gpu_blocks_override": 10,
+            "gpu_memory_utilization": 0.25,
+            "enable_prefix_caching": False,
+            "async_scheduling": False,
+            **overrides,
+        }
+    )
+
+
+def _serve(mode, baseline_path, verify_window):
+    _spawn_env(verify_window)
+    from vllm import SamplingParams
     from vllm.sampling_params import StructuredOutputsParams
 
     spec = (
@@ -26,18 +50,7 @@ def _serve(mode, baseline_path, verify_window):
             "num_speculative_tokens": 3,
         }
     )
-    llm = LLM(
-        model="mlx-community/Qwen3-4B-4bit",
-        max_model_len=128,
-        max_num_seqs=2,
-        max_num_batched_tokens=32,
-        block_size=16,
-        num_gpu_blocks_override=10,
-        gpu_memory_utilization=0.25,
-        enable_prefix_caching=False,
-        async_scheduling=False,
-        speculative_config=spec,
-    )
+    llm = _dflash_llm(speculative_config=spec)
     engine = llm.llm_engine
     runner = engine.model_executor.driver_worker.model_runner
     scheduler = engine.engine_core.engine_core.scheduler
@@ -277,5 +290,5 @@ def test_dflash_serving_parity_and_lifecycle(
     tmp_path, run_in_spawn_process, verify_window
 ):
     baseline = tmp_path / "target.json"
-    run_in_spawn_process(_serve, "target", baseline, verify_window)
-    run_in_spawn_process(_serve, "dflash", baseline, verify_window)
+    run_in_spawn_process(_serve, "target", baseline, verify_window, label="target")
+    run_in_spawn_process(_serve, "dflash", baseline, verify_window, label="dflash")

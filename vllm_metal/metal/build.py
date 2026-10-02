@@ -331,8 +331,13 @@ def _input_hash(spec: _BuildSpec) -> str:
     return h.hexdigest()
 
 
+def _missing_sentinels() -> list[Path]:
+    """The outputs a complete build leaves behind; any missing means rebuild."""
+    return [p for p in (_OUT, _HASH, _MLX_VERSION) if not p.exists()]
+
+
 def needs_rebuild() -> bool:
-    if not _OUT.exists() or not _HASH.exists():
+    if _missing_sentinels():
         return True
     try:
         spec = _build_spec()

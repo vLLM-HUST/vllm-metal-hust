@@ -922,6 +922,11 @@ class MetalModelRunner:
         adapter = self._multimodal_adapter
         if adapter is None or not adapter.forward_ready:
             return []
+        # When the model takes no multimodal inputs and the adapter does not
+        # require explicit positions, an mm step cannot run — profiling a
+        # maximal encoder pass would only inflate the measured overhead.
+        if not (self._supports_mm_inputs or adapter.requires_explicit_positions):
+            return []
         profile_features = getattr(adapter, "profile_features", None)
         if profile_features is None:
             return []

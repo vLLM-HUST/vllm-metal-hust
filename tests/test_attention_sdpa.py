@@ -22,6 +22,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 import torch
+from mlx.utils import tree_flatten
 from vllm.config import VllmConfig
 from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
 from vllm.v1.kv_cache_interface import (
@@ -650,6 +651,16 @@ class _PagedRoutingOpsSpy:
     def supports_decode_routing_metadata(self) -> bool:
         return True
 
+    def supports_gqa_decode_control(self) -> bool:
+        return True
+
+    def paged_attention_capabilities(self) -> dict[str, bool]:
+        return {
+            "gqa_decode": True,
+            "gqa_disable": True,
+            "decode_routing_metadata": True,
+        }
+
     def reshape_and_cache(
         self,
         _key,
@@ -684,21 +695,23 @@ class _PagedRoutingOpsSpy:
         window_seqlen_q: int = 1,
         sinks: mx.array | None = None,
         mm_prefix_ranges: mx.array | None = None,
-        num_decode_requests: int = 0,
+        num_decode_requests: int = -1,
         num_decode_tokens: int = 0,
         max_decode_context_len: int = 0,
+        gqa_disabled: bool = False,
     ) -> None:
         del window_seqlen_q, sinks
         self.calls[-1].block_tables = block_tables.tolist()
         self.calls[-1].block_size = block_size
-        self.calls[-1].mm_prefix_ranges = mm_prefix_ranges
         self.calls[-1].num_decode_requests = num_decode_requests
+        self.calls[-1].gqa_disabled = gqa_disabled
+        self.calls[-1].mm_prefix_ranges = mm_prefix_ranges
         self.calls[-1].num_decode_tokens = num_decode_tokens
         self.calls[-1].max_decode_context_len = max_decode_context_len
 
 
 class _PreMmPrefixOps:
-    """Ops of a native build that predates mm_prefix: no probe, no keyword."""
+    """Old native signature: deliberately no GQA control/probe or new keyword."""
 
     def __init__(self) -> None:
         self._spy = _PagedRoutingOpsSpy()
@@ -707,9 +720,18 @@ class _PreMmPrefixOps:
     def reshape_and_cache(self, *args):
         return self._spy.reshape_and_cache(*args)
 
-    def paged_attention_primitive(self, *args, window_seqlen_q=1, sinks=None):
+    def paged_attention_primitive(
+        self,
+        *args,
+        window_seqlen_q=1,
+        sinks=None,
+        num_decode_requests=-1,
+    ):
         self._spy.paged_attention_primitive(
-            *args, window_seqlen_q=window_seqlen_q, sinks=sinks
+            *args,
+            window_seqlen_q=window_seqlen_q,
+            sinks=sinks,
+            num_decode_requests=num_decode_requests,
         )
 
 
@@ -787,6 +809,65 @@ class TestSDPAForward:
         assert values.shape == (1, 2, 2, 4)
         assert captured["num_kv_heads"] == 2
         assert captured["scale"] == 0.5
+
+    @pytest.mark.parametrize("disabled", [False, True])
+    @pytest.mark.parametrize("legacy_control", [False, True])
+    def test_gqa_policy_reaches_primitive(
+        self, monkeypatch: pytest.MonkeyPatch, disabled: bool, legacy_control: bool
+    ) -> None:
+        """The environment escape hatch and scheduler decode count reach native code."""
+        from vllm_metal import envs
+
+        monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(disabled)))
+        read_env = MagicMock(
+            wraps=envs.environment_variables["VLLM_METAL_DISABLE_GQA_DECODE"]
+        )
+        monkeypatch.setitem(
+            envs.environment_variables, "VLLM_METAL_DISABLE_GQA_DECODE", read_env
+        )
+        spy = _PagedRoutingOpsSpy()
+        if legacy_control:
+            monkeypatch.setattr(spy, "paged_attention_capabilities", None)
+            monkeypatch.setattr(spy, "supports_gqa_decode_control", None)
+            monkeypatch.setattr(
+                spy, "gqa_decode_shape_eligible", MagicMock(), raising=False
+            )
+        else:
+            capability_query = MagicMock(wraps=spy.paged_attention_capabilities)
+            monkeypatch.setattr(spy, "paged_attention_capabilities", capability_query)
+        inner = _make_inner()
+        inner.o_proj = lambda out: out
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=1,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        ctx = _make_ctx(_SEQ_LEN)
+        ctx.num_decode_requests = 1
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN), dtype=mx.float16)
+        zeros = mx.zeros((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM), dtype=mx.float16)
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=spy),
+            patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
+        ):
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+            monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(not disabled)))
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+            assert spy.calls[-1].gqa_disabled is disabled
+            assert read_env.call_count == 1
+            if not legacy_control:
+                assert capability_query.call_count == 1
+            next_ctx = _make_ctx(_SEQ_LEN)
+            next_ctx.num_decode_requests = 1
+            sdpa_forward(inner, x, next_ctx, cache, layer_idx=0)
+        assert read_env.call_count == 2
+        if not legacy_control:
+            assert capability_query.call_count == 2
+        assert spy.calls[-1].gqa_disabled is not disabled
+        assert spy.calls[-1].num_decode_requests == 1
 
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""
@@ -1043,8 +1124,10 @@ class TestSDPAForward:
         assert isinstance(sinks, mx.array)
         assert sinks.dtype == mx.float32
 
-        # The widened tensor is stored back on the module, so a later forward
-        # skips the astype and hands the kernel the same float32 array.
+        # The widened tensor is memoized off the module, so a later forward
+        # hands the kernel the same float32 array while the parameter keeps
+        # its checkpoint dtype.
+        first_sinks = sinks
         with (
             patch.object(
                 sdpa_mod,
@@ -1060,8 +1143,26 @@ class TestSDPAForward:
         ):
             sdpa_forward(inner, x, _make_ctx(_SEQ_LEN), cache, layer_idx=0)
 
-        assert inner.sinks.dtype == mx.float32
-        assert captured["sinks"] is inner.sinks
+        assert inner.sinks is fp16_sinks
+        assert captured["sinks"] is first_sinks
+
+    def test_float32_sinks_cache_stays_off_the_parameter_tree(self) -> None:
+        class _Attention(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.sinks = mx.arange(_N_HEADS, dtype=mx.bfloat16)
+
+        inner = _Attention()
+        first = sdpa_mod._float32_sinks(inner)
+
+        assert first is not None and first.dtype == mx.float32
+        assert sdpa_mod._float32_sinks(inner) is first
+        parameters = dict(tree_flatten(inner.parameters()))
+        assert parameters.keys() == {"sinks"}
+        assert parameters["sinks"].dtype == mx.bfloat16
+
+        inner.sinks = mx.zeros((_N_HEADS,), dtype=mx.bfloat16)
+        assert sdpa_mod._float32_sinks(inner) is not first
 
     def _run_capturing_softcap(self, inner: SimpleNamespace) -> float:
         """Drive ``sdpa_forward`` and return the softcap the kernel received."""
@@ -1409,12 +1510,31 @@ class TestBidirectionalDispatch:
         assert bidi.call_count == 1
         assert spy.calls[-1].mm_prefix_ranges is None
 
-    def test_ops_predating_mm_prefix_serve_the_recompute(self) -> None:
+    @pytest.mark.parametrize("disable_env", [None, "0", "1"])
+    def test_ops_predating_mm_prefix_serve_the_recompute(
+        self, monkeypatch, disable_env
+    ) -> None:
         # No probe and no keyword: the image rows still reach the recompute.
-        bidi, _, _ = self._run(
+        if disable_env is None:
+            monkeypatch.delenv("VLLM_METAL_DISABLE_GQA_DECODE", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", disable_env)
+        bidi, spy, _ = self._run(
             frozenset({"sliding"}), [None, [(0, 2)]], 1, ops=_PreMmPrefixOps()
         )
         assert bidi.call_count == 1
+        assert spy.calls[-1].gqa_disabled is False
+
+    def test_unknown_gqa_native_cannot_silently_ignore_disable(self, monkeypatch):
+        monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", "1")
+        ops = _PreMmPrefixOps()
+        pipeline_probe = MagicMock(
+            side_effect=AssertionError("must not load pipelines")
+        )
+        monkeypatch.setattr(ops, "has_gqa_decode_kernel", pipeline_probe, raising=False)
+        with pytest.raises(RuntimeError, match="rebuild.*native extension"):
+            self._run(frozenset({"sliding"}), [None, [(0, 2)]], 1, ops=ops)
+        pipeline_probe.assert_not_called()
 
     def test_unknown_path_value_raises(self) -> None:
         with pytest.raises(ValueError, match="VLLM_METAL_MM_PREFIX_PATH"):

@@ -61,7 +61,7 @@ from vllm_metal.attention.impls.turboquant_prefill import (
 from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
 )
-from vllm_metal.metal import get_ops
+from vllm_metal.metal import get_ops, paged_attention_capabilities
 from vllm_metal.metal.constants import KERNEL_BLOCK_SIZES
 
 logger = init_logger(__name__)
@@ -568,6 +568,24 @@ def truncate_padded_output(
 # === SDPA forward ===
 
 
+def _float32_sinks(inner: nn.Module) -> mx.array | None:
+    """The module's attention sinks as float32, cast once per parameter.
+
+    The widened copy is stored outside the parameter tree, so the checkpoint
+    weight keeps its dtype for the non-paged fallback and for anything that
+    walks the parameters. It is keyed by the original array, so a reloaded
+    parameter is cast again.
+    """
+    sinks = getattr(inner, "sinks", None)
+    if sinks is None or sinks.dtype == mx.float32:
+        return sinks
+    cached = getattr(inner, "_vllm_metal_sinks_f32", None)
+    if cached is None or cached[0] is not sinks:
+        cached = (sinks, sinks.astype(mx.float32))
+        object.__setattr__(inner, "_vllm_metal_sinks_f32", cached)
+    return cached[1]
+
+
 def sdpa_forward(
     inner: nn.Module,
     x: mx.array,
@@ -623,13 +641,9 @@ def sdpa_forward(
     # Attention sinks: a learned per-head logit that joins the softmax
     # denominator without contributing a value row (GPT-OSS). Models without
     # sinks leave this None and the kernel keeps its plain-softmax path.
-    # The kernel reads them as device float, so cast only when the checkpoint
-    # stored them in another dtype; this is the per-layer hot path.  Write the
-    # widened tensor back to the module so the astype runs once instead of
-    # re-entering the lazy graph on every layer of every forward.
-    sinks = getattr(inner, "sinks", None)
-    if sinks is not None and sinks.dtype != mx.float32:
-        sinks = inner.sinks = sinks.astype(mx.float32)
+    # The kernel reads them as device float; the cast is memoized off the
+    # module's parameter tree, since this is the per-layer hot path.
+    sinks = _float32_sinks(inner)
 
     queries, keys, values, gate, kv_for_sharing = prepare_sdpa_qkv(
         inner,
@@ -980,7 +994,21 @@ def sdpa_forward(
         # Whole-batch decode routing belongs to the ordinary cache path. TQ
         # uses its own sub-batch metadata and stays outside native decode split.
         paged_kwargs: dict[str, int | mx.array] = dict(mm_kwargs)
-        if bool(getattr(ops, "supports_decode_routing_metadata", lambda: False)()):
+        if ctx.paged_native_capabilities is None:
+            ctx.paged_native_capabilities = paged_attention_capabilities(ops)
+        capabilities = ctx.paged_native_capabilities
+        # Omit the new keyword on the default path for older native builds.
+        if ctx.gqa_disabled:
+            if capabilities["gqa_disable"]:
+                paged_kwargs["gqa_disabled"] = True
+            elif capabilities["gqa_decode"]:
+                # Never silently ignore a kill switch on an unrecognized GQA build.
+                raise RuntimeError(
+                    "Loaded native GQA build does not advertise disable support; "
+                    "rebuild the vllm-metal native extension."
+                )
+            # Pre-GQA native builds already use the established attention path.
+        if capabilities["decode_routing_metadata"]:
             paged_kwargs.update(
                 num_decode_requests=ctx.num_decode_requests,
                 num_decode_tokens=ctx.num_decode_tokens,

@@ -22,6 +22,7 @@ class _Paths:
     nb_src: Path
     out: Path
     hsh: Path
+    ver: Path
     spec: build._BuildSpec
 
 
@@ -34,12 +35,14 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     nb_src = tmp_path / "nb_combined.cpp"
     out = tmp_path / "_paged_ops.so"
     hsh = tmp_path / "_paged_ops.so.sha256"
+    ver = tmp_path / "_paged_ops.mlx-version"
 
     src.write_bytes(b"// source v1")
     patch.write_bytes(b"// patch v1")
     bld.write_bytes(b"# build v1")
     consts.write_bytes(b"PARTITION_SIZE = 256")
     nb_src.write_bytes(b"// nanobind combined v1")
+    ver.write_text("0.0.0\n")
 
     monkeypatch.setattr(build, "_SRC", src)
     monkeypatch.setattr(build, "_MLX_PATCH", patch)
@@ -47,6 +50,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     monkeypatch.setattr(build, "_CONSTANTS", consts)
     monkeypatch.setattr(build, "_OUT", out)
     monkeypatch.setattr(build, "_HASH", hsh)
+    monkeypatch.setattr(build, "_MLX_VERSION", ver)
 
     spec = build._BuildSpec(
         cmd=["clang++", "-O2", "-Lfake/mlx/lib", "-o", str(out)],
@@ -59,7 +63,7 @@ def patched(tmp_path, monkeypatch) -> _Paths:
     )
     monkeypatch.setattr(build, "_build_spec", lambda: spec)
 
-    return _Paths(src, patch, bld, consts, nb_src, out, hsh, spec)
+    return _Paths(src, patch, bld, consts, nb_src, out, hsh, ver, spec)
 
 
 def test_needs_rebuild_when_so_missing(patched):
@@ -81,6 +85,13 @@ def test_no_rebuild_when_hash_matches(patched):
     patched.out.write_bytes(b"compiled")
     patched.hsh.write_text(build._input_hash(patched.spec))
     assert build.needs_rebuild() is False
+
+
+def test_needs_rebuild_when_mlx_version_record_missing(patched):
+    patched.out.write_bytes(b"compiled")
+    patched.hsh.write_text(build._input_hash(patched.spec))
+    patched.ver.unlink()
+    assert build.needs_rebuild() is True
 
 
 def test_old_content_with_newer_so_mtime_still_rebuilds(patched):

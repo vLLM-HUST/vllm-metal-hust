@@ -185,17 +185,176 @@ class TestMLAKernelBlockSizes:
         / "kernels_v2"
         / "mla.metal"
     )
+    _PAGED_OPS = (
+        Path(__file__).resolve().parent.parent
+        / "vllm_metal"
+        / "metal"
+        / "paged_ops.cpp"
+    )
 
-    def test_matches_mla_metal_instantiations(self):
-        # instantiate_mla(type, kv_lora_rank, qk_rope_head_dim, block_size, ...)
-        # — a column at the start of a line is a call site; the #define and
-        # comments are excluded by anchoring to the line start.
+    def _instantiations(self) -> set[tuple[str, int, int, int, int, int, int]]:
+        """The full (type, kvr, pe, bs, g, nt, ps) tuple per call site.
+
+        ``instantiate_mla(type, kv_lora_rank, qk_rope_head_dim, block_size,
+        heads_per_tg, num_threads, partition_size)`` — a call at the start
+        of a line; the #define and comments are excluded by that anchor.
+        """
         src = self._MLA_METAL.read_text()
-        instantiated = {
-            int(m.group(1))
+        rows = {
+            (m.group(1), *map(int, m.groups()[1:]))
             for m in re.finditer(
-                r"^instantiate_mla\([^,]+,[^,]+,[^,]+,\s*(\d+)", src, re.M
+                r"^instantiate_mla\(\s*(\w+),\s*(\d+),\s*(\d+),\s*(\d+),"
+                r"\s*(\d+),\s*(\d+),\s*(\d+)\s*\)",
+                src,
+                re.M,
             )
         }
-        assert instantiated, "no instantiate_mla call sites found in mla.metal"
+        assert rows, "no instantiate_mla call sites found in mla.metal"
+        return rows
+
+    @staticmethod
+    def _fn_body(src: str, signature: str) -> str:
+        """One top-level C++ function body: signature to its column-0 ``}``."""
+        start = src.index(signature)
+        return src[start : src.index("\n}\n", start)]
+
+    def _gate_rows(self) -> set[tuple[int, int, int, int, int, int]]:
+        """The (kvr, pe, bs, g, nt, ps) rows of the shared spec table.
+
+        ``kMlaKernelSpecs`` in paged_ops.cpp is the single source of truth
+        the dispatch gate validates against — one ``{kvr, pe, bs, g, nt,
+        ps}`` row per instantiated shape.
+        """
+        cpp = self._PAGED_OPS.read_text()
+        table = cpp[cpp.index("kMlaKernelSpecs") :]
+        rows = {
+            tuple(int(v) for v in m.groups())
+            for m in re.finditer(
+                r"\{\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,"
+                r"\s*(\d+)\s*,\s*(\d+)\s*\}",
+                table[: table.index("};")],
+            )
+        }
+        assert rows, "could not parse the kMlaKernelSpecs table"
+        return rows
+
+    def test_matches_mla_metal_instantiations(self):
+        instantiated = {bs for _, _, _, bs, _, _, _ in self._instantiations()}
         assert instantiated == set(MLA_KERNEL_BLOCK_SIZES)
+
+    def test_instantiations_match_the_cpp_dispatch_gate(self):
+        """Every instantiated specialization must be dispatchable.
+
+        ``dispatch_mla_paged_attention`` admits only the
+        (kv_lora_rank, qk_rope_head_dim, block_size, heads_per_tg,
+        num_threads, partition_size) rows in ``kMlaKernelSpecs``; an
+        instantiation beyond the table compiles dead binary and a table
+        row without an instantiation throws at runtime. The call sites
+        must be exactly the table's admitted space.
+        """
+        cpp = self._PAGED_OPS.read_text()
+
+        # mla_validate_t_dtypes admits only fp16/bf16 for the T buffers; map
+        # them through dtype_to_metal to the instantiated type names.
+        dtype_map = dict(
+            re.findall(
+                r'case (\w+):\s*return "(\w+)";',
+                self._fn_body(cpp, "static std::string dtype_to_metal"),
+            )
+        )
+        gate_dtypes = {
+            dtype_map[d]
+            for d in re.findall(
+                r"expected != (\w+)",
+                self._fn_body(cpp, "static void mla_validate_t_dtypes"),
+            )
+        }
+        assert gate_dtypes, "could not parse the C++ dtype gate"
+
+        expected = {(t, *row) for t in gate_dtypes for row in self._gate_rows()}
+        assert self._instantiations() == expected
+
+    def test_python_g_picker_stays_inside_the_gate(self):
+        """_pick_heads_per_tg may only return G values the gate maps."""
+        from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
+
+        admitted = {g for _, _, _, g, _, _ in self._gate_rows()}
+        picked = {
+            MLAPagedAttentionWrapper._pick_heads_per_tg(num_heads, batch)
+            for num_heads in range(1, 65)
+            for batch in (1, 2, 8, 32)
+        }
+        assert picked <= admitted
+
+
+class TestNaxKernelInstantiations:
+    """The NAX prefill gate and its kernel instantiations cannot drift.
+
+    ``nax_eligible`` in paged_ops.cpp admits a (dtype, head_size, block_size)
+    space; ``instantiate_paged_attention_nax_all`` in
+    pagedattention_nax.metal compiles one specialization per admitted row.
+    An instantiation beyond the gate compiles dead binary; a gate value
+    without an instantiation dispatches a kernel name that does not exist.
+    """
+
+    _NAX_METAL = (
+        Path(__file__).resolve().parent.parent
+        / "vllm_metal"
+        / "metal"
+        / "kernels_v2"
+        / "pagedattention_nax.metal"
+    )
+    _PAGED_OPS = TestMLAKernelBlockSizes._PAGED_OPS
+
+    def _instantiations(self) -> set[tuple[str, int, int]]:
+        """The (metal-type, head_size, block_size) rows the library compiles.
+
+        Rows live in the ``instantiate_paged_attention_nax_all`` macro body
+        (its ``type`` parameter is bound by the ``..._all(<dtype>)`` call
+        sites below it).
+        """
+        src = self._NAX_METAL.read_text()
+        body_start = src.index("#define instantiate_paged_attention_nax_all")
+        body_end = src.index("\n\n", body_start)
+        shapes = {
+            (int(hs), int(bs))
+            for hs, bs in re.findall(
+                r"instantiate_paged_attention_nax\(\s*type\s*,\s*(\d+)\s*,"
+                r"\s*(\d+)\s*\)",
+                src[body_start:body_end],
+            )
+        }
+        assert shapes, "no instantiate_paged_attention_nax rows found"
+
+        dtypes = set(
+            re.findall(r"^instantiate_paged_attention_nax_all\((\w+)\);", src, re.M)
+        )
+        assert dtypes, "no instantiate_paged_attention_nax_all call sites found"
+        return {(t, hs, bs) for t in dtypes for hs, bs in shapes}
+
+    def test_instantiations_match_the_cpp_gate(self) -> None:
+        cpp = self._PAGED_OPS.read_text()
+        gate = TestMLAKernelBlockSizes._fn_body(cpp, "static bool nax_eligible")
+
+        head_sizes = {int(v) for v in re.findall(r"head_size == (\d+)", gate)}
+        block_sizes = {int(v) for v in re.findall(r"block_size == (\d+)", gate)}
+        dtype_map = dict(
+            re.findall(
+                r'case (\w+):\s*return "(\w+)";',
+                TestMLAKernelBlockSizes._fn_body(
+                    cpp, "static std::string dtype_to_metal"
+                ),
+            )
+        )
+        gate_dtypes = {dtype_map[d] for d in re.findall(r"dtype == (\w+)", gate)}
+        for name, parsed in (
+            ("head_size", head_sizes),
+            ("block_size", block_sizes),
+            ("dtype", gate_dtypes),
+        ):
+            assert parsed, f"could not parse the C++ NAX {name} gate"
+
+        expected = {
+            (t, hs, bs) for t in gate_dtypes for hs in head_sizes for bs in block_sizes
+        }
+        assert self._instantiations() == expected

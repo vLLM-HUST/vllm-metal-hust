@@ -14,16 +14,24 @@ os.environ["MLX_ENABLE_TF32"] = "0"  # Keep FP32 parity checks strict on M5.
 
 
 @pytest.fixture
-def run_in_spawn_process():
-    """Isolate a real engine: MLX is not fork-safe, and engines retain state."""
+def run_in_spawn_process(request):
+    """Isolate a real engine: MLX is not fork-safe, and engines retain state.
 
-    def run(target, *args, timeout=300):
+    ``label`` names the spawn in failure messages — it defaults to the test
+    name, so single-spawn tests need nothing, while tests that run several
+    processes pass one per call to tell which child failed.
+    """
+
+    def run(target, *args, timeout=300, label=None):
+        label = request.node.name if label is None else label
         process = mp.get_context("spawn").Process(target=target, args=args)
         process.start()
         try:
             process.join(timeout=timeout)
-            assert not process.is_alive(), "Serving test timed out"
-            assert process.exitcode == 0, "Serving test failed in child process"
+            assert not process.is_alive(), f"{label}: serving test timed out"
+            assert process.exitcode == 0, (
+                f"{label}: child process failed (exit {process.exitcode})"
+            )
         finally:
             if process.is_alive():
                 process.terminate()

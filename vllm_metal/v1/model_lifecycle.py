@@ -54,8 +54,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def load_stt_model(model_name: str) -> Any:
-    """Load an STT model.
+def load_stt_model(model_name: str, dtype: torch.dtype) -> Any:
+    """Load an STT model in the serving ``dtype``.
 
     Returns the loaded STT model. The caller (``STTModelRunner``) builds the
     per-model runtime adapter and wires it onto the runner.
@@ -65,7 +65,7 @@ def load_stt_model(model_name: str) -> Any:
     from vllm_metal.stt.loader import load_model as stt_load_model
 
     logger.info("Loading STT model: %s", model_name)
-    model = stt_load_model(model_name)
+    model = stt_load_model(model_name, TORCH_TO_MLX_DTYPE[dtype])
     logger.info("STT model loaded in %.2fs: %s", time.time() - start_time, model_name)
     return model
 
