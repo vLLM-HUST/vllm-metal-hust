@@ -640,6 +640,17 @@ class TestPrepareSDPAQKV:
         assert kv_for_sharing == (expected_k, values)
 
 
+class _PagedOpsCapsOff:
+    """Baseline capability answer: a current build reporting no GQA features."""
+
+    def paged_attention_capabilities(self) -> dict[str, bool]:
+        return {
+            "gqa_decode": False,
+            "gqa_disable": False,
+            "decode_routing_metadata": False,
+        }
+
+
 class _PagedRoutingOpsSpy:
     def __init__(self, *, supports_mm_prefix: bool = True) -> None:
         self.calls: list[SimpleNamespace] = []
@@ -647,12 +658,6 @@ class _PagedRoutingOpsSpy:
 
     def supports_mm_prefix(self) -> bool:
         return self._supports_mm_prefix
-
-    def supports_decode_routing_metadata(self) -> bool:
-        return True
-
-    def supports_gqa_decode_control(self) -> bool:
-        return True
 
     def paged_attention_capabilities(self) -> dict[str, bool]:
         return {
@@ -710,8 +715,8 @@ class _PagedRoutingOpsSpy:
         self.calls[-1].max_decode_context_len = max_decode_context_len
 
 
-class _PreMmPrefixOps:
-    """Old native signature: deliberately no GQA control/probe or new keyword."""
+class _PreMmPrefixOps(_PagedOpsCapsOff):
+    """Old native signature: reports no new capability and rejects new keywords."""
 
     def __init__(self) -> None:
         self._spy = _PagedRoutingOpsSpy()
@@ -763,7 +768,7 @@ class TestSDPAForward:
         )
         captured: dict[str, int | float] = {}
 
-        class _FakeOps:
+        class _FakeOps(_PagedOpsCapsOff):
             def reshape_and_cache(
                 self,
                 _keys,
@@ -811,9 +816,8 @@ class TestSDPAForward:
         assert captured["scale"] == 0.5
 
     @pytest.mark.parametrize("disabled", [False, True])
-    @pytest.mark.parametrize("legacy_control", [False, True])
     def test_gqa_policy_reaches_primitive(
-        self, monkeypatch: pytest.MonkeyPatch, disabled: bool, legacy_control: bool
+        self, monkeypatch: pytest.MonkeyPatch, disabled: bool
     ) -> None:
         """The environment escape hatch and scheduler decode count reach native code."""
         from vllm_metal import envs
@@ -826,15 +830,8 @@ class TestSDPAForward:
             envs.environment_variables, "VLLM_METAL_DISABLE_GQA_DECODE", read_env
         )
         spy = _PagedRoutingOpsSpy()
-        if legacy_control:
-            monkeypatch.setattr(spy, "paged_attention_capabilities", None)
-            monkeypatch.setattr(spy, "supports_gqa_decode_control", None)
-            monkeypatch.setattr(
-                spy, "gqa_decode_shape_eligible", MagicMock(), raising=False
-            )
-        else:
-            capability_query = MagicMock(wraps=spy.paged_attention_capabilities)
-            monkeypatch.setattr(spy, "paged_attention_capabilities", capability_query)
+        capability_query = MagicMock(wraps=spy.paged_attention_capabilities)
+        monkeypatch.setattr(spy, "paged_attention_capabilities", capability_query)
         inner = _make_inner()
         inner.o_proj = lambda out: out
         cache = MetalPagedKVCache(
@@ -858,14 +855,12 @@ class TestSDPAForward:
             sdpa_forward(inner, x, ctx, cache, layer_idx=0)
             assert spy.calls[-1].gqa_disabled is disabled
             assert read_env.call_count == 1
-            if not legacy_control:
-                assert capability_query.call_count == 1
+            assert capability_query.call_count == 1
             next_ctx = _make_ctx(_SEQ_LEN)
             next_ctx.num_decode_requests = 1
             sdpa_forward(inner, x, next_ctx, cache, layer_idx=0)
         assert read_env.call_count == 2
-        if not legacy_control:
-            assert capability_query.call_count == 2
+        assert capability_query.call_count == 2
         assert spy.calls[-1].gqa_disabled is not disabled
         assert spy.calls[-1].num_decode_requests == 1
 
@@ -996,7 +991,7 @@ class TestSDPAForward:
 
         captured: dict[str, int | float] = {}
 
-        class _FakeOps:
+        class _FakeOps(_PagedOpsCapsOff):
             def reshape_and_cache(
                 self,
                 _key,
@@ -1079,7 +1074,7 @@ class TestSDPAForward:
         values = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
         captured: dict[str, object] = {}
 
-        class _FakeOps:
+        class _FakeOps(_PagedOpsCapsOff):
             def reshape_and_cache(
                 self,
                 _key,
@@ -1181,7 +1176,7 @@ class TestSDPAForward:
         values = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
         captured: dict[str, float] = {}
 
-        class _FakeOps:
+        class _FakeOps(_PagedOpsCapsOff):
             def reshape_and_cache(
                 self,
                 _key,
@@ -1274,7 +1269,7 @@ class TestSDPAForward:
         shared_v = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
         captured: dict[str, mx.array] = {}
 
-        class _FakeOps:
+        class _FakeOps(_PagedOpsCapsOff):
             def paged_attention_primitive(
                 self,
                 _query,
@@ -1334,7 +1329,7 @@ class TestSDPAForward:
         values = mx.zeros((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
         captured: dict[str, mx.array] = {}
 
-        class _FakeOps:
+        class _FakeOps(_PagedOpsCapsOff):
             def paged_attention_primitive(
                 self,
                 _query,
@@ -1528,13 +1523,18 @@ class TestBidirectionalDispatch:
     def test_unknown_gqa_native_cannot_silently_ignore_disable(self, monkeypatch):
         monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", "1")
         ops = _PreMmPrefixOps()
-        pipeline_probe = MagicMock(
-            side_effect=AssertionError("must not load pipelines")
+        # A GQA build without disable support must fail, not drop the switch.
+        monkeypatch.setattr(
+            ops,
+            "paged_attention_capabilities",
+            lambda: {
+                "gqa_decode": True,
+                "gqa_disable": False,
+                "decode_routing_metadata": False,
+            },
         )
-        monkeypatch.setattr(ops, "has_gqa_decode_kernel", pipeline_probe, raising=False)
         with pytest.raises(RuntimeError, match="rebuild.*native extension"):
             self._run(frozenset({"sliding"}), [None, [(0, 2)]], 1, ops=ops)
-        pipeline_probe.assert_not_called()
 
     def test_unknown_path_value_raises(self) -> None:
         with pytest.raises(ValueError, match="VLLM_METAL_MM_PREFIX_PATH"):
@@ -1675,7 +1675,7 @@ class TestPhiAttention:
 
         captured: dict[str, float] = {}
 
-        class _FakeOps:
+        class _FakeOps(_PagedOpsCapsOff):
             def reshape_and_cache(
                 self, _key, _value, key_cache, value_cache, _slot_mapping
             ):

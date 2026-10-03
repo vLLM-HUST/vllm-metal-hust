@@ -17,8 +17,10 @@ import sys
 from functools import partial
 from pathlib import Path
 
-# Set before importing MLX, including through the target loader.
-os.environ["MLX_ENABLE_TF32"] = "0"
+# Configure only CLI execution, before importing MLX or the target loader.
+# Importing comparison helpers must not alter the caller's environment.
+if __name__ == "__main__":
+    os.environ["MLX_ENABLE_TF32"] = "0"
 
 import mlx.core as mx
 import numpy as np
@@ -27,24 +29,13 @@ from mlx_lm import load
 from safetensors.torch import load_file
 from transformers import Qwen3Config
 
-from tools.attention_bench_utils import package_versions
+from tools.attention_bench_utils import compare, native_source_hashes, package_versions
 from vllm_metal.v1.dflash import DFlashTargetCapture
 from vllm_metal.v1.draft_checkpoint import load_draft_weights
 from vllm_metal.v1.dspark import DSparkConfig, load_dspark
 
-
-def compare(actual, expected, *, atol, rtol):
-    actual = np.array(actual.astype(mx.float32))
-    expected = expected.detach().float().cpu().numpy()
-    if actual.shape != expected.shape or not actual.size:
-        raise ValueError(f"Incomplete comparison: {actual.shape} != {expected.shape}")
-    if not np.isfinite(actual).all() or not np.isfinite(expected).all():
-        raise ValueError("Non-finite DSpark output")
-    np.testing.assert_allclose(actual, expected, atol=atol, rtol=rtol)
-    return {
-        "exact": bool(np.array_equal(actual, expected)),
-        "max_abs_error": float(np.max(np.abs(actual - expected))),
-    }
+# Every function that decides which weights produce the numbers in a report.
+NATIVE_SOURCES = (load_dspark, load_draft_weights, DFlashTargetCapture.run)
 
 
 def check_tokens(actual, expected, actual_logits, expected_logits):
@@ -65,21 +56,17 @@ def check_tokens(actual, expected, actual_logits, expected_logits):
         )
 
 
-def qualify(args):
-    raw = json.loads((args.draft / "config.json").read_text())
-    config = DSparkConfig.from_dict(raw)
-    target_config = json.loads((args.target / "config.json").read_text())
-    config.backbone.validate_target(target_config)
-    # Capture before loading both drafters to avoid retaining three models.
-    target, tokenizer = load(str(args.target))
-    capture = DFlashTargetCapture(target, config.backbone)
+def capture_samples(target_path, backbone, context_lengths):
+    """Capture native target features/anchors, then release the target weights."""
+    target, tokenizer = load(str(target_path))
+    capture = DFlashTargetCapture(target, backbone)
     samples = []
     prompts = [
         "Explain how a computer works in simple terms. ",
         "Write a Python function that adds two numbers. ",
     ]
     for batch in (1, 2):
-        for length in args.context_lengths:
+        for length in context_lengths:
             ids = [
                 tokenizer.encode(prompts[i] * (length + 1))[:length]
                 for i in range(batch)
@@ -100,6 +87,16 @@ def qualify(args):
     del target, tokenizer, capture, logits, features, anchors
     gc.collect()
     mx.clear_cache()
+
+    return samples
+
+
+def qualify(args):
+    raw = json.loads((args.draft / "config.json").read_text())
+    config = DSparkConfig.from_dict(raw)
+    target_config = json.loads((args.target / "config.json").read_text())
+    config.backbone.validate_target(target_config)
+    samples = capture_samples(args.target, config.backbone, args.context_lengths)
 
     reference_root = args.reference.resolve()
     reference_file = reference_root / "deepspec/modeling/dspark/qwen3/modeling.py"
@@ -217,12 +214,7 @@ def qualify(args):
             name: hashlib.sha256((reference_root / name).read_bytes()).hexdigest()
             for name in sources
         },
-        "native_source_sha256": {
-            Path(function.__code__.co_filename).name: hashlib.sha256(
-                Path(function.__code__.co_filename).read_bytes()
-            ).hexdigest()
-            for function in (load_dspark, load_draft_weights, DFlashTargetCapture.run)
-        },
+        "native_source_sha256": native_source_hashes(*NATIVE_SOURCES),
         "versions": package_versions("mlx", "mlx-lm", "torch", "transformers"),
         "cases": rows,
         "passed": True,

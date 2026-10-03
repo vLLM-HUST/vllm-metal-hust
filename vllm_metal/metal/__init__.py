@@ -38,38 +38,18 @@ _ops_module: ModuleType | None = None
 
 
 def paged_attention_capabilities(ops: ModuleType) -> dict[str, bool]:
-    """Normalize public native capabilities, including older extension ABIs.
+    """Normalize public native capabilities.
 
     Callers cache this for a forward, rather than probing every layer. Kernel
-    availability is distinct from automatic routing and disable support.
-    Compatibility probes never create pipelines or execute a kernel.
+    availability is distinct from automatic routing and disable support. The
+    structured query is part of the required extension ABI; an artifact too
+    old to export it is unsupported and fails here rather than degrading
+    silently.
     """
-    query = getattr(ops, "paged_attention_capabilities", None)
-    if callable(query):
-        values = query()
-        return {
-            key: bool(values.get(key, False))
-            for key in ("gqa_decode", "gqa_disable", "decode_routing_metadata")
-        }
-
-    # Older GQA builds advertised control through a dedicated probe or the
-    # selector binding. Pre-GQA builds accept no GQA keyword at all.
-    control = getattr(ops, "supports_gqa_decode_control", None)
-    can_disable = (
-        bool(control())
-        if callable(control)
-        else hasattr(ops, "gqa_decode_shape_eligible")
-    )
-    has_gqa = (
-        can_disable
-        or hasattr(ops, "has_gqa_decode_kernel")
-        or hasattr(ops, "_has_gqa_decode_kernel")
-    )
-    metadata = getattr(ops, "supports_decode_routing_metadata", None)
+    values = ops.paged_attention_capabilities()
     return {
-        "gqa_decode": has_gqa,
-        "gqa_disable": can_disable,
-        "decode_routing_metadata": bool(metadata()) if callable(metadata) else False,
+        key: bool(values.get(key, False))
+        for key in ("gqa_decode", "gqa_disable", "decode_routing_metadata")
     }
 
 

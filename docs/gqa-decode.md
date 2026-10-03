@@ -100,7 +100,9 @@ Kernel availability is distinct from a supported production GQA route.
 The `gqa_disabled` keyword is sent only when disabling GQA on a native build
 that reports control support. Pre-GQA builds receive no new keyword; an
 unrecognized GQA build without disable support requires a rebuild rather than
-silently ignoring the switch. Older ABI detection is isolated in the adapter.
+silently ignoring the switch. The structured query is part of the required
+extension ABI; an artifact too old to export it is unsupported and fails at
+the query instead of probing older entry points.
 
 ## Routing contract
 

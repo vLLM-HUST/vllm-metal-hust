@@ -1157,7 +1157,7 @@ class TestSplitAndNormalize:
         [
             (mx.float32, 1e-4),
             (mx.float16, 2e-3),
-            (mx.bfloat16, 1.5e-2),
+            (mx.bfloat16, 1e-2),
         ],
     )
     def test_q_k_norm_matches_l2norm_with_eps_on_the_sum_of_squares(

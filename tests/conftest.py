@@ -5,6 +5,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import random
+import signal
 
 import numpy as np
 import pytest
@@ -29,9 +30,14 @@ def run_in_spawn_process(request):
         try:
             process.join(timeout=timeout)
             assert not process.is_alive(), f"{label}: serving test timed out"
-            assert process.exitcode == 0, (
-                f"{label}: child process failed (exit {process.exitcode})"
-            )
+            exitcode = process.exitcode
+            if exitcode is not None and exitcode < 0:
+                # A negative code is the actual terminating OS signal.
+                signum = -exitcode
+                detail = f"signal {signum} ({signal.Signals(signum).name})"
+            else:
+                detail = f"exit {exitcode}"
+            assert exitcode == 0, f"{label}: child process failed ({detail})"
         finally:
             if process.is_alive():
                 process.terminate()

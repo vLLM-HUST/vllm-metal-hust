@@ -917,15 +917,32 @@ class MetalModelRunner:
         mx.set_cache_limit(overhead)
         return overhead
 
+    def _mm_step_can_run(self, adapter: MultimodalRuntimeAdapter) -> bool:
+        """Whether the model takes mm inputs or the adapter needs explicit
+        positions even for text-only batches.
+
+        Does not check ``adapter.forward_ready``; callers do that.
+        """
+        return self._supports_mm_inputs or adapter.requires_explicit_positions
+
+    @staticmethod
+    def _mm_forward_forced(adapter: MultimodalRuntimeAdapter | None) -> bool:
+        """Whether a forward-ready adapter routes text batches through the
+        mm forward (``requires_explicit_positions``)."""
+        return (
+            adapter is not None
+            and adapter.forward_ready
+            and adapter.requires_explicit_positions
+        )
+
     def _dummy_encoder_outputs(self) -> list[mx.array]:
         """Encoder outputs for one profiling feature, when the adapter offers one."""
         adapter = self._multimodal_adapter
         if adapter is None or not adapter.forward_ready:
             return []
-        # When the model takes no multimodal inputs and the adapter does not
-        # require explicit positions, an mm step cannot run — profiling a
-        # maximal encoder pass would only inflate the measured overhead.
-        if not (self._supports_mm_inputs or adapter.requires_explicit_positions):
+        # When no mm step can run, profiling a maximal encoder pass would
+        # only inflate the measured overhead.
+        if not self._mm_step_can_run(adapter):
             return []
         profile_features = getattr(adapter, "profile_features", None)
         if profile_features is None:
@@ -994,7 +1011,7 @@ class MetalModelRunner:
         if not self._selective_logits_supported or (
             adapter is not None
             and adapter.forward_ready
-            and (self._supports_mm_inputs or adapter.requires_explicit_positions)
+            and self._mm_step_can_run(adapter)
         ):
             return None
         rows = int(input_ids.shape[-1])
@@ -1250,11 +1267,7 @@ class MetalModelRunner:
         # caches, corrupting decode/packed/chunked text batches.  Adapters flag
         # ``requires_explicit_positions`` so text-only batches also run the mm
         # forward, which always passes position_ids.
-        use_mm_forward = has_mm or (
-            adapter is not None
-            and adapter.forward_ready
-            and adapter.requires_explicit_positions
-        )
+        use_mm_forward = has_mm or self._mm_forward_forced(adapter)
 
         # ---- build unified token sequence: decode first, then prefill ----
         all_token_ids: list[int] = []
@@ -1537,11 +1550,7 @@ class MetalModelRunner:
                 decode_params.append(state.sampling_params)
 
         adapter = self._multimodal_adapter
-        mm_forward_forced = (
-            adapter is not None
-            and adapter.forward_ready
-            and adapter.requires_explicit_positions
-        )
+        mm_forward_forced = self._mm_forward_forced(adapter)
         capabilities = RunnerCapabilities(
             pipeline_enabled=envs.VLLM_METAL_DECODE_PIPELINE,
             use_async_scheduling=self.use_async_scheduling,

@@ -2120,8 +2120,9 @@ NB_MODULE(_paged_ops, m) {
   m.def("gqa_decode_partition_size", &gqa_decode_plan_for_shape,
         nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
         nb::arg("max_seq_len"), nb::arg("gpu_cores"), nb::arg("block_size") = 16,
-        "Default GQA partition in the measured geometry scope, or zero. "
-        "Functional dispatch checks also apply.");
+        "Default GQA partition for a supported decode geometry, or zero. "
+        "Geometry and occupancy planning only; dtype, feature and resource "
+        "eligibility are enforced separately by gqa_decode dispatch.");
   m.def("last_gqa_partition_size", []() {
     return g_last_gqa_partition.load(std::memory_order_relaxed);
   }, "Partition selected by the most recent recorded paged eval, or zero "
@@ -2130,8 +2131,9 @@ NB_MODULE(_paged_ops, m) {
   m.def("gqa_decode_shape_eligible", &gqa_decode_shape_eligible,
         nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
         nb::arg("max_seq_len"), nb::arg("gpu_cores"), nb::arg("block_size") = 16,
-        "Measured default scope with a conservative grid guard; "
-        "functional dispatch checks also apply.");
+        "Measured default scope with a conservative grid guard; geometry "
+        "and occupancy planning only. Functional dispatch checks dtype, "
+        "feature and resource eligibility separately.");
   m.def("min_decode_grid", &min_decode_grid,
         "Decode-grid threshold (threadgroups) below which split-KV decode "
         "engages on this machine.");

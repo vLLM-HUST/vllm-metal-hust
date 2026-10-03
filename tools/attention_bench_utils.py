@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.metadata
+from pathlib import Path
+from types import FunctionType
 
 import mlx.core as mx
 import numpy as np
@@ -32,6 +35,50 @@ def package_versions(*names: str) -> dict[str, str | None]:
         except importlib.metadata.PackageNotFoundError:
             versions[name] = None
     return versions
+
+
+def native_source_hashes(*functions: FunctionType) -> dict[str, str]:
+    """Hash the source file behind each function, keyed by file name."""
+    hashes: dict[str, str] = {}
+    for function in functions:
+        path = Path(function.__code__.co_filename)
+        hashes[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return hashes
+
+
+def compare(
+    actual: mx.array,
+    expected,
+    *,
+    atol: float = 1e-3,
+    rtol: float = 1e-3,
+) -> dict[str, object]:
+    """Assert a native output matches its reference within tolerance.
+
+    ``expected`` may be an MLX array, a NumPy array, or a torch tensor
+    (converted through ``detach().float().cpu().numpy()`` so this module
+    does not import torch).  Shape mismatches, empty outputs and
+    non-finite values are rejected before the tolerance check.  Returns
+    the max absolute error and whether the outputs match bit-for-bit.
+    """
+    actual_np = np.array(actual.astype(mx.float32))
+    if isinstance(expected, mx.array):
+        expected_np = np.array(expected.astype(mx.float32))
+    elif isinstance(expected, np.ndarray):
+        expected_np = expected.astype(np.float32)
+    else:
+        expected_np = expected.detach().float().cpu().numpy()
+    if actual_np.shape != expected_np.shape or not actual_np.size:
+        raise ValueError(
+            f"Incomplete comparison: {actual_np.shape} != {expected_np.shape}"
+        )
+    if not np.isfinite(actual_np).all() or not np.isfinite(expected_np).all():
+        raise ValueError("Non-finite output in comparison")
+    np.testing.assert_allclose(actual_np, expected_np, atol=atol, rtol=rtol)
+    return {
+        "max_abs_error": float(np.max(np.abs(actual_np - expected_np))),
+        "exact": bool(np.array_equal(actual_np, expected_np)),
+    }
 
 
 def ref_paged_attn(
