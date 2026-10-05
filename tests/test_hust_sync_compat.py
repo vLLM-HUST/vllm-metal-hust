@@ -25,6 +25,7 @@ def load_compat():
 class SyncCompatibilityTests(unittest.TestCase):
     def test_registration_keeps_hust_and_new_upstream_patches(self):
         compat = load_compat()
+        self.assertTrue(hasattr(compat, "ensure_vllm_v1_diffusion_guard_patch"))
         names = [
             "_patch_huggingface_hub_relative_redirect_query",
             "_patch_torch_mps_empty_host_cache",
@@ -40,6 +41,43 @@ class SyncCompatibilityTests(unittest.TestCase):
         compat.apply_compat_patches()
         compat.apply_compat_patches()
         self.assertEqual(calls, names)
+
+    def test_diffusion_guard_coexists_without_eager_vllm_imports(self):
+        compat = load_compat()
+        calls = []
+
+        def allow_v1_runner_feature(feature, allowed):
+            calls.append((feature, allowed))
+
+        patches = ModuleType("vllm_metal.patches")
+        guard = ModuleType("vllm_metal.patches.v1_runner_guard")
+        guard.allow_v1_runner_feature = allow_v1_runner_feature
+        diffusion = ModuleType("vllm_metal.v1.diffusion")
+        diffusion.SUPPORTED_DIFFUSION_MODEL_TYPES = frozenset({"diffusion_gemma"})
+        with patch.dict(
+            sys.modules,
+            {
+                "vllm_metal.patches": patches,
+                "vllm_metal.patches.v1_runner_guard": guard,
+                "vllm_metal.v1.diffusion": diffusion,
+            },
+        ):
+            compat.ensure_vllm_v1_diffusion_guard_patch()
+            feature, allowed = calls[0]
+            supported = SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(model_type="diffusion_gemma")
+                )
+            )
+            unsupported = SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(model_type="llada")
+                )
+            )
+            self.assertTrue(allowed(supported))
+            self.assertFalse(allowed(unsupported))
+
+        self.assertEqual(feature, "diffusion models")
 
     def test_relative_mirror_redirect_retains_query_and_patch_is_idempotent(self):
         compat = load_compat()

@@ -28,6 +28,7 @@ from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT  # noqa: E402
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.config import MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
+from vllm_metal.v1 import worker as worker_mod  # noqa: E402
 from vllm_metal.v1.cache_policy import (  # noqa: E402
     WorkerCachePlanner,
 )
@@ -115,7 +116,9 @@ def _make_worker(model_runner: object) -> MetalWorker:
         gpu_memory_utilization=0.92,
         num_gpu_blocks_override=None,
     )
-    worker.vllm_config = SimpleNamespace(cache_config=worker.cache_config)
+    worker.vllm_config = SimpleNamespace(
+        cache_config=worker.cache_config, kv_transfer_config=None
+    )
     return worker
 
 
@@ -279,6 +282,47 @@ class TestWorkerRunnerBoundaryDelegation:
 
 
 class TestPagedAttentionPlanDiagnostics:
+    @pytest.mark.parametrize(
+        "key_format,value_format,histories",
+        [
+            ("q8_0", "q3_0", 3),
+            ("int8", "q3_0", 3),
+            ("uint8", "q3_0", 1),
+            ("q4_0", "q3_0", 1),
+            ("q8_0", "q4_0", 1),
+        ],
+    )
+    def test_tq_format_controls_startup_reservation(
+        self, monkeypatch, key_format, value_format, histories
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_TQ_PREFILL", "1")
+        monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "auto")
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.get_config",
+            lambda: MetalConfig(
+                mlx_device="gpu",
+                turboquant=True,
+                k_quant=key_format,
+                v_quant=value_format,
+            ),
+        )
+        runner = make_stub_runner(
+            num_kv_heads=2,
+            head_dim=128,
+            kv_cache_dtype=mx.bfloat16,
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=4, max_num_batched_tokens=193
+            ),
+        )
+        runner.model_config.max_model_len = 8192
+        runner.model_config.get_num_attention_heads = lambda _: 8
+        # A 193-query step can hold three 64-token prefills or one 128-token
+        # prefill. The startup cap must cover that many independent histories,
+        # with metadata/routing overhead smaller than one additional history.
+        history_bytes = 8192 * 2 * 128 * 4
+        allowance = runner.tq_prefill_workspace_bytes
+        assert histories * history_bytes < allowance < (histories + 1) * history_bytes
+
     @pytest.mark.parametrize("length,sequences", [(512, 1), (4096, 4), (131072, 1)])
     def test_tq_auto_reservation_covers_history_and_stays_fixed(
         self, monkeypatch, length, sequences
@@ -511,3 +555,158 @@ class TestHybridPlanGuard:
 
         with pytest.raises(RuntimeError, match="HybridPagedAttentionRuntime"):
             planner.setup_paged_attention(overhead=0)
+
+
+class TestShutdownClosesConnectorStep:
+    """The connector step must end before the transfer group is torn down."""
+
+    def test_step_closes_before_kv_transfer_shutdown(self, monkeypatch) -> None:
+        order: list[str] = []
+        runner = SimpleNamespace(
+            finish_kv_connector_step=lambda: order.append("close"),
+        )
+        worker = _make_worker(runner)
+        worker._metal_profiler = None
+        monkeypatch.setattr(
+            worker_mod, "ensure_kv_transfer_shutdown", lambda: order.append("shutdown")
+        )
+        monkeypatch.setattr(worker_mod, "has_kv_transfer_group", lambda: True)
+
+        MetalWorker.shutdown(worker)
+
+        assert order == ["close", "shutdown"]
+
+    def test_shutdown_survives_a_runner_without_the_hook(self, monkeypatch) -> None:
+        """STT runners have no connector step; shutdown must not care."""
+        calls: list[str] = []
+        worker = _make_worker(SimpleNamespace())
+        worker._metal_profiler = None
+        monkeypatch.setattr(
+            worker_mod, "ensure_kv_transfer_shutdown", lambda: calls.append("shutdown")
+        )
+
+        monkeypatch.setattr(worker_mod, "has_kv_transfer_group", lambda: True)
+
+        MetalWorker.shutdown(worker)
+
+        assert calls == ["shutdown"]
+
+    def test_shutdown_without_a_transfer_group_is_upstream(self, monkeypatch) -> None:
+        """Without the offloading connector no connector teardown runs."""
+        calls: list[str] = []
+        runner = SimpleNamespace(
+            finish_kv_connector_step=lambda: calls.append("close"),
+        )
+        worker = _make_worker(runner)
+        worker._metal_profiler = None
+        monkeypatch.setattr(
+            worker_mod, "ensure_kv_transfer_shutdown", lambda: calls.append("shutdown")
+        )
+        monkeypatch.setattr(worker_mod, "has_kv_transfer_group", lambda: False)
+
+        MetalWorker.shutdown(worker)
+
+        assert calls == []
+
+
+class TestKVConnectorLifecycle:
+    """initialize_from_config wires the connector around KV cache creation.
+
+    The connector exists before ``initialize_kv_cache``, as on GPUWorker. The
+    ``KVCacheStorage`` is allocated inside ``initialize_kv_cache``, so it is
+    registered only after it.
+    """
+
+    def _worker(
+        self,
+        monkeypatch,
+        kv_transfer_config: object,
+        *,
+        has_group: bool,
+        runner_has_hook: bool = True,
+    ) -> tuple[MetalWorker, list[str]]:
+        calls: list[str] = []
+        monkeypatch.setattr(
+            worker_mod,
+            "ensure_kv_transfer_initialized",
+            lambda *_: calls.append("connector"),
+        )
+        monkeypatch.setattr(worker_mod, "has_kv_transfer_group", lambda: has_group)
+        runner = SimpleNamespace(initialize_kv_cache=lambda _cfg: calls.append("init"))
+        if runner_has_hook:
+            runner.register_kv_connector_caches = lambda: calls.append("register")
+        worker = _make_worker(runner)
+        worker.vllm_config.kv_transfer_config = kv_transfer_config
+        return worker, calls
+
+    def _kv_cache_config(self) -> SimpleNamespace:
+        return SimpleNamespace(kv_cache_layout=None)
+
+    def test_no_transfer_config_only_initializes_the_cache(self, monkeypatch) -> None:
+        worker, calls = self._worker(monkeypatch, None, has_group=False)
+        MetalWorker.initialize_from_config(worker, self._kv_cache_config())
+        assert calls == ["init"]
+
+    def test_inert_transfer_config_skips_the_guard(self, monkeypatch) -> None:
+        inert = SimpleNamespace(kv_connector=None)
+        worker, calls = self._worker(monkeypatch, inert, has_group=False)
+        MetalWorker.initialize_from_config(worker, self._kv_cache_config())
+        assert calls == ["init"]
+
+    def test_other_connector_sees_upstream_worker(self, monkeypatch) -> None:
+        """A non-offload connector gets none of the offload wiring."""
+        nixl = SimpleNamespace(kv_connector="NixlConnector")
+        worker, calls = self._worker(monkeypatch, nixl, has_group=False)
+        MetalWorker.initialize_from_config(worker, self._kv_cache_config())
+        assert calls == ["init"]
+
+    def test_connector_registers_storage_after_allocation(self, monkeypatch) -> None:
+        configured = SimpleNamespace(kv_connector="MetalOffloadingConnector")
+        worker, calls = self._worker(monkeypatch, configured, has_group=True)
+        MetalWorker.initialize_from_config(worker, self._kv_cache_config())
+        assert calls == ["connector", "init", "register"]
+
+    def test_unsupported_model_fails_before_the_kv_cache(self, monkeypatch) -> None:
+        """The connector checks the KV cache groups at construction, so an
+        unsupported model fails before the KV cache is allocated."""
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+        from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
+
+        configured = SimpleNamespace(
+            kv_connector="MetalOffloadingConnector",
+            kv_connector_module_path="vllm_metal.v1.kv_offload.connector",
+            engine_id="test",
+        )
+        worker, calls = self._worker(monkeypatch, configured, has_group=True)
+        worker.vllm_config.scheduler_config = SimpleNamespace(
+            disable_hybrid_kv_cache_manager=False
+        )
+        monkeypatch.setattr(
+            worker_mod,
+            "ensure_kv_transfer_initialized",
+            lambda vllm_config, kv_cache_config: KVConnectorFactory.create_connector(
+                vllm_config, KVConnectorRole.WORKER, kv_cache_config
+            ),
+        )
+        group = SimpleNamespace(kv_cache_spec=None, layer_names=["layer0"])
+        kv_cache_config = SimpleNamespace(
+            kv_cache_layout=None, kv_cache_groups=[group, group]
+        )
+        with pytest.raises(NotImplementedError, match="2 groups"):
+            MetalWorker.initialize_from_config(worker, kv_cache_config)
+        assert calls == []
+
+    def test_stt_runner_rejects_offloading(self, monkeypatch) -> None:
+        configured = SimpleNamespace(kv_connector="MetalOffloadingConnector")
+        worker, _ = self._worker(
+            monkeypatch, configured, has_group=True, runner_has_hook=False
+        )
+        with pytest.raises(NotImplementedError, match="STT"):
+            MetalWorker.initialize_from_config(worker, self._kv_cache_config())
+
+    def test_handshake_metadata_is_none_without_a_connector(self, monkeypatch) -> None:
+        monkeypatch.setattr(worker_mod, "has_kv_transfer_group", lambda: False)
+        worker = _make_worker(SimpleNamespace())
+        assert worker.get_kv_connector_handshake_metadata() is None
