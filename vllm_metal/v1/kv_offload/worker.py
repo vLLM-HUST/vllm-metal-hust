@@ -153,6 +153,16 @@ class MetalKVOffloadWorker(OffloadingWorker):
             raise ValueError(
                 f"expected a single KV cache group, got {gpu_spec.group_sizes!r}"
             )
+        # Upstream asserts this in the spec's __init__; asserts vanish under -O.
+        if len(gpu_spec.block_indices) != len(gpu_spec.group_sizes):
+            raise ValueError(
+                f"block_indices must have one entry per KV cache group, got "
+                f"{gpu_spec.block_indices!r} for {gpu_spec.group_sizes!r}"
+            )
+        if gpu_spec.block_indices[0] < 0:
+            raise ValueError(
+                f"block index must be non-negative, got {gpu_spec.block_indices[0]}"
+            )
         group_size = gpu_spec.group_sizes[0]
         if group_size == 0:
             return
@@ -202,20 +212,15 @@ class MetalKVOffloadWorker(OffloadingWorker):
         The scatter reads the current page view, so it runs after any pending
         native write to these blocks, including stale zeroing.
         """
-        from vllm_metal.metal import get_ops
-
-        dst = mx.array(gpu_ids, dtype=mx.int32)
-        pages = self.storage.pages
-        written = []
         moved = 0
-        for i, host in enumerate(self._host):
+        rows = []
+        for host in self._host:
             # Fancy indexing copies, so the pool row is free once this returns.
-            rows = host[chunks, subs]
-            out = get_ops().gdn_state_scatter(pages[i], mx.array(rows), dst)
-            pages[i] = out
-            written.append(out)
-            moved += rows.nbytes
-        mx.eval(*written)
+            host_rows = host[chunks, subs]
+            rows.append(mx.array(host_rows))
+            moved += host_rows.nbytes
+        self.storage.scatter_rows(rows, gpu_ids)
+        mx.eval(*self.storage.pages)
         return moved
 
     def get_finished(self) -> list[TransferResult]:

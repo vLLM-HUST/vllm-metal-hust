@@ -267,6 +267,10 @@ class MetalFileSystemTierManager(FileSystemTierManager):
                 pass
             except OSError as exc:
                 logger.warning("KV store eviction of %s failed: %s", path, exc)
+                # The file still occupies the store; keep it indexed so the
+                # accounting stays honest and a later pass retries it.
+                skipped.append((path, entry))
+                continue
             size, key = entry
             self._store_bytes -= size
             evicted += 1

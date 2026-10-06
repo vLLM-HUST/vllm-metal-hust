@@ -185,6 +185,28 @@ def test_empty_group_is_a_noop() -> None:
     assert result.success and result.transfer_size == 0
 
 
+def test_load_rejects_mismatched_block_indices() -> None:
+    """The spec constructor asserts the length match, but asserts vanish
+    under -O, so _slices re-checks before trusting block_indices[0]."""
+    storage = make_storage()
+    worker = make_worker(storage)
+    spec = gpu_spec([1, 2])
+    spec.block_indices = []
+
+    with pytest.raises(ValueError, match="block_indices"):
+        worker.submit_load(1, CPULoadStoreSpec([0, 1]), spec)
+
+
+def test_load_rejects_negative_block_index() -> None:
+    storage = make_storage()
+    worker = make_worker(storage)
+    spec = gpu_spec([1, 2])
+    spec.block_indices = [-1]
+
+    with pytest.raises(ValueError, match="non-negative"):
+        worker.submit_load(1, CPULoadStoreSpec([0, 1]), spec)
+
+
 def test_unknown_spec_types_raise() -> None:
     worker = make_worker(make_storage())
     with pytest.raises(ValueError, match="unexpected load spec types"):

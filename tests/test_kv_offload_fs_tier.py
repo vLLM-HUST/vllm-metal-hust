@@ -355,6 +355,37 @@ def test_eviction_skips_files_of_in_flight_jobs(tmp_path: Path) -> None:
         tier.shutdown()
 
 
+def test_eviction_keeps_index_entry_when_remove_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A failed remove leaves the file on disk, so the index entry stays."""
+    tier = _tier(tmp_path, max_size_gib=2.5 * BLOCK / (1 << 30), enable_kv_events=True)
+    try:
+        a, b, c = _key(b"A"), _key(b"B"), _key(b"C")
+        _store_keys(tier, [a, b])
+        pa = tier.file_mapper.get_file_name(a)
+        pb = tier.file_mapper.get_file_name(b)
+        real_remove = os.remove
+
+        def fail_on_a(path, *args, **kwargs):
+            if path == pa:
+                raise PermissionError("denied")
+            return real_remove(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "remove", fail_on_a)
+        _store_keys(tier, [c], first_job_id=200)
+
+        # A could not be deleted: it keeps its index entry (and its bytes in
+        # the accounting) while B is the block actually evicted under the cap.
+        assert os.path.exists(pa)
+        assert pa in tier._store_index
+        assert not os.path.exists(pb)
+        assert _removed_keys(tier) == [b]
+        assert tier._store_bytes == 2 * BLOCK
+    finally:
+        tier.shutdown()
+
+
 def test_store_cap_seeds_from_a_previous_run(tmp_path: Path) -> None:
     first = _tier(tmp_path, max_size_gib=0)
     try:
