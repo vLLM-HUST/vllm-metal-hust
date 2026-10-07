@@ -49,6 +49,7 @@ from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES
 from vllm_metal.utils import CommitProbe, probe_commit
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPTargetMetadata
+from vllm_metal.v1.kv_offload.config import AUTO_POOL_KEY
 from vllm_metal.v1.model_adapter import ModelAdapter
 
 if TYPE_CHECKING:
@@ -183,6 +184,44 @@ def _build_turboquant_attention_spec(
     )
 
 
+# Max share of the KV budget for an automatic host pool. See #1037: pool size
+# did not change TTFT.
+_AUTO_POOL_MAX_SHARE = 0.25
+
+
+def _offload_chunk_bytes(
+    extra: dict, per_block_bytes: int, block_size: int | None
+) -> int:
+    """Bytes of one aligned host-pool chunk, as vLLM's offloading spec sizes it.
+
+    Approximate for non-dense layouts, where vLLM's per-block bytes can differ
+    from Metal's estimate; a pool below one real chunk still fails at startup.
+    """
+    from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
+    blocks_per_chunk = max(1, int(extra.get("blocks_per_chunk") or 1))
+    if extra.get("block_size") and block_size:
+        blocks_per_chunk = max(1, int(extra["block_size"]) // block_size)
+    align = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    return -(-per_block_bytes * blocks_per_chunk // align) * align
+
+
+def _bounded_pool(pool: int, cap: int, min_pool: int) -> int:
+    """Clamp an automatic pool to between one host chunk and max(cap, one chunk)."""
+    return min(max(pool, min_pool), max(cap, min_pool))
+
+
+def _no_room_message(kv_budget: int, request: int, min_pool: int) -> str:
+    needs = f"the smallest host pool ({min_pool / 2**20:.1f} MiB)"
+    if request:
+        needs = f"one --max-model-len request ({request / 2**20:.1f} MiB) and {needs}"
+    return (
+        f"KV offloading on Metal: the KV budget ({kv_budget / 2**20:.1f} MiB) "
+        f"cannot hold {needs}. Raise --gpu-memory-utilization"
+        + (" or lower --max-model-len." if request else ".")
+    )
+
+
 def uses_metal_offloading(vllm_config: VllmConfig) -> bool:
     """True when the Metal offloading connector is configured.
 
@@ -244,10 +283,11 @@ KV_COMMIT_SAMPLE_BYTES = 512 << 20
 # small margin.
 KV_COMMIT_RESERVE_FLOOR_BYTES = 1 << 30
 
-# Swap the kernel may write before the probe calls it pressure. A touch can
-# stir a few MB of background paging out of other processes; a real shortfall
-# moves a noticeable part of the sample. The floor keeps a small probe (where
-# the fraction rounds to nothing) from treating that noise as pressure.
+# Memory the kernel may compress or swap out before the probe calls it
+# pressure. A touch can stir a few MB of background paging out of other
+# processes; a real shortfall moves a noticeable part of the sample. The floor
+# keeps a small probe (where the fraction rounds to nothing) from treating that
+# noise as pressure.
 KV_COMMIT_SWAP_TOLERANCE_DIVISOR = 8
 KV_COMMIT_SWAP_TOLERANCE_FLOOR_BYTES = 1 << 20
 
@@ -271,10 +311,10 @@ def kv_pool_bytes_after_probe(
     """Pool bytes to allocate after a commit probe.
 
     The probe answers two different questions and only one of them is a reason
-    to give capacity back. If the kernel had to page memory out to fault the
-    sample in, the machine has no headroom *now*: a pool it cannot back is
-    served from swap, so size it to what is free, less ``reserve_bytes`` and
-    less ``future_reserved_bytes``.
+    to give capacity back. If the kernel had to move memory out of the way, into
+    the compressor or out to swap, to fault the sample in, the machine has no
+    headroom *now*: a pool it cannot back is served from swap, so size it to
+    what is free, less ``reserve_bytes`` and less ``future_reserved_bytes``.
 
     ``future_reserved_bytes`` is memory the engine will allocate later out of
     the same free pool -- the TurboQuant prefill workspace, the KV offload host
@@ -289,7 +329,7 @@ def kv_pool_bytes_after_probe(
     back capacity an idle pool never needed is the regression the lazy
     allocation exists to avoid.
     """
-    if probe.swap_out_bytes <= swap_tolerance_bytes:
+    if probe.displaced_bytes <= swap_tolerance_bytes:
         return plan_bytes
     cap = probe.available_before - reserve_bytes - future_reserved_bytes
     return min(plan_bytes, max(0, cap))
@@ -1131,17 +1171,15 @@ class WorkerCachePlanner:
                     workspace / 2**20,
                 )
         usable_metal = int(metal_limit * fraction)
-        kv_offload_pool = self._kv_offload_pool_bytes()
-        kv_budget = (
-            self.base_kv_budget_bytes(
-                metal_limit,
-                model_memory,
-                fraction,
-                overhead,
-            )
-            - kv_offload_pool
+        base_kv_budget = self.base_kv_budget_bytes(
+            metal_limit,
+            model_memory,
+            fraction,
+            overhead,
         )
-        return self._probe_committed_pool(
+        kv_offload_pool = self._resolve_kv_offload_pool(base_kv_budget, per_block_bytes)
+        kv_budget = base_kv_budget - kv_offload_pool
+        plan = self._probe_committed_pool(
             _PagedAttentionPlan(
                 block_size=block_size,
                 fraction=fraction,
@@ -1156,19 +1194,120 @@ class WorkerCachePlanner:
             ),
             future_reserved_bytes=future_reserved_bytes,
         )
+        if plan.kv_offload_pool and 0 < plan.kv_budget < kv_budget:
+            # The probe shrank only the KV cache. Re-cap an automatic pool
+            # against what is left. A probe result of 0 is floored, so it does
+            # not say how much is left; plan validation then fails as before.
+            total = plan.kv_budget + plan.kv_offload_pool
+            pool = self._recap_kv_offload_pool(
+                total, plan.kv_offload_pool, per_block_bytes
+            )
+            if pool < plan.kv_offload_pool:
+                plan = replace(
+                    plan,
+                    kv_budget=total - pool,
+                    num_blocks=(total - pool) // per_block_bytes,
+                    kv_offload_pool=pool,
+                )
+        return plan
 
-    def _kv_offload_pool_bytes(self) -> int:
+    def _auto_pool_limits(
+        self, kv_budget: int, per_block_bytes: int
+    ) -> tuple[int, int, int, dict] | None:
+        """Cap, floor, request bytes and connector config for an automatic pool.
+
+        None for a user-set size, which is never capped.
+        """
+        vllm_config = self._worker.vllm_config
+        if not uses_metal_offloading(vllm_config):
+            return None
+        assert vllm_config.kv_transfer_config is not None
+        extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        if extra.get(AUTO_POOL_KEY) is not True:
+            return None
+        cache_config = vllm_config.cache_config
+        block_size = cache_config.block_size
+        cap = int(kv_budget * _AUTO_POOL_MAX_SHARE)
+        # Leave room for one full-length request, plus the null block vLLM's
+        # pool holds back. Not when vLLM auto-fits the length later
+        # (--max-model-len -1), or sizes the cache from a block override.
+        request = 0
+        model_config = vllm_config.model_config
+        if (
+            getattr(model_config, "original_max_model_len", None) != -1
+            and cache_config.num_gpu_blocks_override is None
+        ):
+            request_blocks = -(-model_config.max_model_len // block_size) + 1
+            request = request_blocks * per_block_bytes
+            cap = min(cap, kv_budget - request)
+        # The host pool holds whole chunks, each aligned in the shared region.
+        min_pool = _offload_chunk_bytes(extra, per_block_bytes, block_size)
+        return cap, min_pool, request, extra
+
+    def _resolve_kv_offload_pool(self, kv_budget: int, per_block_bytes: int) -> int:
         """Host pool bytes of the Metal offloading connector, else 0.
 
         The pool is the same physical RAM as the wired cache, so it comes out
-        of the same budget.
+        of the same budget. An automatic pool is at most a quarter of the
+        budget, or one host chunk if that is larger, and leaves room for one
+        full-length request. Writes a changed size back to cpu_bytes_to_use.
+        Offloading uses the uni executor, so the connector and scheduler share
+        this config and read it after planning.
         """
         vllm_config = self._worker.vllm_config
         if not uses_metal_offloading(vllm_config):
             return 0
         assert vllm_config.kv_transfer_config is not None
         extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
-        return max(0, int(extra.get("cpu_bytes_to_use", 0)))
+        pool = max(0, int(extra.get("cpu_bytes_to_use", 0)))
+        limits = self._auto_pool_limits(kv_budget, per_block_bytes)
+        if limits is None:
+            return pool
+        if kv_budget <= 0:
+            # No room even before the pool: plan validation reports it with
+            # the full breakdown, so leave the automatic pool out of it.
+            return 0
+        cap, min_pool, request, extra = limits
+        new_pool = _bounded_pool(pool, cap, min_pool)
+        # Fail only where offloading is the cause. A request larger than the
+        # whole budget fails without it too, and vLLM's own check reports that.
+        if kv_budget - new_pool < request <= kv_budget:
+            raise ValueError(_no_room_message(kv_budget, request, min_pool))
+        if new_pool != pool:
+            logger.info(
+                "KV offloading host pool set to %.2f GiB (default %.2f GiB) to "
+                "fit the KV budget and host chunk size; pass --kv-offloading-size "
+                "to set it",
+                new_pool / 2**30,
+                pool / 2**30,
+            )
+            extra["cpu_bytes_to_use"] = new_pool
+        return new_pool
+
+    def _recap_kv_offload_pool(
+        self, total: int, pool: int, per_block_bytes: int
+    ) -> int:
+        """Cap an automatic pool again after the commit probe shrank the budget.
+
+        ``total`` is what the probe left for KV cache and pool together. The
+        pool only shrinks; if a request then does not fit, vLLM's
+        max_model_len check reports it.
+        """
+        limits = self._auto_pool_limits(total, per_block_bytes)
+        if limits is None:
+            return pool
+        cap, min_pool, _, extra = limits
+        new_pool = min(pool, _bounded_pool(pool, cap, min_pool))
+        if new_pool < pool:
+            logger.warning(
+                "KV offloading host pool cut from %.2f to %.2f GB after the "
+                "commit probe; the KV cache gets the difference, %.2f GB",
+                pool / 1e9,
+                new_pool / 1e9,
+                (total - new_pool) / 1e9,
+            )
+            extra["cpu_bytes_to_use"] = new_pool
+        return new_pool
 
     def _probe_committed_pool(
         self, plan: _PagedAttentionPlan, *, future_reserved_bytes: int = 0

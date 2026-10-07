@@ -56,7 +56,13 @@ def paged_attention_capabilities(ops: ModuleType) -> dict[str, bool]:
     values = query()
     return {
         key: bool(values.get(key, False))
-        for key in ("gqa_decode", "gqa_disable", "decode_routing_metadata")
+        for key in (
+            "gqa_decode",
+            "gqa_disable",
+            "decode_routing_metadata",
+            "gqa_batch_context_lens",
+            "gqa_length_plan",
+        )
     }
 
 

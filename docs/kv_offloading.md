@@ -22,7 +22,7 @@ vllm serve Qwen/Qwen3-8B \
 
 | Flag | Description |
 |---|---|
-| `--kv-offloading-size N` | Host pool size in GiB. Enables offloading. |
+| `--kv-offloading-size N` | Host pool size in GiB. Enables offloading. Optional when `--kv-transfer-config` names the connector: the pool then defaults to two `--max-model-len` requests of KV, and the startup log reports the size. |
 | `--kv-offloading-backend` | `native` (default). `lmcache` is refused. |
 | `--kv-transfer-config` | Secondary tiers, as JSON. Only `fs` is supported. |
 
@@ -34,12 +34,23 @@ Keys for an `fs` tier:
 | `root_dir` | required | Where block files are stored. |
 | `max_size_gib` | 10% of the volume | Disk cap in GiB. `0` means no cap. If unset and the disk has less free space than 10% of the volume, startup fails. |
 
+Without `--kv-offloading-size`, the pool defaults to the KV of two
+`--max-model-len` requests, rounded up to whole blocks. A full pool does not lose
+a block, the scheduler retries the store on the next step; two requests is the
+smallest pool with no retries at concurrency 4 in the #1037 measurements. The
+default is capped at a quarter of the KV budget (after weights and
+activations), or one host chunk if that is larger, and leaves room for one
+`--max-model-len` request. With `--max-model-len -1` or
+`--num-gpu-blocks-override` no request is reserved. The startup log says when
+the pool is changed. Pass the flag to size it yourself.
+
 The host pool comes out of `--gpu-memory-utilization` (see
 [Configuration](configuration.md#kv-cache-memory-settings)), which is the total
 Metal budget including weights. A larger pool means a smaller KV cache, not
 extra memory. The startup memory breakdown shows it as `kv_offload_pool=`. A
-pool larger than the budget fails at startup, after the weights load, with the
-breakdown and the fix. 8 GiB was enough for the Qwen3-32B benchmark in #737.
+pool set with `--kv-offloading-size` that is larger than the budget fails at
+startup, after the weights load, with the breakdown and the fix. 8 GiB was
+enough for the Qwen3-32B benchmark in #737.
 
 ## Limits
 

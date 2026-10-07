@@ -58,6 +58,30 @@ def _features(count):
     return tuple(mx.random.normal((count, 64)).astype(mx.float16) for _ in range(3))
 
 
+def _assert_committed(proposer, blocks, features):
+    """Compare committed draft KV with independent full-context projections."""
+    for layer, (keys, values) in enumerate(
+        proposer.model._project_context([f[None] for f in features])
+    ):
+        for stored, expected in (
+            (proposer.cache.cache.key_caches[layer], keys),
+            (proposer.cache.cache.value_caches[layer], values),
+        ):
+            block_size = stored.shape[1]
+            actual = mx.stack(
+                [
+                    stored[blocks[p // block_size], p % block_size]
+                    for p in range(len(features[0]))
+                ]
+            )
+            np.testing.assert_allclose(
+                np.array(actual),
+                np.array(expected[0].transpose(1, 0, 2)),
+                atol=0.004,
+                rtol=0.004,
+            )
+
+
 def _prefill(state, features, start, final):
     count = features[0].shape[0]
     return ProposeContext(
@@ -131,31 +155,15 @@ def test_chunked_prefill_then_rejection_overwrites_temporary_kv(accepted, propos
     )
     actual = proposer.propose(ctx)
     features = [
-        mx.concatenate([a, b, c[: accepted + 1]])[None]
+        mx.concatenate([a, b, c[: accepted + 1]])
         for a, b, c in zip(first, second, feature, strict=True)
     ]
-    expected = _dense_tokens(proposer, mx.array([4]), features, 3)
+    expected = _dense_tokens(proposer, mx.array([4]), [f[None] for f in features], 3)
     assert actual.draft_token_ids == expected.tolist()
     assert proposer._valid_ends == {"r": 16 + accepted}
     # Assert the committed KV itself, not just argmax IDs: random residual
     # logits can retain an argmax even if rejected feature rows leak in.
-    for i, (keys, values) in enumerate(proposer.model._project_context(features)):
-        for stored, reference in (
-            (proposer.cache.cache.key_caches[i], keys),
-            (proposer.cache.cache.value_caches[i], values),
-        ):
-            committed = mx.stack(
-                [
-                    stored[state.block_ids[1][p // 16], p % 16]
-                    for p in range(16 + accepted)
-                ]
-            )
-            np.testing.assert_allclose(
-                np.array(committed),
-                np.array(reference[0].transpose(1, 0, 2)),
-                atol=0.004,
-                rtol=0.004,
-            )
+    _assert_committed(proposer, state.block_ids[1], features)
     # Cancellation/preemption invalidates logical coverage, even if the same
     # request ID and physical pages are immediately handed out again.
     proposer.release_requests({"r"})
@@ -204,8 +212,139 @@ def test_missing_and_discontinuous_features_fail_before_drafting(proposer):
         proposer.propose(_prefill(state, _features(1), 1, True))
 
 
+def test_prefix_caching_cannot_adopt_unknown_decode_coverage(proposer):
+    proposer.enable_prefix_caching = True
+    state = RequestState(
+        token_ids=[1] * 17 + [2],
+        prompt_len=16,
+        sampling_params=SamplingParams(temperature=0),
+        block_ids=[[0, 1], [5, 2]],
+    )
+    ctx = replace(
+        _prefill(state, _features(1), 0, True),
+        decode_reqs=[("r", state)],
+        decode_segments=[
+            PagedDecodeSegment(
+                req_id="r",
+                input_token_ids=(1,),
+                start_row=0,
+                num_query_tokens=1,
+                draft_token_ids=(),
+                cache_start_pos=16,
+                block_ids=tuple(tuple(g) for g in state.block_ids),
+            )
+        ],
+        decode_token_ids=[[2]],
+        prefill_reqs=[],
+        prefill_token_ids=[],
+        prefill_result_modes=[],
+        num_decode_segments=1,
+    )
+    with pytest.raises(RuntimeError, match="discontinuous"):
+        proposer.propose(ctx)
+    assert not proposer._valid_ends
+
+
+@pytest.mark.parametrize("start", [0, 16])
+def test_first_prefill_draft_uses_sampled_anchor_at_absolute_position(
+    proposer, monkeypatch, start
+):
+    proposer.enable_prefix_caching = True
+    state = RequestState(
+        token_ids=[1] * 31 + [2],
+        prompt_len=31,
+        sampling_params=SamplingParams(temperature=0),
+        block_ids=[[0, 1], [5, 2, 7, 1]],
+    )
+    features = _features(31)
+    if start:
+        proposer.cache.write_context(
+            [f[:start] for f in features], [(state.block_ids[1], 0, start)]
+        )
+    compile_draft = proposer._compile_draft
+    calls = []
+
+    def record_compile(width):
+        forward = compile_draft(width)
+
+        def record_forward(anchors, rows):
+            calls.append((anchors.tolist(), rows))
+            return forward(anchors, rows)
+
+        return record_forward
+
+    monkeypatch.setattr(proposer, "_compile_draft", record_compile)
+    result = proposer.propose(
+        _prefill(state, [f[start:] for f in features], start, True)
+    )
+    assert result is not None
+    # The final prompt token is 1; the target has already emitted anchor 2 at
+    # position 31. A cached suffix must preserve that absolute position and
+    # must not draft from the final prompt token or ingest anchor 2 twice.
+    assert calls == [([2], [(state.block_ids[1], 31)])]
+
+
+@pytest.mark.parametrize("prefix_caching", [False, True])
+def test_build_forwards_prefix_caching(monkeypatch, proposer, prefix_caching):
+    spec = SimpleNamespace(
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(), quantization=None, max_model_len=64
+        ),
+        num_speculative_tokens=3,
+        enable_adaptive_verification=False,
+        draft_sample_method="greedy",
+        rejection_sample_method="standard",
+        dspark_draft_topk=None,
+        quantization=None,
+        kv_cache_dtype=None,
+    )
+    runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=spec,
+            cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
+            additional_config={},
+        ),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(to_dict=dict)),
+        kv_cache_dtype=mx.float16,
+        _spec_decode_controller=SpeculativeDecodeController(),
+    )
+    if isinstance(proposer, DSparkProposer):
+        model = proposer.draft_model
+    else:
+        model = proposer.model
+        runner._target_input_embeddings = proposer.embed
+        runner._forward_model = SimpleNamespace(
+            args=SimpleNamespace(tie_word_embeddings=True),
+            model=SimpleNamespace(embed_tokens=proposer.embed),
+        )
+    method = proposer.name.lower()
+    proposer_cls = type(proposer)
+    # Replace checkpoint I/O only; exercise the real builder and constructor.
+    monkeypatch.setattr(proposer_cls, "_checkpoint_path", lambda _: "unused")
+    monkeypatch.setattr(
+        f"vllm_metal.v1.{method}_proposer.load_{method}", lambda *a, **kw: model
+    )
+    built = proposer_cls.build(runner)
+    built.bind_cache(proposer.cache.storage, group_index=1, max_model_len=64)
+    state = RequestState(
+        token_ids=[1] * 31 + [2],
+        prompt_len=31,
+        sampling_params=SamplingParams(temperature=0),
+        block_ids=[[0, 1], [5, 2, 7, 1]],
+    )
+    features = _features(31)
+    built.cache.write_context([f[:16] for f in features], [(state.block_ids[1], 0, 16)])
+    ctx = _prefill(state, [f[16:] for f in features], 16, True)
+    if prefix_caching:
+        assert built.propose(ctx) is not None
+        _assert_committed(built, state.block_ids[1], features)
+    else:
+        with pytest.raises(RuntimeError, match="discontinuous"):
+            built.propose(ctx)
+
+
 @pytest.mark.parametrize("proposer_cls", [DFlashProposer, DSparkProposer])
-@pytest.mark.parametrize("restriction", ["prefix", "lora", "tp", "block_size"])
+@pytest.mark.parametrize("restriction", ["lora", "tp", "block_size"])
 def test_unsupported_configuration_fails_before_loading(restriction, proposer_cls):
     config = SimpleNamespace(
         speculative_config=SimpleNamespace(
@@ -232,9 +371,7 @@ def test_unsupported_configuration_fails_before_loading(restriction, proposer_cl
         _is_vlm=False,
         _is_pooling=False,
     )
-    if restriction == "prefix":
-        config.cache_config.enable_prefix_caching = True
-    elif restriction == "lora":
+    if restriction == "lora":
         config.lora_config = object()
     elif restriction == "tp":
         config.parallel_config.tensor_parallel_size = 2
@@ -302,22 +439,7 @@ def test_width_changes_commit_verified_rows_and_reuse_compiled_callables(
         assert proposer._valid_ends == {"r": end}
         full_features = [f[None] for f in committed]
         # Inspect actual KV: argmax agreement alone can hide a bad ingest.
-        for layer, (keys, values) in enumerate(
-            proposer.model._project_context(full_features)
-        ):
-            for stored, expected in (
-                (proposer.cache.cache.key_caches[layer], keys),
-                (proposer.cache.cache.value_caches[layer], values),
-            ):
-                actual = mx.stack(
-                    [stored[state.block_ids[1][p // 16], p % 16] for p in range(end)]
-                )
-                np.testing.assert_allclose(
-                    np.array(actual),
-                    np.array(expected[0].transpose(1, 0, 2)),
-                    atol=0.004,
-                    rtol=0.004,
-                )
+        _assert_committed(proposer, state.block_ids[1], committed)
         if width == 0:
             assert result is None
         else:
@@ -363,3 +485,102 @@ def test_context_limit_uses_selected_width(width, proposer):
         assert len(result.draft_token_ids[0]) == 1
     else:
         assert result is None
+
+
+@pytest.mark.parametrize("producer", ["greedy", "sampled", "grammar", "zero_k"])
+def test_prefix_hit_reuses_committed_kv_without_writing_shared_blocks(
+    proposer, producer
+):
+    proposer.enable_prefix_caching = True
+    params = SamplingParams(
+        temperature=0.7 if producer == "sampled" else 0,
+        structured_outputs=StructuredOutputsParams(choice=["yes", "no"])
+        if producer == "grammar"
+        else None,
+    )
+    state = RequestState(
+        token_ids=[1] * 31 + [2],
+        prompt_len=31,
+        sampling_params=params,
+        block_ids=[[0], [5, 2, 7, 1]],
+    )
+    original = _features(31)
+    ctx = _prefill(state, original, 0, True)
+    if producer == "zero_k":
+        ctx = replace(ctx, num_speculative_tokens=0)
+    result = proposer.propose(ctx)
+    assert (result is not None) == (producer == "greedy")
+    shared = [
+        np.array(stored[5])
+        for caches in (
+            proposer.cache.cache.key_caches,
+            proposer.cache.cache.value_caches,
+        )
+        for stored in caches
+    ]
+    proposer.release_requests({"r"})
+    # Reuse one full block and allocate private suffix/lookahead pages.
+    state.sampling_params = SamplingParams(temperature=0)
+    state.block_ids = [[0], [5, 3, 8, 4]]
+    state.token_ids = [1] * 16 + [3] * 7 + [4]
+    state.prompt_len = 23
+    suffix = _features(7)
+    result = proposer.propose(_prefill(state, suffix, 16, True))
+    assert result is not None
+    features = [
+        mx.concatenate([prefix[:16], tail])
+        for prefix, tail in zip(original, suffix, strict=True)
+    ]
+    assert (
+        result.draft_token_ids
+        == _dense_tokens(
+            proposer, mx.array([4]), [f[None] for f in features], 3
+        ).tolist()
+    )
+    for saved, stored in zip(
+        shared,
+        [
+            stored
+            for caches in (
+                proposer.cache.cache.key_caches,
+                proposer.cache.cache.value_caches,
+            )
+            for stored in caches
+        ],
+        strict=True,
+    ):
+        np.testing.assert_array_equal(np.array(stored[5]), saved)
+    _assert_committed(proposer, state.block_ids[1], features)
+
+
+def test_prefix_hit_does_not_allow_a_later_gap(proposer):
+    proposer.enable_prefix_caching = True
+    state = RequestState(
+        token_ids=[1] * 40,
+        prompt_len=40,
+        sampling_params=SamplingParams(temperature=0),
+        block_ids=[[0], [5, 2, 7, 1]],
+    )
+    assert proposer.propose(_prefill(state, _features(4), 16, False)) is None
+    before = [np.array(buffer) for buffer in proposer.cache.storage.buffers]
+    with pytest.raises(RuntimeError, match="discontinuous"):
+        proposer.propose(_prefill(state, _features(4), 24, False))
+    for actual, expected in zip(proposer.cache.storage.buffers, before, strict=True):
+        np.testing.assert_array_equal(np.array(actual), expected)
+
+
+@pytest.mark.parametrize("start", [32, 48])
+def test_prefix_hit_beyond_draft_context_stays_target_only(proposer, start):
+    proposer.enable_prefix_caching = True
+    proposer.cache.max_model_len = 32
+    state = RequestState(
+        token_ids=[1] * (start + 1) + [2],
+        prompt_len=start + 1,
+        sampling_params=SamplingParams(temperature=0),
+        block_ids=[[0], [5, 2, 7, 1]],
+    )
+    before = [np.array(buffer) for buffer in proposer.cache.storage.buffers]
+    assert proposer.propose(_prefill(state, _features(1), start, True)) is None
+    assert not proposer._valid_ends
+    for actual, expected in zip(proposer.cache.storage.buffers, before, strict=True):
+        np.testing.assert_array_equal(np.array(actual), expected)

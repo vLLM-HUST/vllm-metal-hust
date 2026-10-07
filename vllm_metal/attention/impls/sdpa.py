@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -148,6 +149,9 @@ class _KernelMetadata:
     # Same forward/group lifetime as the existing kernel metadata. Only CPU
     # routing and gather indices are cached, never materialized K/V buffers.
     tq_prefill_plans: dict[tuple[int, ...], _TurboQuantPrefillPlan | None] = field(
+        default_factory=dict
+    )
+    tq_min_tokens: dict[tuple[object, ...], tuple[int, ...]] = field(
         default_factory=dict
     )
     tq_prefill_workspace_bytes: int = 0
@@ -951,7 +955,7 @@ def sdpa_forward(
     else:
         # Whole-batch decode routing belongs to the ordinary cache path. TQ
         # uses its own sub-batch metadata and stays outside native decode split.
-        paged_kwargs: dict[str, int | mx.array] = dict(mm_kwargs)
+        paged_kwargs: dict[str, Any] = dict(mm_kwargs)
         if ctx.paged_native_capabilities is None:
             ctx.paged_native_capabilities = paged_attention_capabilities(ops)
         capabilities = ctx.paged_native_capabilities
@@ -972,6 +976,22 @@ def sdpa_forward(
                 num_decode_tokens=ctx.num_decode_tokens,
                 max_decode_context_len=ctx.max_decode_context_len,
             )
+        if (
+            (capabilities["gqa_length_plan"] or capabilities["gqa_batch_context_lens"])
+            and not ctx.gqa_disabled
+            and ctx.num_decode_requests > 1
+            and ctx.num_decode_requests
+            == ctx.num_decode_tokens
+            == q_3d.shape[0]
+            == len(ctx.context_lens)
+            and ctx.verify_window_q == 1
+        ):
+            if capabilities["gqa_length_plan"]:
+                if ctx.gqa_length_plan is None:
+                    ctx.gqa_length_plan = ops.gqa_decode_length_plan(ctx.context_lens)
+                paged_kwargs["gqa_length_plan"] = ctx.gqa_length_plan
+            else:
+                paged_kwargs["gqa_context_lens"] = ctx.context_lens
         ops.paged_attention_primitive(
             q_3d,
             kernel_k_cache,

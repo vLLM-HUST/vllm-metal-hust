@@ -11,7 +11,11 @@ import torch
 from vllm.platforms.interface import Platform, PlatformEnum
 
 import vllm_metal.envs as envs
-from vllm_metal.config import get_config
+from vllm_metal.config import (
+    DSPARK_DRAFT_QUANTIZATION_KEY,
+    DSPARK_DRAFT_QUANTIZATION_Q4,
+    get_config,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -307,7 +311,9 @@ class MetalPlatform(Platform):
         ):
             raise VLLMValidationError(
                 "Logprobs are not supported for diffusion models on Metal yet.",
-                parameter="logprobs",
+                parameter="logprobs"
+                if params.logprobs is not None
+                else "prompt_logprobs",
             )
         # Upstream's diffusion sampler applies top_k/top_p to the canvas; the
         # Metal one does not, so refuse them rather than ignore them.
@@ -464,9 +470,24 @@ class MetalPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
 
+        add = vllm_config.additional_config
+        if isinstance(add, dict) and DSPARK_DRAFT_QUANTIZATION_KEY in add:
+            if add[DSPARK_DRAFT_QUANTIZATION_KEY] != DSPARK_DRAFT_QUANTIZATION_Q4:
+                raise ValueError(
+                    f"{DSPARK_DRAFT_QUANTIZATION_KEY} must be "
+                    f"{DSPARK_DRAFT_QUANTIZATION_Q4!r}, got "
+                    f"{add[DSPARK_DRAFT_QUANTIZATION_KEY]!r}"
+                )
+            if (
+                vllm_config.speculative_config is None
+                or vllm_config.speculative_config.method != "dspark"
+            ):
+                raise ValueError(
+                    f"{DSPARK_DRAFT_QUANTIZATION_KEY} requires method='dspark'"
+                )
+
         # Apply TurboQuant config from --additional-config
         # Example: --additional-config '{"turboquant": true, "k_quant": "q4_0"}'
-        add = vllm_config.additional_config
         if isinstance(add, dict) and add.get("turboquant"):
             config.turboquant = True
             config.k_quant = add.get("k_quant", "q8_0")

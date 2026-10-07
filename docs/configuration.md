@@ -8,7 +8,7 @@ vllm-metal validates these variables when the engine configuration is created an
 |----------|---------|-------------|
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_DISABLE_NAX` | `0` | Emergency override for automatic M5 NAX prefill attention. Set to `1` to force the non-NAX fallback. |
-| `VLLM_METAL_DISABLE_GQA_DECODE` | `0` | Set to `1` to keep eligible single-request decode on the established per-token / split-KV kernels. Automatic GQA routing is limited to the [measured geometries, kernel page sizes and context minima](gqa-decode.md), using the largest of 256/512-token partitions whose complete-partition SIMD count reaches 33 per detected GPU core. This switch only disables the optimization. |
+| `VLLM_METAL_DISABLE_GQA_DECODE` | `0` | Set to `1` to keep eligible ordinary decode on the established per-token / split-KV kernels. Automatic GQA routing uses the [supported geometries, kernel pages and batch planning rules](gqa-decode.md), requiring 33 complete-partition SIMD groups per detected GPU core. It normally prefers the largest eligible 256/512-token partition; calibrated 10-core M3 guards narrow short-context admission and prefer P256 for supported head256 batches at longer contexts. This switch only disables the optimization. |
 | `VLLM_METAL_TQ_PREFILL` | `auto` | Materialize eligible TurboQuant prefills when NAX is available. `1` explicitly enables the tiled fallback on other GPUs; `0` keeps compressed attention. Set before worker startup. |
 | `VLLM_METAL_TQ_PREFILL_MAX_MIB` | `auto` | TurboQuant prefill workspace, reserved inside `gpu_memory_utilization` before KV sizing. `auto` caps the device allowance by model and scheduler limits for non-speculative serving, and can fall below 256 MiB. A number sets an explicit MiB limit; `0` disables materialization. See [automatic sizing and memory bounds](turboquant.md#prefill-acceleration). |
 | `VLLM_METAL_MULTIMODAL_MODE` | `auto` | Multimodal serve mode: `auto` uses the compatibility allowlist (Gemma 4 gets the vision sidecar when its checkpoint allows); `multimodal-native` disables overrides; `text-only` forces the text-only path for every multimodal checkpoint |
@@ -100,12 +100,17 @@ where the eager fill's resident pages at least showed up as used.
 Because of that, the planner checks the plan against the machine before serving:
 `VLLM_METAL_KV_COMMIT_PROBE` (on by default) forces a bounded sample of the
 planned pool resident at startup — `min(capacity, 512 MiB)`, one write per
-page — and reads back how much memory was free and how much the kernel wrote to
-swap to make room. Paging is read from the cumulative swap-file counter
-(`vm_stat` `Swapouts`): not from swap occupancy, which rises and falls within a
-probe and so can hide the writes, and not from psutil's `swap_memory().sout`,
-which on macOS is the `Pageouts` counter — it moves for file writeback and can
-stay put while the kernel is swapping.
+page — and reads back how much memory was free and how much the kernel
+compressed or wrote to swap to make room. macOS answers pressure with the
+compressor first and the swap file once that fills, so paging is read from both
+cumulative counters (`vm_stat` `Compressions` and `Swapouts`): not from swap
+occupancy, which rises and falls within a probe and so can hide the writes, and
+not from psutil's `swap_memory().sout`, which on macOS is the `Pageouts`
+counter — it moves for file writeback and can stay put while the kernel is
+swapping. The `vm_stat` read has a five-second timeout; if the command is
+missing, fails, hangs or prints something unexpected, startup stops with an
+error that names `VLLM_METAL_KV_COMMIT_PROBE=0` as the opt-out, because a
+default-on safety check must not pass silently.
 The sample lives in its own mapping and is dropped as soon as the probe returns,
 so it leaves nothing resident behind — the touch itself is transient, which a
 process's peak-RSS counter will see but steady state will not. If the kernel

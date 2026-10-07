@@ -3,8 +3,9 @@
 DSpark greedy serving is an experimental stage of [RFC #825](https://github.com/vllm-project/vllm-metal/issues/825).
 It uses the shared DFlash target-capture and committed-feature lifecycle with
 scheduler-owned draft KV. DSpark's own embeddings and Markov head propose tokens;
-the target verifies every proposal. Confidence-based planning, sampled
-verification, prefix reuse, and asynchronous scheduling remain subsequent work.
+the target verifies every proposal. Prefix reuse is supported in synchronous
+serving. Confidence-based planning, sampled verification, and asynchronous
+scheduling remain subsequent work.
 
 `vllm_metal/v1/dspark.py` adapts the [MIT-licensed DeepSpec implementation](https://github.com/deepseek-ai/DeepSpec/blob/005e03b81cec38b7da6399833d609ee89a2587f2/LICENSE).
 It retains DeepSpec's copyright and full MIT permission notice, following the
@@ -16,7 +17,7 @@ existing DFlash module's approach to third-party attribution.
 vllm serve mlx-community/Qwen3-4B-4bit \
     --revision 4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25 \
     --max-model-len 2048 \
-    --no-enable-prefix-caching \
+    --enable-prefix-caching \
     --no-async-scheduling \
     --speculative-config '{
       "method": "dspark",
@@ -32,8 +33,9 @@ The first stage requires a single-device Qwen3 text target without LoRA or
 TurboQuant, native cache blocks of 8/16/32, and matching target/draft activation
 precision. Draft weights load before memory profiling and share the device
 budget with target weights, activations, and scheduler-owned KV.
-Draft quantization and an explicit draft-cache precision that differs from the
-target activation precision are rejected.
+Pre-quantized draft checkpoints and an explicit draft-cache precision that differs
+from the target activation precision are rejected. An optional runtime Q4
+conversion is described below.
 
 Widths 1 through the checkpoint's trained width are supported. The optional
 `num_speculative_tokens_per_batch_size` schedule can use zero to pause drafting;
@@ -41,11 +43,24 @@ verified target features still commit during a pause. A K-token proposal writes
 exactly K draft slots (anchor plus K-1 masks), including at the context boundary.
 Drafting stops when the selected span would exceed the effective target/draft
 context limit. Cancellation and preemption discard logical feature coverage;
-recomputation overwrites reused pages before drafting resumes.
+resumed prefills adopt the scheduler's new common prefix and commit the suffix
+before drafting resumes.
+
+Prefix reuse follows the shared [DFlash cache lifecycle](dflash.md#cache-lifecycle-and-validation).
+Both target and draft groups must have the prefix; an independently missing
+group forces suffix recomputation. Fallback and zero-width requests still commit
+draft features, so they can populate reusable prefixes. The scheduler owns
+hashing, shared pages, eviction, and cache reset. Its existing speculative
+block-drop policy stays in effect, and temporary draft slots are never committed
+prefix data. Use `--no-enable-prefix-caching` for a cold-cache comparison.
+
+KV offloading is rejected during configuration: the Metal offloader does not
+support restoring the target and draft cache groups. Remove `--kv-offloading-size`
+and any offloading connector from `--kv-transfer-config` when using DSpark.
 
 `enable_adaptive_verification`, non-greedy `draft_sample_method`, and nonstandard
 `rejection_sample_method` are rejected rather than ignored.
-The vLLM 0.30 compatibility bridge exempts only `MetalWorker` from the GPU V1
+The Metal compatibility bridge exempts only `MetalWorker` from the GPU V1
 runner's DSpark prohibition; all other upstream runner checks remain active.
 
 ### Limit Markov candidates
@@ -64,6 +79,33 @@ vocabulary size also uses that path. Smaller limits trade candidate coverage for
 less projection work; measure acceptance and end-to-end latency together.
 This option does not enable adaptive verification or change the proposal width.
 
+### Quantize draft linear layers
+
+Add `--additional-config '{"dspark_draft_quantization":"q4"}'` to the serve
+command to convert the draft backbone's linear layers and its vocabulary
+projection to MLX affine 4-bit weights with group size 64. Conversion runs once,
+after checkpoint validation and before memory profiling or compilation. Omit the
+option to retain the checkpoint weights. Only `q4` is supported, and the option
+requires `method="dspark"`.
+
+Embeddings, feature fusion, normalization, and Markov/confidence heads retain
+checkpoint precision. Draft activations and KV also retain FP16/BF16 precision;
+the target is unchanged. This reduces resident draft weight memory, but startup
+still loads the original floating checkpoint before conversion. Linear input
+dimensions must be divisible by 64; incompatible checkpoint dimensions are
+rejected before allocating the draft model or loading its weights.
+
+Q4 can change draft proposals and acceptance. The target still verifies each
+proposal against its full vocabulary. Measure acceptance and serving latency
+together; reduced draft memory does not establish a speedup or native greedy
+equivalence. The existing reduced-precision qualification limits still apply.
+
+Both `tools.dflash_serving_parity` and
+`tools.benchmark.dspark_serving_benchmark` accept
+`--dspark-draft-quantization q4`, including with `--dspark-draft-topk 64`.
+The option applies only to the DSpark arm; native, target-only and ordinary
+draft-model controls retain their existing settings.
+
 ## Serving validation
 
 The shared lifecycle tests exercise both DFlash and DSpark, in both target
@@ -74,11 +116,27 @@ reuse, stop/EOS handling, and scheduler-driven width changes through zero.
 
 ```bash
 pytest -m slow tests/test_block_draft_serving_e2e.py tests/test_block_draft_schedule_e2e.py
+pytest -m slow tests/test_block_draft_prefix_caching_e2e.py -k dspark
 python -m tools.dflash_serving_parity \
     --method dspark --num-draft-tokens 7 \
     --target /path/to/target/snapshot --draft /path/to/draft/snapshot \
     --batch-size 1 2 --max-tokens 32 --output-dir /path/to/new-serving-results
 ```
+
+The prefix-reuse tests pin the documented 4B target/DSpark revisions and
+use K=7 with top-K=64 in both verification layouts. They require exact output IDs
+against cache-disabled serving, observed cache hits and verified drafts after
+reuse, reduced prefill work, fallback-produced prefixes, shared prompts,
+cancellation, and cache-pressure resume. Per-case IDs, counters, and elapsed times
+are retained in pytest's temporary directory; timings are observations rather
+than performance gates. A retained-page preemption case requires a nonzero hit
+on resume. A deliberately incorrect proposal exercises rejection without relying
+on the model making a natural mistake; its output must still match the original
+greedy continuation.
+The first verification window also checks the sampled anchor, absolute position,
+and first-proposal IDs against cache-disabled serving, so target corrections cannot
+hide a draft shift after prefill or resume. Separately trained drafters are not
+required to match an identical target/draft-model control's acceptance rate.
 
 The shared parity tool compares native mlx-lm, target-only serving, and DSpark
 serving. It records actual verification counts and reports `EXACT`, `TOP_K_MATCH`,
@@ -240,7 +298,7 @@ since matching dimensions alone do not establish training/tokenizer compatibilit
 - The loader accepts local, unsharded, uniform FP32/FP16/BF16 safetensors and
   preserves their precision. Tensor names/shapes and finite weights are checked.
   DFlash and DSpark share these checks in `draft_checkpoint.py`.
-  Quantized, gated/RNN-head, GIDD, scaled/partial-RoPE, and non-Qwen3 checkpoints
+  Pre-quantized, gated/RNN-head, GIDD, scaled/partial-RoPE, and non-Qwen3 checkpoints
   are rejected. Confidence heads may be absent or may use hidden states with
   or without Markov embeddings.
 - Validate external anchor IDs with `draft.validate_anchors(anchors)` outside

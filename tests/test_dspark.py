@@ -194,12 +194,75 @@ def test_candidate_limit_excludes_outside_winner_and_preserves_token_id_ties(dty
     assert model.greedy_proposal(hidden, anchor, draft_topk=2)[0][0, 0].item() == 2
 
 
-@pytest.mark.parametrize("draft_topk", [0, -1, 65, True, 1.5])
-def test_invalid_candidate_limit_is_rejected(draft_topk):
-    with pytest.raises(ValueError, match="draft_topk"):
-        DSparkModel(config()).greedy_proposal(
+def test_topk_draft_skips_dense_corrected_logits_when_disabled(monkeypatch):
+    model = DSparkModel(config())
+    model.set_dtype(mx.float32)
+    hidden = mx.random.normal((1, 7, 32))
+    anchors = mx.array([3])
+    calls = 0
+    real_full_like = mx.full_like
+
+    def counting_full_like(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_full_like(*args, **kwargs)
+
+    monkeypatch.setattr(mx, "full_like", counting_full_like)
+
+    tokens, logits, _ = model.greedy_proposal(
+        hidden, anchors, draft_topk=2, corrected_logits=False
+    )
+    assert logits is None
+    assert calls == 0
+
+    dense_tokens, dense_logits, _ = model.greedy_proposal(hidden, anchors, draft_topk=2)
+    assert dense_logits is not None
+    assert calls == 7
+    assert mx.array_equal(tokens, dense_tokens).item()
+
+
+@pytest.mark.parametrize(
+    "draft_topk", [np.int32(1), np.int64(8), np.uint64(8), np.int64(64)]
+)
+def test_candidate_limit_accepts_integral_types(draft_topk):
+    model = DSparkModel(config())
+    hidden = mx.random.normal((2, 7, 32))
+    anchors = mx.array([3, 5])
+    expected = model.greedy_proposal(hidden, anchors, draft_topk=int(draft_topk))
+    compiled = mx.compile(
+        lambda hidden, anchors: model.greedy_proposal(
+            hidden, anchors, draft_topk=draft_topk
+        )
+    )
+    for result in (
+        model.greedy_proposal(hidden, anchors, draft_topk=draft_topk),
+        compiled(hidden, anchors),
+    ):
+        np.testing.assert_array_equal(np.array(result[0]), np.array(expected[0]))
+        for actual, reference in zip(result[1:], expected[1:], strict=True):
+            np.testing.assert_allclose(
+                array(actual), array(reference), atol=1e-5, rtol=1e-5
+            )
+
+
+@pytest.mark.parametrize(
+    "draft_topk", [0, -1, 65, True, False, 1.5, "8", np.int64(65), np.bool_(True)]
+)
+@pytest.mark.parametrize("vocab_size", [32, 64])
+def test_invalid_candidate_limit_is_rejected(draft_topk, vocab_size):
+    cfg = config()
+    cfg = replace(
+        cfg,
+        backbone=replace(
+            cfg.backbone, vocab_size=vocab_size, mask_token_id=vocab_size - 1
+        ),
+    )
+    with pytest.raises(ValueError, match="draft_topk") as error:
+        DSparkModel(cfg).greedy_proposal(
             mx.zeros((1, 7, 32)), mx.array([3]), draft_topk=draft_topk
         )
+    assert f"[1, {vocab_size}]" in str(error.value)
+    assert f"got {draft_topk!r}" in str(error.value)
 
 
 def test_markov_and_confidence_follow_previous_prediction_not_anchor_or_current_token():

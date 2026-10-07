@@ -7,8 +7,14 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
+from vllm.logger import init_logger
 
 from vllm_metal.attention.caches.storage import KVCacheStorage
+from vllm_metal.config import (
+    DSPARK_DRAFT_QUANTIZATION_KEY,
+    DSPARK_DRAFT_QUANTIZATION_Q4,
+    DSPARK_Q4_GROUP_SIZE,
+)
 from vllm_metal.v1.block_draft_proposer import BlockDraftProposer, DraftForward
 from vllm_metal.v1.dspark import DSparkModel, load_dspark
 from vllm_metal.v1.dspark_paged import DSparkPagedCache
@@ -16,6 +22,8 @@ from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
 if TYPE_CHECKING:
     from vllm_metal.v1.model_runner import MetalModelRunner
+
+logger = init_logger(__name__)
 
 
 class DSparkProposer(BlockDraftProposer):
@@ -36,12 +44,14 @@ class DSparkProposer(BlockDraftProposer):
         num_draft_tokens: int,
         controller: SpeculativeDecodeController,
         draft_topk: int | None = None,
+        enable_prefix_caching: bool = False,
     ) -> None:
         model.validate_draft_topk(draft_topk, model.config.backbone.vocab_size)
         super().__init__(
             model.backbone,
             num_draft_tokens=num_draft_tokens,
             controller=controller,
+            enable_prefix_caching=enable_prefix_caching,
         )
         self.draft_model = model
         self.draft_topk = draft_topk
@@ -82,16 +92,34 @@ class DSparkProposer(BlockDraftProposer):
                     "DSpark on Metal requires draft KV in the target activation precision"
                 )
         path = cls._checkpoint_path(runner)
-        model = load_dspark(path, target_config=runner.model_config.hf_config.to_dict())
+        additional = runner.vllm_config.additional_config
+        draft_quantization = (
+            additional.get(DSPARK_DRAFT_QUANTIZATION_KEY)
+            if isinstance(additional, dict)
+            else None
+        )
+        model = load_dspark(
+            path,
+            target_config=runner.model_config.hf_config.to_dict(),
+            draft_quantization=draft_quantization,
+        )
         if model.backbone.fc.weight.dtype != runner.kv_cache_dtype:
             raise NotImplementedError(
                 "DSpark on Metal requires matching target and draft activation precision"
+            )
+        if draft_quantization == DSPARK_DRAFT_QUANTIZATION_Q4:
+            logger.info(
+                "DSpark draft linears use affine Q4 (group_size=%d); "
+                "activations and KV remain %s",
+                DSPARK_Q4_GROUP_SIZE,
+                model.embed_tokens.weight.dtype,
             )
         proposer = cls(
             model,
             num_draft_tokens=spec.num_speculative_tokens,
             controller=runner._spec_decode_controller,
             draft_topk=draft_topk,
+            enable_prefix_caching=runner.vllm_config.cache_config.enable_prefix_caching,
         )
         proposer.max_model_len = min(
             proposer.max_model_len, spec.draft_model_config.max_model_len
@@ -108,7 +136,9 @@ class DSparkProposer(BlockDraftProposer):
     def _compile_draft(self, width: int) -> DraftForward:
         assert isinstance(self.cache, DSparkPagedCache)
         draft = self.cache.compile_draft(
-            num_draft_tokens=width, draft_topk=self.draft_topk
+            num_draft_tokens=width,
+            draft_topk=self.draft_topk,
+            corrected_logits=False,
         )
         # The paged adapter has already applied the sequential Markov head.
         # Return its IDs without enabling confidence-based truncation.
@@ -121,5 +151,6 @@ class DSparkProposer(BlockDraftProposer):
                 features,
                 num_draft_tokens=self.num_draft_tokens,
                 draft_topk=self.draft_topk,
+                corrected_logits=False,
             )
         )

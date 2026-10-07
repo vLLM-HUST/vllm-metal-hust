@@ -57,6 +57,14 @@ def _registered() -> None:
     vllm_integration.register()
 
 
+@pytest.fixture(autouse=True)
+def _online_hub(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The resolver branches on the hub's offline flag, so a shell that exports
+    # HF_HUB_OFFLINE=1 would send every online test down the offline path.
+    # Pin the online path once; the offline tests set the flag themselves.
+    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", False)
+
+
 @pytest.fixture()
 def config_dir(tmp_path: Path) -> str:
     directory = tmp_path / "config"
@@ -405,7 +413,6 @@ def test_remote_reference_grammar() -> None:
 def test_remote_load_source_downloads_one_matching_gguf(
     tmp_path, monkeypatch, quant: str
 ) -> None:
-    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", False)
     weight_snapshot = tmp_path / "weights"
     config_snapshot = tmp_path / "config"
     tokenizer_snapshot = tmp_path / "tokenizer"
@@ -575,7 +582,6 @@ def test_remote_load_source_repins_the_config_repo_revision_offline(
 def test_remote_load_source_rejects_unsupported_remote_matches(
     monkeypatch, filenames, error
 ) -> None:
-    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", False)
 
     def fail_snapshot_download(**_: object) -> str:
         raise AssertionError("rejected remote GGUF reference must not download")
@@ -661,7 +667,6 @@ def test_remote_plain_type_tags_resolve(tmp_path, monkeypatch, tag, offline) -> 
 
 @pytest.mark.parametrize("tag", ["Q6_K", "Q6_K_L"])
 def test_remote_sibling_tags_resolve_separately(tmp_path, monkeypatch, tag) -> None:
-    monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", False)
     snapshot = tmp_path / "weights"
     repo_files = ["README.md", "model-Q6_K.gguf", "model-Q6_K_L.gguf"]
     monkeypatch.setattr(
