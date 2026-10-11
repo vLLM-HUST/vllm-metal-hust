@@ -977,7 +977,7 @@ def sdpa_forward(
                 max_decode_context_len=ctx.max_decode_context_len,
             )
         if (
-            (capabilities["gqa_length_plan"] or capabilities["gqa_batch_context_lens"])
+            capabilities["gqa_length_plan"]
             and not ctx.gqa_disabled
             and ctx.num_decode_requests > 1
             and ctx.num_decode_requests
@@ -986,12 +986,9 @@ def sdpa_forward(
             == len(ctx.context_lens)
             and ctx.verify_window_q == 1
         ):
-            if capabilities["gqa_length_plan"]:
-                if ctx.gqa_length_plan is None:
-                    ctx.gqa_length_plan = ops.gqa_decode_length_plan(ctx.context_lens)
-                paged_kwargs["gqa_length_plan"] = ctx.gqa_length_plan
-            else:
-                paged_kwargs["gqa_context_lens"] = ctx.context_lens
+            if ctx.gqa_length_plan is None:
+                ctx.gqa_length_plan = ops.gqa_decode_length_plan(ctx.context_lens)
+            paged_kwargs["gqa_length_plan"] = ctx.gqa_length_plan
         ops.paged_attention_primitive(
             q_3d,
             kernel_k_cache,
@@ -1020,6 +1017,7 @@ def sdpa_forward(
             kernel_v_cache,
             block_tables=block_tables,
             block_size=kernel_block_size,
+            block_stride=kv_cache.block_stride_for_layer(layer_idx),
             cu_seqlens=ctx.cu_seqlens,
             context_lens=ctx.context_lens,
             ctx=ctx,

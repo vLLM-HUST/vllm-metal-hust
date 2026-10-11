@@ -179,6 +179,13 @@ def test_packed_kv_store_preserves_strides_and_shared_backing():
     assert torch.all(key[2, 2] == 0)
 
 
+def test_block_stride_spans_the_upstream_page():
+    storage = make_storage()
+    cache = MetalPagedKVCache.from_upstream(storage, ["a0", "a1"])
+    page = storage.specs["a0"].page_size_bytes
+    assert cache.block_stride_for_layer(1) == page // 2
+
+
 def test_budget_above_buffer_limit_uses_shared_regions(monkeypatch):
     from types import SimpleNamespace
 

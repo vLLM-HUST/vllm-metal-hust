@@ -114,7 +114,7 @@ def test_slot_indices_follow_the_block_table() -> None:
 def test_gather_kv_reads_rows_and_slices_head_dim() -> None:
     cache = mx.arange(3 * 4 * 2 * 6, dtype=mx.float32).reshape(3, 4, 2, 6)
     slots = mx.array([5, 0, 11], dtype=mx.int32)
-    got = gather_kv(cache, slots, 4)
+    got = gather_kv(cache, slots, 4, cache[0].size)
     flat = cache.reshape(-1, 2, 6)
     expected = mx.stack([flat[5], flat[0], flat[11]])[:, :, :4]
     assert got.shape == (3, 2, 4)

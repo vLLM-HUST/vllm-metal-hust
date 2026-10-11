@@ -9,6 +9,7 @@ import logging
 import mlx.core as mx
 import numpy as np
 import pytest
+import torch
 
 from vllm_metal.attention.block_tables import build_block_tables
 from vllm_metal.attention.context import PagedAttentionContext
@@ -19,6 +20,7 @@ from vllm_metal.attention.impls.bidi_prefill import (
     slot_indices,
 )
 from vllm_metal.metal import get_ops
+from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 
 BLOCK = 16
 HEADS, KV_HEADS, HD = 4, 2, 64
@@ -140,8 +142,8 @@ def test_assembled_causal_path_matches_kernel(window) -> None:
     q_lo = seq_len - n
     k_lo = max(0, q_lo - window + 1) if window is not None else 0
     slots = slot_indices(table[0], BLOCK, k_lo, seq_len)
-    keys = gather_kv(key_cache, slots, HD)
-    values = gather_kv(value_cache, slots, HD)
+    keys = gather_kv(key_cache, slots, HD, key_cache[0].size)
+    values = gather_kv(value_cache, slots, HD, value_cache[0].size)
     mask = mx.array(build_bidi_mask(q_lo, n, k_lo, seq_len - k_lo, (0, 0), window))
     got = mx.fast.scaled_dot_product_attention(
         query.transpose(1, 0, 2)[None],
@@ -171,6 +173,7 @@ def test_block_rows_are_recomputed_with_the_bidirectional_mask(window) -> None:
         value_cache,
         block_tables=table,
         block_size=BLOCK,
+        block_stride=key_cache[0].size,
         cu_seqlens=[0, n],
         context_lens=[seq_len],
         ctx=ctx,
@@ -221,6 +224,7 @@ def test_decoder_canvas_window_is_anchored_at_the_block_start(canvas) -> None:
         value_cache,
         block_tables=table,
         block_size=BLOCK,
+        block_stride=key_cache[0].size,
         cu_seqlens=[0, n],
         context_lens=[seq_len],
         ctx=ctx,
@@ -258,6 +262,7 @@ def test_block_head_in_context_is_read_from_the_cache() -> None:
         value_cache,
         block_tables=table,
         block_size=BLOCK,
+        block_stride=key_cache[0].size,
         cu_seqlens=[0, n],
         context_lens=[seq_len],
         ctx=_ctx(n, seq_len, [(b0, b1)]),
@@ -295,6 +300,7 @@ def test_ranges_outside_the_queries_leave_the_output_untouched() -> None:
         value_cache,
         block_tables=table,
         block_size=BLOCK,
+        block_stride=key_cache[0].size,
         cu_seqlens=[0, n],
         context_lens=[seq_len],
         ctx=ctx,
@@ -314,10 +320,38 @@ def test_gather_follows_hybrid_block_size_translation() -> None:
     cache64 = mx.random.normal((8, 64, KV_HEADS, HD)).astype(DTYPE)
     tables, kernel_bs = build_block_tables([[3, 5]], 64)
     view = cache64.reshape(-1, kernel_bs, KV_HEADS, HD)
-    got = gather_kv(view, slot_indices(tables[0], kernel_bs, 10, 100), HD)
+    got = gather_kv(view, slot_indices(tables[0], kernel_bs, 10, 100), HD, view[0].size)
     expected = mx.stack([cache64[[3, 5][p // 64], p % 64] for p in range(10, 100)])
     mx.eval(got, expected)
     assert mx.array_equal(got, expected)
+
+
+def test_gather_reads_blocks_past_32_bit_offsets() -> None:
+    """A pooled cache region whose strides reach past INT32_MAX elements.
+
+    MLX gathers from such a view with 32-bit offsets; the rows of blocks past
+    the limit came back as garbage, and DiffusionGemma's canvas turned to NaN.
+    """
+    block_size, head_dim, block_stride = 16, 64, 1 << 16
+    num_blocks = (1 << 15) + 2
+    # Uncommitted, as KVCacheStorage allocates it: only written pages are
+    # resident.
+    backing = torch.empty((num_blocks, block_stride), dtype=torch.uint8)
+    cache = get_ops().as_strided(
+        torch_to_mlx(backing),
+        (num_blocks, block_size, 1, head_dim),
+        (block_stride, block_stride // block_size, head_dim, 1),
+        0,
+    )
+    blocks = [1, num_blocks - 1]
+    for value, block in enumerate(blocks, start=1):
+        backing[block] = value
+    slots = slot_indices(mx.array(blocks, dtype=mx.int32), block_size, 0, 32)
+    got = gather_kv(cache, slots, head_dim, block_stride)
+    expected = np.repeat([1, 2], block_size)[:, None, None]
+    np.testing.assert_array_equal(
+        np.array(got), np.broadcast_to(expected, (32, 1, head_dim))
+    )
 
 
 def test_softcap_and_turboquant_are_refused() -> None:
@@ -327,6 +361,7 @@ def test_softcap_and_turboquant_are_refused() -> None:
     common = {
         "block_tables": table,
         "block_size": BLOCK,
+        "block_stride": key_cache[0].size,
         "cu_seqlens": [0, n],
         "context_lens": [seq_len],
         "ctx": _ctx(n, seq_len, [(0, 8)]),
@@ -361,6 +396,7 @@ def test_two_blocks_in_one_segment_are_spliced_in_order() -> None:
         value_cache,
         block_tables=table,
         block_size=BLOCK,
+        block_stride=key_cache[0].size,
         cu_seqlens=[0, n],
         context_lens=[seq_len],
         ctx=ctx,
@@ -415,6 +451,7 @@ def test_narrow_head_dim_rows_are_repadded() -> None:
         value_cache,
         block_tables=table,
         block_size=BLOCK,
+        block_stride=key_cache[0].size,
         cu_seqlens=[0, n],
         context_lens=[seq_len],
         ctx=_ctx(n, seq_len, [(b0, b1)]),
@@ -505,6 +542,7 @@ def test_two_segments_with_blocks_are_spliced_independently() -> None:
             value_cache,
             block_tables=table,
             block_size=BLOCK,
+            block_stride=key_cache[0].size,
             cu_seqlens=cu_seqlens,
             context_lens=context_lens,
             ctx=ctx,

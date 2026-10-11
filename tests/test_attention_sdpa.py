@@ -893,7 +893,7 @@ class TestSDPAForward:
         assert spy.calls[-1].num_decode_requests == 1
 
     @pytest.mark.parametrize("disabled", [False, True])
-    @pytest.mark.parametrize("capability", ["none", "lengths", "plan"])
+    @pytest.mark.parametrize("capability", ["none", "plan"])
     @pytest.mark.parametrize("kind", ["decode", "mixed", "expanded_verify"])
     def test_gqa_batch_metadata_is_only_forwarded_for_ordinary_decode(
         self, monkeypatch, disabled, capability, kind
@@ -919,7 +919,6 @@ class TestSDPAForward:
                 "gqa_decode": True,
                 "gqa_disable": True,
                 "decode_routing_metadata": True,
-                "gqa_batch_context_lens": capability == "lengths",
                 "gqa_length_plan": capability == "plan",
             }
         )
@@ -944,9 +943,6 @@ class TestSDPAForward:
         ):
             for _layer in range(3):
                 sdpa_forward(inner, x, ctx, cache, layer_idx=0)
-            assert spy.calls[-1].gqa_context_lens == (
-                [2, 4] if eligible and capability == "lengths" else None
-            )
             plan = spy.calls[-1].gqa_length_plan
             assert plan == ((2, 4) if eligible and capability == "plan" else None)
             assert len(spy.length_plans) == int(eligible and capability == "plan")

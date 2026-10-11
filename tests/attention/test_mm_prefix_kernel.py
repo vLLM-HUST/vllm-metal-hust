@@ -207,6 +207,7 @@ def test_block_longer_than_window_matches_reference_and_recompute(
         value_cache,
         block_tables=table,
         block_size=BLOCK,
+        block_stride=key_cache[0].size,
         cu_seqlens=[0, n],
         context_lens=[seq_len],
         ctx=ctx,

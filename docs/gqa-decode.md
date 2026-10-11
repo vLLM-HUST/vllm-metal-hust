@@ -166,9 +166,8 @@ unrecognized GQA build without disable support requires a rebuild rather than
 silently ignoring the switch. The structured query is part of the required
 extension ABI; an artifact too old to export it is unsupported and fails at
 the query instead of probing older entry points.
-The `gqa_length_plan` capability advertises the per-forward plan. Builds with
-only `gqa_batch_context_lens` receive the original optional length list;
-an older structured query that omits it keeps its existing batch routing.
+The `gqa_length_plan` capability advertises the per-forward plan. Builds
+without it keep their existing batch routing.
 
 ## Routing contract
 
