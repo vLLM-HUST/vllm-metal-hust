@@ -128,6 +128,7 @@ def test_unknown_core_count_keeps_measured_shape_on_baseline() -> None:
     ops._override_detected_gpu_core_count_for_test(0)
     try:
         assert ops.detected_gpu_core_count() == 0
+        assert ops.min_decode_grid() == 14 * 8
         out, ref = _run_primitive(
             [32768],
             mx.bfloat16,
@@ -135,7 +136,7 @@ def test_unknown_core_count_keeps_measured_shape_on_baseline() -> None:
             seed=37,
             num_decode_requests=1,
         )
-        _assert_fallback()
+        assert _dispatch_family() == "per_token_ps512"
         _assert_close(out, ref, mx.bfloat16)
     finally:
         _restore_test_gpu_cores()
