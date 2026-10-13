@@ -341,6 +341,11 @@ class MetalWorker(WorkerBase):
         """
         return self.model_runner.model
 
+    def get_model_inspection(self) -> str:
+        # vLLM's default walks torch's named_children(); MLX modules have
+        # their own tree repr.
+        return repr(self.get_model())
+
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after engine auto-fits context to GPU memory."""
         self.model_config.max_model_len = max_model_len

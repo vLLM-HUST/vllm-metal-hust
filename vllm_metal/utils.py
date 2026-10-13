@@ -163,7 +163,7 @@ def set_wired_limit() -> None:
     try:
         import mlx.core as mx
 
-        device_info = mx.metal.device_info()
+        device_info = mx.device_info()
         max_wired = int(device_info.get("max_recommended_working_set_size", 0))
         if max_wired > 0:
             mx.set_wired_limit(max_wired)

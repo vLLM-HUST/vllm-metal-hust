@@ -71,7 +71,7 @@ def test_set_wired_limit_uses_pinned_mlx_api(monkeypatch) -> None:
     calls: list[int] = []
 
     monkeypatch.setattr(
-        mx.metal,
+        mx,
         "device_info",
         lambda: {"max_recommended_working_set_size": 123},
     )

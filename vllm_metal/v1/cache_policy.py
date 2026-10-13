@@ -248,6 +248,7 @@ class _PagedAttentionPlan:
     # KV offload host pool. Pageable, but the same physical RAM as the wired
     # cache on unified memory, so it comes out of the same budget.
     kv_offload_pool: int = 0
+    sized_down_by_probe: bool = False
 
     def format_breakdown(self) -> str:
         parts = [
@@ -263,10 +264,18 @@ class _PagedAttentionPlan:
         return ", ".join(parts)
 
     def format_mitigations(self) -> str:
-        mitigations = [
-            f"increase --gpu-memory-utilization (currently {self.fraction})",
-            "use a smaller or more quantized model",
-        ]
+        if self.sized_down_by_probe:
+            mitigations = [
+                "close other applications to free memory (the startup probe "
+                "saw this machine page memory out, so raising "
+                "--gpu-memory-utilization will not help)",
+                "use a smaller or more quantized model",
+            ]
+        else:
+            mitigations = [
+                f"increase --gpu-memory-utilization (currently {self.fraction})",
+                "use a smaller or more quantized model",
+            ]
         if self.kv_offload_pool:
             mitigations.insert(0, "lower --kv-offloading-size")
         return "Mitigations: " + "; ".join(mitigations) + "."
@@ -1386,7 +1395,10 @@ class WorkerCachePlanner:
             plan.fraction,
             probe.describe(),
         )
-        return replace(plan, kv_budget=fit, num_blocks=num_blocks)
+
+        return replace(
+            plan, kv_budget=fit, num_blocks=num_blocks, sized_down_by_probe=True
+        )
 
     def _validate_paged_attention_plan(
         self, plan: _PagedAttentionPlan, *, require_min_blocks: bool
