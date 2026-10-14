@@ -356,7 +356,6 @@ class MetalPlatform(Platform):
             unsupported_controls += [
                 name
                 for name in (
-                    "logprobs",
                     "logprob_token_ids",
                     "prompt_logprobs",
                     "structured_outputs",
@@ -569,8 +568,11 @@ class MetalPlatform(Platform):
 
         logger.debug("Metal config: %s", config)
 
-        # Set worker class for Metal
         backend = envs.VLLM_METAL_BACKEND
+        if model_config is not None and model_config.enable_sleep_mode:
+            cls._check_sleep_mode_config(vllm_config, backend)
+
+        # Set worker class for Metal
         if backend == "mps":
             from vllm_metal.pytorch_backend.worker import configure_mps
 
@@ -1059,6 +1061,24 @@ class MetalPlatform(Platform):
         )
 
     @classmethod
+    def _check_sleep_mode_config(cls, vllm_config: "VllmConfig", backend: str) -> None:
+        """Sleep mode re-creates the MLX runner's shared KV storage in place.
+        Drafters that keep their own caches or arrays derived from it are not
+        covered, and the PyTorch MPS runner has no such storage.
+        """
+        if backend != "mlx":
+            raise NotImplementedError(
+                "Sleep mode is supported on the MLX backend only "
+                f"(VLLM_METAL_BACKEND={backend!r})."
+            )
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None and speculative_config.method != "ngram":
+            raise NotImplementedError(
+                "Sleep mode on Metal supports only n-gram speculative decoding, "
+                f"got method={speculative_config.method!r}."
+            )
+
+    @classmethod
     def _check_diffusion_config(cls, vllm_config: "VllmConfig") -> None:
         """Constrain a block-diffusion LM to what ``DiffusionGemmaRuntime`` serves.
 
@@ -1418,6 +1438,10 @@ class MetalPlatform(Platform):
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on Metal/MLX.")
         return AttentionBackendEnum.CPU_ATTN.get_path()
+
+    @classmethod
+    def is_sleep_mode_available(cls) -> bool:
+        return True
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:

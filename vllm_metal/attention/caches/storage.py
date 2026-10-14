@@ -126,6 +126,10 @@ class KVCacheStorage:
             for group in config.kv_cache_groups
             for name in group.layer_names
         }
+        self._bind()
+
+    def _bind(self) -> None:
+        config = self.config
         self.tensors = allocate_kv_cache_lazily(
             config,
             KVCacheLayout[config.kv_cache_layout],
@@ -161,6 +165,22 @@ class KVCacheStorage:
                     raw, (config.num_blocks, size), (tensor.block_stride, 1), offset
                 )
         self.pages = CacheViews(self, list(regions.values()))
+
+    @property
+    def released(self) -> bool:
+        return not self.buffers
+
+    def release(self) -> None:
+        """Free the backing memory. Its contents are discarded."""
+        self.tensors = {}
+        self.buffers = []
+
+    def reallocate(self) -> None:
+        """Re-create the backing memory with the layout vLLM scheduled against."""
+        nbytes, region_offsets = self.nbytes, self.region_offsets
+        self._bind()
+        if (self.nbytes, self.region_offsets) != (nbytes, region_offsets):
+            raise RuntimeError("Reallocated KV cache changed its layout")
 
     def depend(self, arrays: Sequence[mx.array]) -> None:
         if arrays:

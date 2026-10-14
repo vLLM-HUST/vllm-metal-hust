@@ -251,3 +251,10 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
     def materialize_pending_state(self) -> None:
         self.state_manager.materialize_pending_state()
+
+    def release_kv_memory(self) -> None:
+        self.state_manager.discard_pending_state()
+        self.storage.release()
+
+    def restore_kv_memory(self) -> None:
+        self.storage.reallocate()

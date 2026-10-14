@@ -326,6 +326,15 @@ class PagedStateCache:
         for layer_idx in range(self.num_layers):
             self.apply_pending_recurrent_state(layer_idx)
 
+    def discard_pending_states(self) -> None:
+        for pending in (
+            self.pending_conv_states,
+            self.pending_conv_slot_ids,
+            self.pending_recurrent_states,
+            self.pending_recurrent_slot_ids,
+        ):
+            pending[:] = [None] * self.num_layers
+
     def apply_pending_states(self, slot_ids: Sequence[int] | None = None) -> None:
         """Flush pending components touching these slots, or all when omitted."""
         slots = None if slot_ids is None else set(slot_ids)

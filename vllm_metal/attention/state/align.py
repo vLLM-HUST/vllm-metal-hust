@@ -140,6 +140,11 @@ class AlignStateManager:
         """Materialize deferred updates at a request lifecycle boundary."""
         self._needs_materialize |= bool(req_ids)
 
+    def discard_pending_state(self) -> None:
+        """Drop deferred updates whose state is being discarded."""
+        self._state_cache.discard_pending_states()
+        self._needs_materialize = False
+
     def materialize_pending_state(self) -> None:
         """Force stable state arrays out of the lazy graph between steps."""
         if not self._needs_materialize:

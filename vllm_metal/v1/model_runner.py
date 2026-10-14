@@ -1003,6 +1003,18 @@ class MetalModelRunner:
             output.kv_connector_output = kv_connector_output
         return output
 
+    def release_kv_cache_memory(self) -> None:
+        """Free the paged KV cache for sleep mode; its contents are discarded."""
+        if self._execute_model_state is not None or self._decode_pipeline.has_pending:
+            raise RuntimeError("Cannot release the KV cache while a step is in flight.")
+        if self._paged_attention_runtime is not None:
+            self._paged_attention_runtime.release_kv_memory()
+
+    def restore_kv_cache_memory(self) -> None:
+        """Re-create the KV cache freed by ``release_kv_cache_memory``."""
+        if self._paged_attention_runtime is not None:
+            self._paged_attention_runtime.restore_kv_memory()
+
     def reset_mm_cache(self) -> None:
         """Reset profiling-time multimodal cache state when present."""
         if self.encoder_cache is not None:

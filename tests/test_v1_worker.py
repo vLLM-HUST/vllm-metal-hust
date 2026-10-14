@@ -298,6 +298,50 @@ class TestWorkerRunnerBoundaryDelegation:
         assert MetalWorker.determine_available_memory(worker) == 2_900_000_000
 
 
+class TestSleepMode:
+    """Sleep frees the KV cache in place; weights stay in unified memory."""
+
+    def _worker(self) -> tuple[MetalWorker, list[str]]:
+        calls: list[str] = []
+        runner = SimpleNamespace(
+            release_kv_cache_memory=lambda: calls.append("release"),
+            restore_kv_cache_memory=lambda: calls.append("restore"),
+        )
+        return _make_worker(runner), calls
+
+    def test_level_one_releases_kv_and_wake_restores_it(self) -> None:
+        worker, calls = self._worker()
+
+        MetalWorker.sleep(worker, level=1)
+        MetalWorker.wake_up(worker, tags=None)
+
+        assert calls == ["release", "restore"]
+
+    def test_waking_only_weights_keeps_the_kv_cache_released(self) -> None:
+        worker, calls = self._worker()
+
+        MetalWorker.sleep(worker, level=1)
+        MetalWorker.wake_up(worker, tags=["weights"])
+
+        assert calls == ["release"]
+
+    def test_unsupported_level_is_rejected_before_releasing(self) -> None:
+        worker, calls = self._worker()
+
+        with pytest.raises(NotImplementedError, match="level 1 only"):
+            MetalWorker.sleep(worker, level=2)
+
+        assert calls == []
+
+    def test_discarding_weights_is_rejected(self) -> None:
+        worker, calls = self._worker()
+
+        with pytest.raises(NotImplementedError, match="only discard the KV cache"):
+            MetalWorker.discard(worker, ("weights",))
+
+        assert calls == []
+
+
 class TestPagedAttentionPlanDiagnostics:
     @pytest.mark.parametrize(
         "key_format,value_format,histories",

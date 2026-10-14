@@ -56,6 +56,34 @@ Use `--no-async-scheduling` (required for all spec-decode methods on Metal).
 See [Speculative Decoding](speculative_decoding.md) for supported methods,
 model pairing, and memory considerations.
 
+## Sleep Mode
+
+Start with `--enable-sleep-mode` (or `LLM(..., enable_sleep_mode=True)`) to
+give the KV cache's memory back while the engine is idle, for example when a
+model server stays open in the background on a laptop, or when the same Mac
+runs another memory-hungry job between requests. The API is vLLM's
+[sleep mode](https://docs.vllm.ai/en/latest/features/sleep_mode.html); the
+`/sleep`, `/wake_up` and `/is_sleeping` endpoints and `LLM.sleep()` work the
+same way.
+
+Sleep levels mean something different on unified memory than on a GPU:
+
+| Level | vLLM on a GPU | vllm-metal |
+|---|---|---|
+| 1 | Copies weights to CPU memory, discards the KV cache | Discards the KV cache. Weights stay in place: unified memory has nowhere cheaper to copy them to. |
+| 2 | Discards weights and the KV cache | Not supported yet |
+
+- `llm.sleep(level=1)` frees the KV cache. `llm.wake_up()` re-creates it in
+  well under a second, and the prefix cache starts empty.
+- `llm.sleep(level=0)` followed by `llm.release_kv_cache_memory()` also frees
+  the KV cache. Restore it with `llm.wake_up(tags=["kv_cache"])`.
+- The amount freed is the part of the KV pool that was in use, because the
+  pool is allocated lazily.
+
+Sleep mode supports dense and hybrid models on the MLX backend. Standalone MLA
+models and speculative decoding methods other than `ngram` are not supported
+yet.
+
 ## KV Cache Memory Settings
 
 The paged KV cache budget follows vLLM's standard `--gpu-memory-utilization`
