@@ -162,6 +162,14 @@ class _Qwen35LanguageModelStub:
         return None
 
 
+# Every Qwen3-VL family hf_config carries the video frame token ids.
+_QWEN35_FRAME_TOKEN_IDS = {
+    "video_token_id": 248057,
+    "vision_start_token_id": 248053,
+    "vision_end_token_id": 248054,
+}
+
+
 def _qwen35_vlm_model(
     *,
     vision_tower: object | None = None,
@@ -483,6 +491,7 @@ class TestModelLifecycle:
             model_config=_runner_model_config(
                 hf_config=SimpleNamespace(
                     model_type="qwen3_5",
+                    **_QWEN35_FRAME_TOKEN_IDS,
                     architectures=["Qwen3_5ForConditionalGeneration"],
                     quantization={"group_size": 64, "bits": 4, "mode": "affine"},
                     vision_config=SimpleNamespace(spatial_merge_size=2),
@@ -514,6 +523,7 @@ class TestModelLifecycle:
             model_config=_runner_model_config(
                 hf_config=SimpleNamespace(
                     model_type="qwen3_5",
+                    **_QWEN35_FRAME_TOKEN_IDS,
                     architectures=["Qwen3_5ForConditionalGeneration"],
                     quantization_config={"quant_method": "fp8"},
                 ),
@@ -547,6 +557,7 @@ class TestModelLifecycle:
             model_config=_runner_model_config(
                 hf_config=SimpleNamespace(
                     model_type="qwen3_5",
+                    **_QWEN35_FRAME_TOKEN_IDS,
                     architectures=["Qwen3_5ForConditionalGeneration"],
                     quantization_config={"quant_method": "fp8"},
                 ),
@@ -641,6 +652,7 @@ class TestModelLifecycle:
             model_config=_runner_model_config(
                 hf_config=SimpleNamespace(
                     model_type="qwen3_5",
+                    **_QWEN35_FRAME_TOKEN_IDS,
                     architectures=["Qwen3_5ForConditionalGeneration"],
                     quantization_config={"quant_method": "fp8"},
                 ),
@@ -1453,6 +1465,24 @@ class TestResolveModelDims:
         )
 
         assert runner.num_layers == 32
+        assert runner.num_kv_heads == 8
+        assert runner.head_dim == 128
+
+    def test_null_mla_fields_resolve_as_standard_attention(self) -> None:
+        # Mistral-Small-3.1 text config as mlx-vlm's mistral3 TextConfig gives it.
+        runner = self._resolve(
+            {
+                "num_hidden_layers": 40,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "hidden_size": 5120,
+                "head_dim": 128,
+                "kv_lora_rank": None,
+                "qk_rope_head_dim": None,
+            }
+        )
+
+        assert runner.is_mla is False
         assert runner.num_kv_heads == 8
         assert runner.head_dim == 128
 

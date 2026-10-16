@@ -44,12 +44,13 @@ validation guidance. The reranker requires Qwen3 sequence-classification
 
 ## Multimodal Language Models
 
-Native multimodal support currently targets image-only vision-language requests on the paged backend.
+Native multimodal support uses the paged backend. Video token pruning is
+unsupported; leave `--video-pruning-rate` unset.
 
 | Model | MLX | PyTorch MPS | Runner | Scope | Example checkpoint |
 | --- | --- | --- | --- | --- | --- |
-| Qwen3-VL | 🔵 | | native multimodal paged generation | image input, no video | `mlx-community/Qwen3-VL-4B-Instruct-4bit` |
-| Qwen3.5 (dense) | 🔵 | | native multimodal paged generation | image input, no video; FP8 checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
+| Qwen3-VL | 🔵 | | native multimodal paged generation | image and video input | `mlx-community/Qwen3-VL-4B-Instruct-4bit` |
+| Qwen3.5 (dense) | 🔵 | | native multimodal paged generation | image and video input; FP8 checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
 | PaddleOCR-VL | 🔵 | | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
 | Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm vision sidecar, paged generation | image input, no video/audio, bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4` |
 
@@ -120,6 +121,12 @@ qtypes, exclusions, and serve examples. Verified end-to-end on Qwen3-0.6B,
 Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 in Q8_0 and Q4_K_M
 ([#415](https://github.com/vllm-project/vllm-metal/issues/415),
 [#761](https://github.com/vllm-project/vllm-metal/issues/761)).
+
+Mistral Small 3.1 (`mlx-community/Mistral-Small-3.1-24B-Instruct-2503-4bit`) is
+a vision-language model. By default vllm-metal serves its text backbone through
+mlx_lm and rejects image input. Ministral 3 and Devstral Small 2 take the same
+path but fail at load on `attn_scale`
+([#1130](https://github.com/vllm-project/vllm-metal/issues/1130)).
 
 Ling-3.0 Tiny supports the official BF16 checkpoint and MLX-native MXFP8
 checkpoints converted from it. Direct loading of the official serialized

@@ -17,6 +17,7 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
 )
+from vllm.config.multimodal import MultiModalConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -317,7 +318,7 @@ class TestMetalPlatform:
             (None, None, False),
             ("auto_awq", None, True),
             ("gguf", None, True),
-            ("auto_awq", SimpleNamespace(language_model_only=False), False),
+            ("auto_awq", MultiModalConfig(), False),
         ],
         ids=["safetensors", "text-awq", "text-gguf", "multimodal-awq"],
     )
@@ -325,7 +326,7 @@ class TestMetalPlatform:
         self,
         monkeypatch: pytest.MonkeyPatch,
         quantization: str | None,
-        multimodal_config: SimpleNamespace | None,
+        multimodal_config: MultiModalConfig | None,
         rejects_pp: bool,
     ) -> None:
         """PP admits lazy loaders and rejects proven eager text loaders."""
@@ -950,7 +951,7 @@ class TestMetalPlatform:
                     "distributed_executor_backend": "ray",
                     "ray_runtime_env": None,
                 },
-                model={"multimodal_config": SimpleNamespace()},
+                model={"multimodal_config": MultiModalConfig()},
             )
             with pytest.raises(NotImplementedError, match="multimodal models"):
                 MetalPlatform.check_and_update_config(vllm_config)
@@ -1721,7 +1722,7 @@ class TestMetalPlatform:
             monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", mode)
         reset_config()
         try:
-            multimodal_config = SimpleNamespace(language_model_only=False)
+            multimodal_config = MultiModalConfig()
             model_config = SimpleNamespace(
                 enable_sleep_mode=False,
                 model="test-model",
@@ -1901,7 +1902,7 @@ class TestMetalPlatform:
             text_config=SimpleNamespace(model_type="gemma4_text"),
             vision_config=SimpleNamespace(default_output_length=280),
         )
-        model_config.multimodal_config = SimpleNamespace()
+        model_config.multimodal_config = MultiModalConfig()
         model_config.mm_processor_kwargs = mm_processor_kwargs
         return self._platform_config(
             model_config=model_config,

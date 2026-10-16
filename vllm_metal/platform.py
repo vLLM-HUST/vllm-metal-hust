@@ -980,7 +980,12 @@ class MetalPlatform(Platform):
             # architectures) that only genuinely multimodal checkpoints carry;
             # skip it for text-only models so a bare hf_config doesn't crash
             # config-time checks that never touch vision at all.
-            if getattr(model_config, "multimodal_config", None) is not None:
+            if model_config.multimodal_config is not None:
+                if model_config.multimodal_config.is_multimodal_pruning_enabled():
+                    raise NotImplementedError(
+                        "Video token pruning is not supported on Metal. "
+                        "Remove --video-pruning-rate."
+                    )
                 mode = DefaultModelAdapter().multimodal_backbone_mode(
                     model_config, speculative_config=vllm_config.speculative_config
                 )
