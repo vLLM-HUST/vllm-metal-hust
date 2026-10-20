@@ -315,6 +315,7 @@ struct NaxAttentionPlan {
   bool split_full;
   int q_blocks;
   int num_threads;
+  int value_slices;
 };
 
 static NaxAttentionPlan make_nax_attention_plan(
@@ -332,10 +333,12 @@ static NaxAttentionPlan make_nax_attention_plan(
 
   std::string base_kname =
       kernels::nax_name(dtype_to_metal(dtype), head_size, block_size);
+  const int value_slices = head_size == 512 && split_full ? 2 : 1;
+  if (value_slices > 1) base_kname += "_v256";
   std::string hash_name = base_kname + "_sk" + (use_sinks ? "1" : "0")
                           + "_sf" + (split_full ? "1" : "0");
   return {std::move(base_kname), std::move(hash_name), use_sinks, split_full,
-          total_q_blocks - q_block_offset, kernels::kNaxThreads};
+          total_q_blocks - q_block_offset, kernels::kNaxThreads, value_slices};
 }
 
 // Same buffer ABI as the tiled kernel, with BQ=64 and no threadgroup memory.
@@ -379,7 +382,7 @@ static void dispatch_paged_attention_nax(
   }
 
   enc.dispatch_threadgroups(
-      MTL::Size::Make(num_heads, plan.q_blocks, 1),
+      MTL::Size::Make(num_heads, plan.q_blocks, plan.value_slices),
       MTL::Size::Make(plan.num_threads, 1, 1));
 }
 
@@ -669,14 +672,12 @@ static PagedAttentionPlan select_paged_attention_route(
     // CPU from the lengths it already holds (vllm_metal.attention.nax_split).
     // Without it (-1) the host only knows totals here, so it falls back to an
     // average of at least 128 query tokens (two Q blocks) per sequence.
-    // head_size 512 stays unsplit either way: conservative enablement scope for
-    // this change to avoid regressing measured shapes (the split was slower on
-    // long D512 prefill; register pressure is suspected but unverified). D512
-    // can be optimized separately later.
-    bool split_full = m.head_size < 512
-        && (split_hint >= 0
-                ? split_hint == 1
-                : m.query_tokens >= kNaxSplitMinAvgQ * m.query_sequences);
+    // D512 uses two 256-column output slices to limit register pressure.
+    // Keep legacy callers on the original loop without per-sequence metadata.
+    bool split_full = split_hint >= 0
+        ? split_hint == 1
+        : (m.head_size < 512 &&
+           m.query_tokens >= kNaxSplitMinAvgQ * m.query_sequences);
     plan.route = split_mixed_batch
         ? (split_full ? PagedAttentionRoute::MixedNaxSplit
                       : PagedAttentionRoute::MixedNaxUnsplit)
@@ -1522,6 +1523,13 @@ array paged_attention_primitive_fn(
           "); an understated value leaves window rows unwritten");
     }
   }
+  if (use_turboquant &&
+      (key_scale_cache == nullptr || value_scale_cache == nullptr ||
+       key_zero_cache == nullptr || v_centroids == nullptr)) {
+    throw std::invalid_argument(
+        "TurboQuant requires key_scale_cache, value_scale_cache, "
+        "key_zero_cache, and v_centroids");
+  }
   int k_bits = use_turboquant ? get_bits(quant_type) : 8;
   auto prim = std::make_shared<PagedAttentionPrimitive>(
       default_stream(Device::gpu),
@@ -1713,7 +1721,7 @@ class TQEncodePrimitive : public Primitive {
   bool k_signed_;
 };
 
-std::vector<array> tq_encode_primitive_fn(
+std::tuple<array, array, array, array, array> tq_encode_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,
     const array& key_scale_cache, const array& value_scale_cache,
@@ -1743,7 +1751,7 @@ std::vector<array> tq_encode_primitive_fn(
   auto prim = std::make_shared<TQEncodePrimitive>(
       default_stream(Device::gpu), v_bits, k_bits, k_signed);
 
-  return array::make_arrays(
+  auto outputs = array::make_arrays(
       {key_cache.shape(), value_cache.shape(),
        key_scale_cache.shape(), value_scale_cache.shape(),
        key_zero_cache.shape()},
@@ -1755,6 +1763,9 @@ std::vector<array> tq_encode_primitive_fn(
        key_cache, value_cache,
        key_scale_cache, value_scale_cache, key_zero_cache,
        slot_mapping, v_centroids});
+  return std::make_tuple(
+      std::move(outputs[0]), std::move(outputs[1]), std::move(outputs[2]),
+      std::move(outputs[3]), std::move(outputs[4]));
 }
 
 // ---------------------------------------------------------------------------
@@ -1864,15 +1875,16 @@ class ReshapeAndCachePrimitive : public Primitive {
   }
 };
 
-std::vector<array> reshape_and_cache_primitive_fn(
+std::tuple<array, array> reshape_and_cache_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,
     const array& slot_mapping) {
   auto prim = std::make_shared<ReshapeAndCachePrimitive>(
       default_stream(Device::gpu));
-  return array::make_arrays(
+  auto outputs = array::make_arrays(
       {key_cache.shape(), value_cache.shape()},
       {key_cache.dtype(), value_cache.dtype()},
       prim,
       {key, value, key_cache, value_cache, slot_mapping});
+  return std::make_tuple(std::move(outputs[0]), std::move(outputs[1]));
 }
